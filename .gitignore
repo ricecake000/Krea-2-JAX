@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.safetensors
+cache/
+lora_out/
+data/
+venv/
+.venv/
+*.png
+!docs/*.png

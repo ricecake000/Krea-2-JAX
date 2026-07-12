@@ -1,0 +1,10 @@
+# Host-side preprocessing & decoding (dataset caching, prompt encoding,
+# VAE decode, LoRA merging). CPU torch is enough on a TPU VM:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
+transformers>=4.57.0
+diffusers>=0.31.0
+accelerate
+safetensors>=0.4.5
+pillow
+einops

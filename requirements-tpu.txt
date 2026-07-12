@@ -1,0 +1,9 @@
+# TPU training / sampling (the DiT itself)
+# Install JAX for TPU first:
+#   pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+jax>=0.4.35
+optax>=0.2.0
+safetensors>=0.4.5
+ml_dtypes>=0.4.0
+numpy
+pillow
