@@ -63,6 +63,13 @@ python scripts/cache_dataset.py \
   --data-dir ./data --cache-dir ./cache --resolution 1024
 ```
 
+Non-square datasets: pass an explicit `--width`/`--height` (multiples of 16)
+matching your dataset's aspect ratio instead of `--resolution`, e.g.
+`--width 832 --height 1216` for ~2:3 portraits. All images are cover-resized
+and center-cropped to that one fixed shape, so a run still compiles a single
+XLA graph — if your images share (roughly) one aspect ratio there is no need
+for bucketing.
+
 ## 2. Train the LoRA (TPU)
 
 ```bash
@@ -151,6 +158,7 @@ tests/              # parity / training / sharding verification
 - Single-host TPU slices (≤8 devices visible to one process). Multi-host
   pods would need per-host data sharding and `jax.make_array_from_*` when
   loading — not implemented yet.
-- Fixed square training resolution per run (no aspect-ratio bucketing yet).
+- One fixed training resolution per run — square or rectangular via
+  `--width`/`--height` (no mixed-aspect-ratio bucketing yet).
 - Krea 2 weights are distributed under the **Krea 2 Community License**;
   review it before commercial use.

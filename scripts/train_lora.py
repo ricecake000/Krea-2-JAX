@@ -122,8 +122,9 @@ def main():
     h_tok, w_tok = lat_h // cfg.patch, lat_w // cfg.patch
     img_seq = h_tok * w_tok
     mu = args.timestep_mu if args.timestep_mu is not None else cfg.mu_for_seq_len(img_seq)
+    res = meta.get("resolution", f"{lat_w * 8}x{lat_h * 8}")
     print(
-        f"dataset: {N} samples @ {meta['resolution']}px "
+        f"dataset: {N} samples @ {res}px "
         f"(latent {lat_h}x{lat_w}, {img_seq} tokens, txt_len {txt_len}, mu {mu:.4f})"
     )
 
@@ -199,7 +200,7 @@ def main():
             extra_meta={
                 "step": step,
                 "targets": args.targets,
-                "resolution": meta["resolution"],
+                "resolution": res,
                 "base": Path(args.base_ckpt).name,
             },
         )

@@ -99,8 +99,8 @@ def main():
     sd = {k: torch.randn(v.shape, generator=g) * 0.02 for k, v in sd.items()}
     model.load_state_dict(sd)
 
-    # --- inputs ---
-    B, ltxt, latH, latW = 2, 7, 16, 16
+    # --- inputs (non-square latent grid to cover rectangular resolutions) ---
+    B, ltxt, latH, latW = 2, 7, 16, 24
     htok, wtok = latH // 2, latW // 2
     lat = torch.randn(B, tiny["channels"], latH, latW, generator=g)
     context = torch.randn(B, ltxt, tiny["txtlayers"], tiny["txtdim"], generator=g)

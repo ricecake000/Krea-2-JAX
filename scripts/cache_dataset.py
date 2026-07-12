@@ -109,20 +109,20 @@ class VaeEncoder:
         return z[0, :, 0]
 
 
-def load_image(path, resolution):
-    """RGB load, resize shorter side to `resolution`, center crop, to [-1, 1]."""
+def load_image(path, width, height):
+    """RGB load, cover-resize to (width, height), center crop, to [-1, 1]."""
     img = Image.open(path).convert("RGB")
     w, h = img.size
-    scale = resolution / min(w, h)
+    scale = max(width / w, height / h)
     img = img.resize(
-        (max(resolution, round(w * scale)), max(resolution, round(h * scale))),
+        (max(width, round(w * scale)), max(height, round(h * scale))),
         Image.LANCZOS,
     )
     w, h = img.size
-    left, top = (w - resolution) // 2, (h - resolution) // 2
-    img = img.crop((left, top, left + resolution, top + resolution))
+    left, top = (w - width) // 2, (h - height) // 2
+    img = img.crop((left, top, left + width, top + height))
     t = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
-    t = t.view(resolution, resolution, 3).permute(2, 0, 1).float()
+    t = t.view(height, width, 3).permute(2, 0, 1).float()
     return (t / 127.5 - 1.0).unsqueeze(0)
 
 
@@ -130,7 +130,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--cache-dir", required=True)
-    ap.add_argument("--resolution", type=int, default=1024)
+    ap.add_argument("--resolution", type=int, default=1024,
+                    help="square training resolution (shorthand)")
+    ap.add_argument("--width", type=int, default=None,
+                    help="fixed training width; overrides --resolution")
+    ap.add_argument("--height", type=int, default=None,
+                    help="fixed training height; overrides --resolution")
     ap.add_argument("--max-length", type=int, default=512)
     ap.add_argument("--default-caption", default="")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -138,8 +143,10 @@ def main():
     ap.add_argument("--vae", default="Qwen/Qwen-Image")
     args = ap.parse_args()
 
-    if args.resolution % 16 != 0:
-        raise SystemExit("--resolution must be a multiple of 16 (VAE f8 × patch 2)")
+    width = args.width if args.width is not None else args.resolution
+    height = args.height if args.height is not None else args.resolution
+    if width % 16 or height % 16:
+        raise SystemExit("width/height must be multiples of 16 (VAE f8 × patch 2)")
 
     data_dir, cache_dir = Path(args.data_dir), Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -160,7 +167,7 @@ def main():
         caption = (
             cap_path.read_text().strip() if cap_path.exists() else args.default_caption
         )
-        latent = vae(load_image(path, args.resolution))
+        latent = vae(load_image(path, width, height))
         hiddens, mask = text_encoder(caption)
         n_valid = int(mask.sum().item())
         # Compact away padding: valid tokens are (prompt..., suffix) — text
@@ -181,7 +188,9 @@ def main():
         print(f"[{i + 1}/{len(images)}] {path.name} (txt tokens: {n_valid})")
 
     meta = {
-        "resolution": args.resolution,
+        "width": width,
+        "height": height,
+        "resolution": f"{width}x{height}",
         "latent_channels": 16,
         "txt_dim": 2560,
         "txt_layers": 12,
