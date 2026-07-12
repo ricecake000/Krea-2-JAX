@@ -8,8 +8,9 @@ matching, Qwen3-VL-4B text conditioning, Qwen-Image f8/16ch VAE) released with
 open weights as **Krea 2 RAW** (base, for training) and **Krea 2 Turbo**
 (8-step distilled, for inference). This repo re-implements the DiT in pure
 functional JAX — numerically verified against the
-[official PyTorch implementation](https://github.com/krea-ai/krea-2) to
-~1e-7 — and trains LoRA adapters on TPU:
+[official PyTorch implementation](https://github.com/krea-ai/krea-2) down to
+float32 rounding (measured ~4e-7 max relative error; tests assert < 2e-4 to
+absorb platform/BLAS variance) — and trains LoRA adapters on TPU:
 
 - **FSDP sharding** of the frozen bf16 base across all TPU devices
   (`lax.scan` over blocks + gradient rematerialization, query-chunked
@@ -132,7 +133,7 @@ CPU-only numerical verification against the official PyTorch code
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install einops optax
-python tests/test_parity.py        # forward parity ~1e-7, LoRA == merged
+python tests/test_parity.py        # forward parity (~4e-7, asserts <2e-4), LoRA == merged
 python tests/test_train_and_io.py  # train step, save/load, merge script
 python tests/test_sharding.py      # 8-device FSDP parity (emulated on CPU)
 ```

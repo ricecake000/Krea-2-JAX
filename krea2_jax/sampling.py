@@ -76,6 +76,13 @@ def sample_latents(
     qchunk=512,
 ):
     """Euler-integrate the flow ODE. Returns latents (B, C, H/8, W/8)."""
+    align = cfg.vae_compression * cfg.patch
+    if height % align or width % align:
+        raise ValueError(
+            f"height/width must be multiples of {align} "
+            f"(VAE f{cfg.vae_compression} x patch {cfg.patch}); "
+            f"got {width}x{height}"
+        )
     B = txt.shape[0]
     lat_h, lat_w = height // cfg.vae_compression, width // cfg.vae_compression
     h_tok, w_tok = lat_h // cfg.patch, lat_w // cfg.patch

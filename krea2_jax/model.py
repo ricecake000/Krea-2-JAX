@@ -103,9 +103,17 @@ def scaled_dot_product_attention(q, k, v, keymask=None, qchunk=512):
     """Exact attention with float32 softmax, GQA, and query chunking.
 
     q: (B, Hq, L, D); k, v: (B, Hk, L, D); keymask: (B, L) bool or None.
-    Masked keys get a finite large-negative bias so fully-masked query rows
-    produce finite (garbage, later discarded) outputs instead of NaNs.
     Query chunking bounds the (heads, chunk, L) float32 logit buffer.
+
+    Mask semantics: the reference builds an outer-product (query AND key)
+    mask and relies on the fused CUDA kernels returning zeros for fully
+    masked query rows. We mask keys only, with a finite large-negative bias:
+    valid queries see exactly the same key set (identical outputs, verified
+    to float32 rounding in tests/test_parity.py), while invalid query rows
+    produce finite garbage instead of the reference's zeros. Those rows are
+    masked as keys downstream and sliced away at the output, so they never
+    influence results — and keeping the bias finite (rather than -inf on
+    empty rows) keeps softmax gradients NaN-free for LoRA training.
     """
     B, Hq, L, D = q.shape
     Hk = k.shape[1]
@@ -311,6 +319,10 @@ def dit_forward(
 def patchify(lat, patch):
     """(B, C, H, W) -> (B, (H/p)*(W/p), C*p*p) matching the reference layout."""
     B, C, H, W = lat.shape
+    if H % patch or W % patch:
+        raise ValueError(
+            f"latent grid {H}x{W} must be divisible by patch size {patch}"
+        )
     h, w = H // patch, W // patch
     x = lat.reshape(B, C, h, patch, w, patch)
     x = x.transpose(0, 2, 4, 1, 3, 5)  # B h w C p p
@@ -320,7 +332,15 @@ def patchify(lat, patch):
 def unpatchify(tokens, patch, channels, H, W):
     """Inverse of `patchify`. H, W are latent-grid sizes."""
     B = tokens.shape[0]
+    if H % patch or W % patch:
+        raise ValueError(
+            f"latent grid {H}x{W} must be divisible by patch size {patch}"
+        )
     h, w = H // patch, W // patch
+    if tokens.shape[1] != h * w:
+        raise ValueError(
+            f"got {tokens.shape[1]} tokens for a {h}x{w} ({h * w}-token) grid"
+        )
     x = tokens.reshape(B, h, w, channels, patch, patch)
     x = x.transpose(0, 3, 1, 4, 2, 5)
     return x.reshape(B, channels, H, W)
