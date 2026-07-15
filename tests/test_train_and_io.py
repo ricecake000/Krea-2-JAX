@@ -116,6 +116,30 @@ def main():
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-7)
     print("LoRA save/load round-trip: ok")
 
+    # --- optimizer-state save/resume: 15 + 15 steps == 30 straight steps ---
+    from krea2_jax.checkpoint import load_train_state, save_train_state
+
+    lora_b = init_lora(params, jax.random.PRNGKey(3), rank=4, targets="attn+mlp")
+    opt_b = tx.init(lora_b)
+    for step in range(15):
+        lora_b, opt_b, _ = train_step(lora_b, opt_b, jax.random.fold_in(rng, step))
+
+    mid_lora_path = tmp / "lora_step000015.safetensors"
+    mid_state_path = tmp / "train_state_step000015.safetensors"
+    save_lora(str(mid_lora_path), lora_b, rank=4, alpha=8)
+    save_train_state(str(mid_state_path), opt_b, step=15)
+
+    lora_c, _ = load_lora(str(mid_lora_path))
+    opt_c, start_step = load_train_state(str(mid_state_path), tx.init(lora_c))
+    assert start_step == 15
+    for a, b in zip(jax.tree.leaves(opt_b), jax.tree.leaves(opt_c)):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    for step in range(start_step, 30):
+        lora_c, opt_c, _ = train_step(lora_c, opt_c, jax.random.fold_in(rng, step))
+    for a, b in zip(jax.tree.leaves(lora), jax.tree.leaves(lora_c)):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-6)
+    print("optimizer-state save/resume matches uninterrupted training: ok")
+
     # --- merge_lora.py equivalence ---
     merged_path = tmp / "merged.safetensors"
     subprocess.run(

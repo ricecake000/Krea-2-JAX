@@ -33,9 +33,11 @@ from krea2_jax.checkpoint import (
     init_lora,
     load_krea2_params,
     load_lora,
+    load_train_state,
     make_mesh,
     replicate_tree,
     save_lora,
+    save_train_state,
 )
 from krea2_jax.config import KREA2_CONFIG
 from krea2_jax.model import build_positions_and_mask, dit_forward, patchify
@@ -75,6 +77,19 @@ def load_cache(cache_dir, txt_len):
     return np.stack(latents), txt, mask, meta, txt_len
 
 
+def train_state_path(lora_path):
+    """Companion train-state file for a LoRA checkpoint.
+
+    lora_step000500.safetensors -> train_state_step000500.safetensors,
+    lora.safetensors -> train_state.safetensors.
+    """
+    lora_path = Path(lora_path)
+    name = lora_path.name.replace("lora", "train_state", 1)
+    if name == lora_path.name:
+        name = lora_path.stem + ".train_state" + lora_path.suffix
+    return lora_path.with_name(name)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-ckpt", required=True, help="raw.safetensors path")
@@ -101,7 +116,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
-    ap.add_argument("--resume", default=None, help="LoRA safetensors to resume from")
+    ap.add_argument(
+        "--resume", default=None,
+        help="LoRA safetensors to resume from; its companion train_state file "
+             "(optimizer moments + step counter) is picked up automatically, "
+             "and training continues from that step up to --steps",
+    )
     args = ap.parse_args()
 
     cfg = KREA2_CONFIG
@@ -163,6 +183,23 @@ def main():
         optax.adamw(sched, weight_decay=args.weight_decay),
     )
     opt_state = replicate_tree(tx.init(lora), mesh)
+    start_step = 0
+    if args.resume:
+        state_path = train_state_path(args.resume)
+        if state_path.exists():
+            opt_state, start_step = load_train_state(
+                str(state_path), opt_state, mesh=mesh
+            )
+            print(f"resumed optimizer state from {state_path} (step {start_step})")
+        else:
+            print(
+                f"warning: {state_path} not found; optimizer state and step "
+                "counter start fresh"
+            )
+    if start_step >= args.steps:
+        raise SystemExit(
+            f"resumed at step {start_step} >= --steps {args.steps}; nothing to do"
+        )
 
     data_sharding = batch_sharding(mesh)
 
@@ -204,12 +241,14 @@ def main():
                 "base": Path(args.base_ckpt).name,
             },
         )
-        print(f"saved {out_dir / name}")
+        state_path = train_state_path(out_dir / name)
+        save_train_state(str(state_path), opt_state, step)
+        print(f"saved {out_dir / name} (+ {state_path.name})")
 
     # --- loop ---
-    np_rng = np.random.default_rng(args.seed)
+    np_rng = np.random.default_rng([args.seed, start_step])
     ema_loss, t_log = None, time.time()
-    for step in range(1, args.steps + 1):
+    for step in range(start_step + 1, args.steps + 1):
         idx = np_rng.choice(N, size=args.batch_size, replace=N < args.batch_size)
         batch_lat = jax.device_put(latents[idx], data_sharding)
         batch_txt = jax.device_put(txt[idx], data_sharding)
@@ -220,7 +259,7 @@ def main():
             lora, opt_state, params, batch_lat, batch_txt, batch_mask, key
         )
 
-        if step % args.log_every == 0 or step == 1:
+        if step % args.log_every == 0 or step == start_step + 1:
             loss = float(loss)
             ema_loss = loss if ema_loss is None else 0.9 * ema_loss + 0.1 * loss
             dt = time.time() - t_log

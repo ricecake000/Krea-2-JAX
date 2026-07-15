@@ -94,6 +94,16 @@ Useful knobs:
 | `--timestep-mu` | from resolution | logit-normal timestep shift override |
 | `--qchunk` | 512 | attention query-chunk size (memory knob) |
 
+Checkpointing: every `--save-every` steps the script writes
+`lora_stepNNNNNN.safetensors` plus a companion
+`train_state_stepNNNNNN.safetensors` (AdamW moments + step counter).
+`--resume path/to/lora_stepNNNNNN.safetensors` picks up the companion file
+automatically and continues from that step (same LR schedule position) up to
+`--steps` — useful on preemptible or time-limited machines such as Kaggle's
+9-hour TPU sessions. Resuming requires the same `--rank`/`--targets`; if the
+train-state file is missing, only the LoRA weights are restored and the
+optimizer starts fresh (the old behavior).
+
 Memory: base 12.9B bf16 ≈ 26 GB FSDP-sharded → ~3.3 GB/device on 8 devices,
 plus LoRA/optimizer (replicated, tiny) and rematerialized activations.
 Batch 8 @ 1024px trains comfortably on v4-8 / v5e-8.

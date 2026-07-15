@@ -7,7 +7,6 @@ layout and the exact key names, but nest keys by "." and stack repeated blocks
 `txtfusion.refiner_blocks.{i}.*`) along a leading axis for `lax.scan`.
 """
 
-import json
 import re
 
 import jax
@@ -231,6 +230,63 @@ def lora_scale_from_meta(meta, default_alpha=None, default_rank=None):
     return alpha / rank
 
 
-def save_train_state_meta(path, **kwargs):
-    with open(path, "w") as f:
-        json.dump(kwargs, f, indent=2)
+# ---------------------------------------------------------------------------
+# optimizer / train-state checkpointing
+# ---------------------------------------------------------------------------
+
+
+def save_train_state(path, opt_state, step, extra_meta=None):
+    """Write the optimizer state (any optax pytree) plus the step counter.
+
+    Leaves are stored in `jax.tree.leaves` order; the tree structure itself is
+    not serialized — `load_train_state` rebuilds it from a freshly
+    `tx.init`-ed template, so save and load must use the same optimizer
+    configuration.
+    """
+    from safetensors.numpy import save_file
+
+    leaves = jax.tree.leaves(opt_state)
+    flat = {
+        f"leaf.{i:05d}": np.asarray(jax.device_get(a)) for i, a in enumerate(leaves)
+    }
+    meta = {
+        "step": str(step),
+        "n_leaves": str(len(leaves)),
+        "format": "krea2-jax-train-state",
+    }
+    if extra_meta:
+        meta.update({k: str(v) for k, v in extra_meta.items()})
+    save_file(flat, path, metadata=meta)
+
+
+def load_train_state(path, opt_state_template, mesh=None):
+    """Restore an opt_state saved by `save_train_state`.
+
+    opt_state_template: a freshly `tx.init`-ed state with the same optimizer,
+    LoRA rank, and targets as the saved run; it supplies the tree structure
+    and expected leaf shapes/dtypes. Returns (opt_state, step).
+    """
+    template_leaves, treedef = jax.tree.flatten(opt_state_template)
+    with safe_open(path, framework="numpy") as f:
+        meta = f.metadata() or {}
+        n = int(meta["n_leaves"])
+        if n != len(template_leaves):
+            raise ValueError(
+                f"{path}: {n} optimizer-state leaves, expected "
+                f"{len(template_leaves)} (different optimizer/--rank/--targets?)"
+            )
+        leaves = [f.get_tensor(f"leaf.{i:05d}") for i in range(n)]
+    for i, (got, want) in enumerate(zip(leaves, template_leaves)):
+        if got.shape != tuple(want.shape):
+            raise ValueError(
+                f"{path}: leaf {i} has shape {got.shape}, expected "
+                f"{tuple(want.shape)} (different --rank/--targets?)"
+            )
+    leaves = [
+        jnp.asarray(got, dtype=want.dtype)
+        for got, want in zip(leaves, template_leaves)
+    ]
+    opt_state = jax.tree.unflatten(treedef, leaves)
+    if mesh is not None:
+        opt_state = replicate_tree(opt_state, mesh)
+    return opt_state, int(meta["step"])
