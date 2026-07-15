@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import time
 from functools import partial
@@ -77,6 +78,26 @@ def load_cache(cache_dir, txt_len):
     return np.stack(latents), txt, mask, meta, txt_len
 
 
+def find_latest_checkpoint(dir_path):
+    """Newest LoRA checkpoint in a directory, ranked by training step.
+
+    The step comes from the safetensors metadata written by save(), falling
+    back to the stepNNNNNN in the filename. Returns None if the directory
+    holds no LoRA checkpoints.
+    """
+    best, best_step = None, None
+    for p in sorted(Path(dir_path).glob("lora*.safetensors")):
+        with safe_open(str(p), framework="numpy") as f:
+            meta = f.metadata() or {}
+        if meta.get("format") != "krea2-jax-lora":
+            continue
+        m = re.search(r"step(\d+)", p.stem)
+        step = int(meta.get("step", m.group(1) if m else -1))
+        if best_step is None or step >= best_step:
+            best, best_step = p, step
+    return best
+
+
 def train_state_path(lora_path):
     """Companion train-state file for a LoRA checkpoint.
 
@@ -117,8 +138,10 @@ def main():
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument(
-        "--resume", default=None,
-        help="LoRA safetensors to resume from; its companion train_state file "
+        "--resume", nargs="?", const="auto", default=None,
+        help="resume training: with no value (or a directory), the newest LoRA "
+             "checkpoint in --output-dir (or that directory) is used; a file "
+             "path selects one explicitly. The companion train_state file "
              "(optimizer moments + step counter) is picked up automatically, "
              "and training continues from that step up to --steps",
     )
@@ -129,6 +152,18 @@ def main():
     lora_scale = alpha / args.rank
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    resume = None
+    if args.resume == "auto":
+        resume = find_latest_checkpoint(out_dir)
+        if resume is None:
+            print(f"no checkpoint in {out_dir}; starting fresh")
+    elif args.resume and Path(args.resume).is_dir():
+        resume = find_latest_checkpoint(args.resume)
+        if resume is None:
+            raise SystemExit(f"--resume: no LoRA checkpoint found in {args.resume}")
+    elif args.resume:
+        resume = Path(args.resume)
 
     mesh = make_mesh()
     n_dev = mesh.size
@@ -156,9 +191,9 @@ def main():
 
     rng = jax.random.PRNGKey(args.seed)
     rng, lora_rng = jax.random.split(rng)
-    if args.resume:
-        lora, lmeta = load_lora(args.resume, mesh=mesh)
-        print(f"resumed LoRA from {args.resume} (meta: {lmeta})")
+    if resume:
+        lora, lmeta = load_lora(str(resume), mesh=mesh)
+        print(f"resumed LoRA from {resume} (meta: {lmeta})")
     else:
         lora = replicate_tree(
             init_lora(params, lora_rng, rank=args.rank, targets=args.targets),
@@ -184,8 +219,8 @@ def main():
     )
     opt_state = replicate_tree(tx.init(lora), mesh)
     start_step = 0
-    if args.resume:
-        state_path = train_state_path(args.resume)
+    if resume:
+        state_path = train_state_path(resume)
         if state_path.exists():
             opt_state, start_step = load_train_state(
                 str(state_path), opt_state, mesh=mesh

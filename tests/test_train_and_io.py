@@ -140,6 +140,18 @@ def main():
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-6)
     print("optimizer-state save/resume matches uninterrupted training: ok")
 
+    # --- find_latest_checkpoint picks the highest-step LoRA file ---
+    sys.path.insert(0, str(REPO / "scripts"))
+    from train_lora import find_latest_checkpoint
+
+    assert find_latest_checkpoint(tmp) == mid_lora_path  # lora.safetensors has no step
+    save_lora(str(tmp / "lora.safetensors"), lora, rank=4, alpha=8,
+              extra_meta={"step": 30})
+    assert find_latest_checkpoint(tmp) == tmp / "lora.safetensors"
+    (tmp / "empty").mkdir()
+    assert find_latest_checkpoint(tmp / "empty") is None
+    print("find_latest_checkpoint: ok")
+
     # --- merge_lora.py equivalence ---
     merged_path = tmp / "merged.safetensors"
     subprocess.run(
