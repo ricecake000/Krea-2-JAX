@@ -17,6 +17,7 @@ Numerical conventions copied from the reference implementation:
 """
 
 import math
+import warnings
 from functools import partial
 
 import jax
@@ -33,8 +34,16 @@ MASK_BIAS = -1e30
 # ---------------------------------------------------------------------------
 
 
-def _lget(lora, key):
-    return None if lora is None else lora.get(key)
+def _lget(lora, *keys):
+    node = lora
+    for k in keys:
+        node = None if node is None else node.get(k)
+    return node
+
+
+def _lindex(lora, i):
+    """Select layer i from a stacked LoRA subtree (None passes through)."""
+    return None if lora is None else jax.tree.map(lambda a: a[i], lora)
 
 
 def linear(x, p, lora=None, lora_scale=1.0):
@@ -137,6 +146,13 @@ def scaled_dot_product_attention(q, k, v, keymask=None, qchunk=512):
         return jnp.einsum("bhgcm,bhmd->bhgcd", w, v)
 
     if L <= qchunk or L % qchunk != 0:
+        if L > qchunk:
+            warnings.warn(
+                f"qchunk={qchunk} does not divide sequence length {L}; "
+                "falling back to unchunked attention (use a divisor of "
+                f"{L}, or qchunk >= {L} to silence this)",
+                stacklevel=2,
+            )
         out = one_chunk(qg)
     else:
         n = L // qchunk
@@ -148,6 +164,88 @@ def scaled_dot_product_attention(q, k, v, keymask=None, qchunk=512):
     return out.transpose(0, 2, 1, 3).reshape(B, L, Hq * D)
 
 
+def splash_attention(
+    q, k, v, keymask=None, mesh=None, block=256, interpret=False
+):
+    """Fused TPU (Pallas "Splash") attention, numerically matching
+    `scaled_dot_product_attention` to bf16/online-softmax rounding.
+
+    q: (B, Hq, L, D); k, v: (B, Hk, L, D); keymask: (B, L) bool or None.
+    The L x L float32 logit buffer never materializes in HBM: tiles are
+    computed in VMEM with an online softmax, forward and backward.
+
+    Key-only mask semantics are reproduced with segment ids: every query
+    (padded or not) gets segment 0 and only valid keys get segment 0, so
+    valid queries see exactly the valid key set and padded query rows still
+    produce finite values (never an empty softmax — image tokens are always
+    valid keys). Requires L to be a multiple of `block`.
+
+    mesh: when the batch is sharded, the kernel must run under shard_map
+    (GSPMD cannot partition a Pallas call); pass the mesh used for batch
+    sharding. With mesh=None the kernel runs on the local device (tests).
+    interpret: run the kernel in Pallas interpret mode (CPU-testable).
+    """
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        BlockSizes,
+        FullMask,
+        MultiHeadMask,
+        SegmentIds,
+        make_splash_mha,
+    )
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    B, Hq, L, D = q.shape
+    if block <= 0 or block % 128 != 0:
+        raise ValueError(
+            f"splash attention block ({block}) must be a positive multiple "
+            "of 128"
+        )
+    if L % block != 0:
+        raise ValueError(f"splash attention needs L ({L}) % block ({block}) == 0")
+
+    # The kernel applies no softmax scale; fold 1/sqrt(D) into q.
+    q = q * jnp.asarray(1.0 / math.sqrt(D), q.dtype)
+
+    kernel = make_splash_mha(
+        MultiHeadMask([FullMask((L, L)) for _ in range(Hq)]),
+        head_shards=1,
+        q_seq_shards=1,
+        block_sizes=BlockSizes(
+            block_q=block, block_kv=block, block_kv_compute=block,
+            block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
+            block_q_dq=block, block_kv_dq=block,
+        ),
+        interpret=interpret,
+    )
+
+    q_seg = jnp.zeros((B, L), dtype=jnp.int32)
+    kv_seg = (
+        jnp.where(keymask, 0, 1).astype(jnp.int32)
+        if keymask is not None
+        else jnp.zeros((B, L), dtype=jnp.int32)
+    )
+
+    def batched(q, k, v, q_seg, kv_seg):
+        return jax.vmap(
+            lambda q1, k1, v1, s1, s2: kernel(q1, k1, v1, SegmentIds(s1, s2))
+        )(q, k, v, q_seg, kv_seg)
+
+    if mesh is not None:
+        batched = shard_map(
+            batched,
+            mesh=mesh,
+            in_specs=(
+                P("fsdp"), P("fsdp"), P("fsdp"), P("fsdp"), P("fsdp"),
+            ),
+            out_specs=P("fsdp"),
+            check_rep=False,
+        )
+
+    out = batched(q, k, v, q_seg, kv_seg)  # (B, Hq, L, D)
+    return out.transpose(0, 2, 1, 3).reshape(B, L, Hq * D)
+
+
 # ---------------------------------------------------------------------------
 # modules
 # ---------------------------------------------------------------------------
@@ -155,7 +253,8 @@ def scaled_dot_product_attention(q, k, v, keymask=None, qchunk=512):
 
 def attention_forward(
     x, p, heads, kvheads, freqs=None, keymask=None, lora=None, lora_scale=1.0,
-    qchunk=512,
+    qchunk=512, attn_impl="ref", attn_mesh=None, attn_block=256,
+    attn_interpret=False,
 ):
     """Sigmoid-gated multi-head attention (`Attention` in the reference)."""
     B, L, _ = x.shape
@@ -176,7 +275,15 @@ def attention_forward(
         q = rope_apply(q, freqs)
         k = rope_apply(k, freqs)
 
-    out = scaled_dot_product_attention(q, k, v, keymask=keymask, qchunk=qchunk)
+    if attn_impl == "splash":
+        out = splash_attention(
+            q, k, v, keymask=keymask, mesh=attn_mesh, block=attn_block,
+            interpret=attn_interpret,
+        )
+    elif attn_impl == "ref":
+        out = scaled_dot_product_attention(q, k, v, keymask=keymask, qchunk=qchunk)
+    else:
+        raise ValueError(f"unknown attn_impl: {attn_impl!r}")
     out = out * jax.nn.sigmoid(gate)
     return linear(out, p["wo"], _lget(lora, "wo"), lora_scale)
 
@@ -188,7 +295,9 @@ def swiglu_forward(x, p, lora=None, lora_scale=1.0):
 
 
 def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
-                        lora=None, lora_scale=1.0, qchunk=512):
+                        lora=None, lora_scale=1.0, qchunk=512,
+                        attn_impl="ref", attn_mesh=None, attn_block=256,
+                        attn_interpret=False):
     mods = tvec6 + p["mod"]["lin"]  # (B, 1, 6*features)
     prescale, preshift, pregate, postscale, postshift, postgate = jnp.split(
         mods, 6, axis=-1
@@ -197,6 +306,8 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
     x = x + pregate * attention_forward(
         h, p["attn"], cfg.heads, cfg.kvheads, freqs=freqs, keymask=keymask,
         lora=_lget(lora, "attn"), lora_scale=lora_scale, qchunk=qchunk,
+        attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
+        attn_interpret=attn_interpret,
     )
     h = (1 + postscale) * rms_norm(x, p["postnorm"]["scale"]) + postshift
     x = x + postgate * swiglu_forward(
@@ -205,16 +316,21 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
     return x
 
 
-def text_fusion_block(x, p, heads, kvheads, keymask=None):
+def text_fusion_block(x, p, heads, kvheads, keymask=None, lora=None,
+                      lora_scale=1.0):
     x = x + attention_forward(
         rms_norm(x, p["prenorm"]["scale"]), p["attn"], heads, kvheads,
-        keymask=keymask,
+        keymask=keymask, lora=_lget(lora, "attn"), lora_scale=lora_scale,
     )
-    x = x + swiglu_forward(rms_norm(x, p["postnorm"]["scale"]), p["mlp"])
+    x = x + swiglu_forward(
+        rms_norm(x, p["postnorm"]["scale"]), p["mlp"],
+        lora=_lget(lora, "mlp"), lora_scale=lora_scale,
+    )
     return x
 
 
-def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None):
+def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
+                        lora=None, lora_scale=1.0):
     """TextFusionTransformer: fuse per-layer encoder states then refine.
 
     context: (B, L, txtlayers, txtdim) -> (B, L, txtdim)
@@ -223,21 +339,29 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None):
     x = context.reshape(B * L, N, D)
     for i in range(2):  # layerwise blocks attend across the N encoder layers
         blk = jax.tree.map(lambda a: a[i], p["layerwise_blocks"])
-        x = text_fusion_block(x, blk, cfg.txtheads, cfg.txtkvheads)
+        x = text_fusion_block(
+            x, blk, cfg.txtheads, cfg.txtkvheads,
+            lora=_lindex(_lget(lora, "layerwise_blocks"), i),
+            lora_scale=lora_scale,
+        )
     x = x.reshape(B, L, N, D).transpose(0, 1, 3, 2)  # (B, L, D, N)
-    x = jnp.einsum("bldn,on->bldo", x, p["projector"]["weight"])[..., 0]
+    x = linear(x, p["projector"], _lget(lora, "projector"), lora_scale)[..., 0]
     for i in range(2):  # refiner blocks attend across the L text tokens
         blk = jax.tree.map(lambda a: a[i], p["refiner_blocks"])
-        x = text_fusion_block(x, blk, cfg.txtheads, cfg.txtkvheads, keymask=keymask)
+        x = text_fusion_block(
+            x, blk, cfg.txtheads, cfg.txtkvheads, keymask=keymask,
+            lora=_lindex(_lget(lora, "refiner_blocks"), i),
+            lora_scale=lora_scale,
+        )
     return x
 
 
-def last_layer_forward(x, p, tvec):
+def last_layer_forward(x, p, tvec, lora=None, lora_scale=1.0):
     """Modulated RMSNorm + projection back to patch pixels."""
     mods = tvec + p["modulation"]["lin"][None]  # (B, 2, features)
     scale, shift = mods[:, 0:1], mods[:, 1:2]
     x = (1 + scale) * rms_norm(x, p["norm"]["scale"]) + shift
-    return linear(x, p["linear"])
+    return linear(x, p["linear"], _lget(lora, "linear"), lora_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -257,24 +381,43 @@ def dit_forward(
     lora_scale=1.0,
     qchunk=512,
     remat=True,
+    attn_impl="ref",     # "ref" (exact fp32 softmax) or "splash" (fused TPU)
+    attn_mesh=None,      # mesh for shard_map around splash (sharded batch)
+    attn_block=256,      # splash tile size; must divide the padded seq len
+    attn_interpret=False,  # run splash in Pallas interpret mode (CPU tests)
 ):
-    """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels)."""
+    """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels).
+
+    remat: True/"full" checkpoints each scanned block (recompute everything in
+    backward), "dots" uses the dots_with_no_batch_dims_saveable policy (dense
+    projection outputs are saved, attention still rematerializes — spends HBM
+    to skip recomputing the big matmuls), False/"none" disables remat.
+    """
     B, Limg, _ = img.shape
     Ltxt = context.shape[1]
 
-    x = linear(img, params["first"])
+    x = linear(img, params["first"], _lget(lora, "first"), lora_scale)
 
     tv = timestep_embedding(t, cfg.tdim, dtype=x.dtype)
-    tv = linear(tv, params["tmlp"]["0"])
-    tv = linear(gelu_tanh(tv), params["tmlp"]["2"])          # (B, 1, features)
-    tvec6 = linear(gelu_tanh(tv), params["tproj"]["1"])      # (B, 1, 6*features)
+    tv = linear(tv, params["tmlp"]["0"], _lget(lora, "tmlp", "0"), lora_scale)
+    tv = linear(
+        gelu_tanh(tv), params["tmlp"]["2"], _lget(lora, "tmlp", "2"), lora_scale
+    )                                                        # (B, 1, features)
+    tvec6 = linear(
+        gelu_tanh(tv), params["tproj"]["1"], _lget(lora, "tproj", "1"),
+        lora_scale,
+    )                                                        # (B, 1, 6*features)
 
     txt = text_fusion_forward(
-        context, params["txtfusion"], cfg, keymask=mask[:, :Ltxt]
+        context, params["txtfusion"], cfg, keymask=mask[:, :Ltxt],
+        lora=_lget(lora, "txtfusion"), lora_scale=lora_scale,
     )
     txt = rms_norm(txt, params["txtmlp"]["0"]["scale"])
-    txt = linear(txt, params["txtmlp"]["1"])
-    txt = linear(gelu_tanh(txt), params["txtmlp"]["3"])
+    txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"), lora_scale)
+    txt = linear(
+        gelu_tanh(txt), params["txtmlp"]["3"], _lget(lora, "txtmlp", "3"),
+        lora_scale,
+    )
 
     combined = jnp.concatenate([txt, x], axis=1)
 
@@ -290,7 +433,9 @@ def dit_forward(
 
     blocks = params["blocks"]
     block_fn = partial(
-        single_stream_block, cfg=cfg, lora_scale=lora_scale, qchunk=qchunk
+        single_stream_block, cfg=cfg, lora_scale=lora_scale, qchunk=qchunk,
+        attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
+        attn_interpret=attn_interpret,
     )
 
     if lora is not None and "blocks" in lora:
@@ -303,11 +448,22 @@ def dit_forward(
             return block_fn(carry, p, tvec6, freqs, mask), None
         xs = blocks
 
-    if remat:
+    if remat is True or remat == "full":
         body = jax.checkpoint(body, prevent_cse=False)
+    elif remat == "dots":
+        body = jax.checkpoint(
+            body,
+            policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+            prevent_cse=False,
+        )
+    elif remat not in (False, None, "none"):
+        raise ValueError(f"unknown remat mode: {remat!r}")
     combined, _ = jax.lax.scan(body, combined, xs)
 
-    out = last_layer_forward(combined, params["last"], tv)
+    out = last_layer_forward(
+        combined, params["last"], tv, lora=_lget(lora, "last"),
+        lora_scale=lora_scale,
+    )
     return out[:, Ltxt : Ltxt + Limg]
 
 

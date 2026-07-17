@@ -98,6 +98,31 @@ def find_latest_checkpoint(dir_path):
     return best
 
 
+def check_resume_meta(meta, rank, alpha, targets):
+    """Fail fast when --resume flags disagree with checkpoint metadata.
+
+    The LoRA tree is loaded from the checkpoint as-is, so a CLI mismatch
+    would not crash — it would silently train with the wrong lora_scale and
+    re-save the tree labeled with the wrong rank/alpha/targets.
+    """
+    problems = []
+    if "rank" in meta and float(meta["rank"]) != float(rank):
+        problems.append(f"checkpoint rank {meta['rank']} != --rank {rank}")
+    if "alpha" in meta and float(meta["alpha"]) != float(alpha):
+        problems.append(f"checkpoint alpha {meta['alpha']} != --alpha {alpha}")
+    if "targets" in meta and meta["targets"] != targets:
+        problems.append(
+            f"checkpoint targets {meta['targets']!r} != --targets {targets!r}"
+        )
+    if problems:
+        raise SystemExit(
+            "--resume mismatch: " + "; ".join(problems) + " — rerun with "
+            f"--rank {meta.get('rank', rank)} "
+            f"--alpha {meta.get('alpha', alpha)} "
+            f"--targets {meta.get('targets', targets)} (or drop --resume)"
+        )
+
+
 def train_state_path(lora_path):
     """Companion train-state file for a LoRA checkpoint.
 
@@ -126,7 +151,11 @@ def main():
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=None, help="default: rank")
     ap.add_argument(
-        "--targets", choices=["attn", "attn+mlp", "all"], default="attn"
+        "--targets", choices=["attn", "attn+mlp", "all", "full"], default="attn",
+        help="attn: wq/wk/wv/wo; attn+mlp: adds the SwiGLU MLP; all: adds the "
+             "attention sigmoid gate; full: every Linear in the DiT (adds the "
+             "text-fusion transformer and the image/timestep/text/output "
+             "projections — the model authors' recommended coverage)",
     )
     ap.add_argument("--txt-len", default="auto", help='"auto" or an int (<=512)')
     ap.add_argument("--timestep-mu", type=float, default=None,
@@ -134,6 +163,27 @@ def main():
     ap.add_argument("--logit-mean", type=float, default=0.0)
     ap.add_argument("--logit-std", type=float, default=1.0)
     ap.add_argument("--qchunk", type=int, default=512)
+    ap.add_argument(
+        "--attn", choices=["ref", "splash"], default="ref",
+        help="attention implementation: exact fp32-softmax reference, or the "
+             "fused Pallas TPU (Splash) kernel — same math, no HBM logit "
+             "buffer; requires the padded sequence length to be a multiple "
+             "of --attn-block",
+    )
+    ap.add_argument("--attn-block", type=int, default=256,
+                    help="splash attention tile size")
+    ap.add_argument(
+        "--remat-policy", choices=["full", "dots", "none"], default="full",
+        help="gradient checkpointing: 'full' recomputes each block, 'dots' "
+             "saves dense-projection outputs (faster backward, more HBM), "
+             "'none' saves everything (needs the most HBM)",
+    )
+    ap.add_argument(
+        "--base-sharding", choices=["fsdp", "replicate"], default="fsdp",
+        help="frozen base placement: FSDP-shard across devices, or replicate "
+             "(full ~24 GiB copy per device instead of 24/n_devices, removes "
+             "per-step weight all-gathers)",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
@@ -164,6 +214,9 @@ def main():
             raise SystemExit(f"--resume: no LoRA checkpoint found in {args.resume}")
     elif args.resume:
         resume = Path(args.resume)
+    if resume:
+        with safe_open(str(resume), framework="numpy") as f:
+            check_resume_meta(f.metadata() or {}, args.rank, alpha, args.targets)
 
     mesh = make_mesh()
     n_dev = mesh.size
@@ -186,8 +239,15 @@ def main():
     # --- model ---
     print("loading base checkpoint (this can take a few minutes)...")
     t0 = time.time()
-    params = load_krea2_params(args.base_ckpt, mesh=mesh, dtype=jnp.bfloat16)
+    params = load_krea2_params(
+        args.base_ckpt, mesh=mesh, dtype=jnp.bfloat16,
+        sharding=args.base_sharding,
+    )
     print(f"base params loaded in {time.time() - t0:.0f}s")
+    print(
+        f"attn {args.attn} | remat {args.remat_policy} | "
+        f"base {args.base_sharding}"
+    )
 
     rng = jax.random.PRNGKey(args.seed)
     rng, lora_rng = jax.random.split(rng)
@@ -256,7 +316,12 @@ def main():
         def loss_fn(lora):
             v = dit_forward(
                 params, cfg, xt, batch_txt, t, pos, mask,
-                lora=lora, lora_scale=lora_scale, qchunk=args.qchunk, remat=True,
+                lora=lora, lora_scale=lora_scale, qchunk=args.qchunk,
+                remat={"full": True, "dots": "dots", "none": False}[
+                    args.remat_policy
+                ],
+                attn_impl=args.attn, attn_mesh=mesh,
+                attn_block=args.attn_block,
             )
             return jnp.mean((v.astype(jnp.float32) - target) ** 2)
 
@@ -281,10 +346,16 @@ def main():
         print(f"saved {out_dir / name} (+ {state_path.name})")
 
     # --- loop ---
+    # Epoch-shuffled order (each sample seen once per epoch) instead of iid
+    # per-step draws: matches the reference trainer and evens out coverage.
     np_rng = np.random.default_rng([args.seed, start_step])
+    perm, perm_pos = np_rng.permutation(N), 0
     ema_loss, t_log = None, time.time()
     for step in range(start_step + 1, args.steps + 1):
-        idx = np_rng.choice(N, size=args.batch_size, replace=N < args.batch_size)
+        if perm_pos + args.batch_size > N:
+            perm, perm_pos = np_rng.permutation(N), 0
+        idx = perm[perm_pos:perm_pos + args.batch_size]
+        perm_pos += args.batch_size
         batch_lat = jax.device_put(latents[idx], data_sharding)
         batch_txt = jax.device_put(txt[idx], data_sharding)
         batch_mask = jax.device_put(txt_mask[idx], data_sharding)

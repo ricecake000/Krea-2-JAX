@@ -21,6 +21,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -138,6 +139,12 @@ def main():
                     help="fixed training height; overrides --resolution")
     ap.add_argument("--max-length", type=int, default=512)
     ap.add_argument("--default-caption", default="")
+    ap.add_argument(
+        "--caption-prefix", default="",
+        help="prepended to every caption before encoding (e.g. a trigger "
+             'phrase: "PJSK_Style. "); existing cache entries whose stored '
+             "caption differs are re-encoded, reusing their latents",
+    )
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--text-encoder", default="Qwen/Qwen3-VL-4B-Instruct")
     ap.add_argument("--vae", default="Qwen/Qwen-Image")
@@ -157,9 +164,46 @@ def main():
         raise SystemExit(f"no images found in {data_dir}")
     print(f"found {len(images)} images")
 
+    def cached_txt_len(out, caption, name):
+        """txt token count if `out` is a valid cache entry for exactly this
+        (image, caption, resolution, max_length) job, else None.
+
+        Outputs are deterministic per input+settings, so an entry may only be
+        reused when everything that influenced it still matches; a truncated
+        file (previous interruption) fails safe_open and is recomputed.
+        """
+        try:
+            with safe_open(str(out), framework="pt") as f:
+                m = f.metadata() or {}
+                if m.get("image") != name or m.get("caption") != caption:
+                    return None
+                lat_shape = tuple(f.get_slice("latent").get_shape())
+                txt_shape = tuple(f.get_slice("txt").get_shape())
+        except Exception:
+            return None
+        if lat_shape != (16, height // 8, width // 8):
+            return None
+        if len(txt_shape) != 3 or txt_shape[1:] != (12, 2560):
+            return None
+        if txt_shape[0] > args.max_length:
+            return None
+        return txt_shape[0]
+
+    # Encoders load lazily: a fully cached rerun never touches the models.
     dtype = torch.bfloat16 if args.device != "cpu" else torch.float32
-    text_encoder = TextEncoder(args.text_encoder, args.device, dtype, args.max_length)
-    vae = VaeEncoder(args.vae, args.device, dtype)
+    text_encoder = vae = None
+
+    def cached_latent(out, name):
+        """Reuse the stored latent when only the caption changed: the image,
+        resolution, and VAE are unchanged, so the latent is identical."""
+        try:
+            with safe_open(str(out), framework="pt") as f:
+                if (f.metadata() or {}).get("image") != name:
+                    return None
+                lat = f.get_tensor("latent")
+        except Exception:
+            return None
+        return lat if lat.shape == (16, height // 8, width // 8) else None
 
     samples = []
     for i, path in enumerate(images):
@@ -167,7 +211,27 @@ def main():
         caption = (
             cap_path.read_text().strip() if cap_path.exists() else args.default_caption
         )
-        latent = vae(load_image(path, width, height))
+        if args.caption_prefix:
+            caption = args.caption_prefix + caption
+        out = cache_dir / f"{i:06d}.safetensors"
+        latent = None
+        if out.exists():
+            n_valid = cached_txt_len(out, caption, path.name)
+            if n_valid is not None:
+                samples.append(
+                    {"file": out.name, "txt_len": n_valid, "image": path.name}
+                )
+                print(f"[{i + 1}/{len(images)}] {path.name} (already cached)")
+                continue
+            latent = cached_latent(out, path.name)
+        if text_encoder is None:
+            text_encoder = TextEncoder(
+                args.text_encoder, args.device, dtype, args.max_length
+            )
+        if latent is None:
+            if vae is None:
+                vae = VaeEncoder(args.vae, args.device, dtype)
+            latent = vae(load_image(path, width, height))
         hiddens, mask = text_encoder(caption)
         n_valid = int(mask.sum().item())
         # Compact away padding: valid tokens are (prompt..., suffix) — text
@@ -175,7 +239,6 @@ def main():
         # dropping padded rows and re-padding later is mathematically exact.
         hiddens = hiddens[mask].contiguous()  # (n_valid, 12, 2560)
 
-        out = cache_dir / f"{i:06d}.safetensors"
         save_file(
             {
                 "latent": latent.to(torch.bfloat16).cpu(),
@@ -195,6 +258,7 @@ def main():
         "txt_dim": 2560,
         "txt_layers": 12,
         "max_length": args.max_length,
+        "caption_prefix": args.caption_prefix,
         "text_encoder": args.text_encoder,
         "vae": args.vae,
         "samples": samples,
