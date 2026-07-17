@@ -98,6 +98,31 @@ def find_latest_checkpoint(dir_path):
     return best
 
 
+def check_resume_meta(meta, rank, alpha, targets):
+    """Fail fast when --resume flags disagree with checkpoint metadata.
+
+    The LoRA tree is loaded from the checkpoint as-is, so a CLI mismatch
+    would not crash — it would silently train with the wrong lora_scale and
+    re-save the tree labeled with the wrong rank/alpha/targets.
+    """
+    problems = []
+    if "rank" in meta and float(meta["rank"]) != float(rank):
+        problems.append(f"checkpoint rank {meta['rank']} != --rank {rank}")
+    if "alpha" in meta and float(meta["alpha"]) != float(alpha):
+        problems.append(f"checkpoint alpha {meta['alpha']} != --alpha {alpha}")
+    if "targets" in meta and meta["targets"] != targets:
+        problems.append(
+            f"checkpoint targets {meta['targets']!r} != --targets {targets!r}"
+        )
+    if problems:
+        raise SystemExit(
+            "--resume mismatch: " + "; ".join(problems) + " — rerun with "
+            f"--rank {meta.get('rank', rank)} "
+            f"--alpha {meta.get('alpha', alpha)} "
+            f"--targets {meta.get('targets', targets)} (or drop --resume)"
+        )
+
+
 def train_state_path(lora_path):
     """Companion train-state file for a LoRA checkpoint.
 
@@ -164,6 +189,9 @@ def main():
             raise SystemExit(f"--resume: no LoRA checkpoint found in {args.resume}")
     elif args.resume:
         resume = Path(args.resume)
+    if resume:
+        with safe_open(str(resume), framework="numpy") as f:
+            check_resume_meta(f.metadata() or {}, args.rank, alpha, args.targets)
 
     mesh = make_mesh()
     n_dev = mesh.size
@@ -281,10 +309,16 @@ def main():
         print(f"saved {out_dir / name} (+ {state_path.name})")
 
     # --- loop ---
+    # Epoch-shuffled order (each sample seen once per epoch) instead of iid
+    # per-step draws: matches the reference trainer and evens out coverage.
     np_rng = np.random.default_rng([args.seed, start_step])
+    perm, perm_pos = np_rng.permutation(N), 0
     ema_loss, t_log = None, time.time()
     for step in range(start_step + 1, args.steps + 1):
-        idx = np_rng.choice(N, size=args.batch_size, replace=N < args.batch_size)
+        if perm_pos + args.batch_size > N:
+            perm, perm_pos = np_rng.permutation(N), 0
+        idx = perm[perm_pos:perm_pos + args.batch_size]
+        perm_pos += args.batch_size
         batch_lat = jax.device_put(latents[idx], data_sharding)
         batch_txt = jax.device_put(txt[idx], data_sharding)
         batch_mask = jax.device_put(txt_mask[idx], data_sharding)
