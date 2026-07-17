@@ -74,13 +74,18 @@ def _nest(tree, path, leaf):
     node[path[-1]] = leaf
 
 
-def load_krea2_params(path, mesh=None, dtype=None):
+def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp"):
     """Load the official DiT safetensors into a (sharded) nested pytree.
 
     Tensors are read on host CPU, repeated blocks are stacked, and each leaf
-    is placed on the mesh with an FSDP-style sharding. With mesh=None the
-    tree stays on the default device, replicated.
+    is placed on the mesh. sharding="fsdp" shards each leaf's largest
+    divisible dim across the mesh; "replicate" keeps a full copy per device
+    (frozen base + pure data parallelism: no weight all-gathers per step, at
+    ~24 GiB HBM per device for the 12.9B model). With mesh=None the tree
+    stays on the default device, replicated.
     """
+    if sharding not in ("fsdp", "replicate"):
+        raise ValueError(f"unknown base sharding: {sharding!r}")
     cpu = jax.devices("cpu")[0]
     flat = {}
     stacked = {}  # prefix -> field -> {idx: array}
@@ -101,7 +106,7 @@ def load_krea2_params(path, mesh=None, dtype=None):
 
     params = {}
     for key, tensor in flat.items():
-        _nest(params, key.split("."), _place(tensor, mesh, stacked=False))
+        _nest(params, key.split("."), _place(tensor, mesh, stacked=False, sharding=sharding))
     for prefix, fields in stacked.items():
         for rest, by_idx in fields.items():
             n = max(by_idx) + 1
@@ -111,15 +116,18 @@ def load_krea2_params(path, mesh=None, dtype=None):
             _nest(
                 params,
                 prefix.split(".") + rest.split("."),
-                _place(arr, mesh, stacked=True),
+                _place(arr, mesh, stacked=True, sharding=sharding),
             )
     return params
 
 
-def _place(arr, mesh, stacked):
+def _place(arr, mesh, stacked, sharding="fsdp"):
     if mesh is None:
         return arr
-    spec = param_partition_spec(arr.shape, mesh.size, stacked)
+    if sharding == "replicate":
+        spec = P()
+    else:
+        spec = param_partition_spec(arr.shape, mesh.size, stacked)
     return jax.device_put(arr, NamedSharding(mesh, spec))
 
 

@@ -163,6 +163,27 @@ def main():
     ap.add_argument("--logit-mean", type=float, default=0.0)
     ap.add_argument("--logit-std", type=float, default=1.0)
     ap.add_argument("--qchunk", type=int, default=512)
+    ap.add_argument(
+        "--attn", choices=["ref", "splash"], default="ref",
+        help="attention implementation: exact fp32-softmax reference, or the "
+             "fused Pallas TPU (Splash) kernel — same math, no HBM logit "
+             "buffer; requires the padded sequence length to be a multiple "
+             "of --attn-block",
+    )
+    ap.add_argument("--attn-block", type=int, default=256,
+                    help="splash attention tile size")
+    ap.add_argument(
+        "--remat-policy", choices=["full", "dots", "none"], default="full",
+        help="gradient checkpointing: 'full' recomputes each block, 'dots' "
+             "saves dense-projection outputs (faster backward, more HBM), "
+             "'none' saves everything (needs the most HBM)",
+    )
+    ap.add_argument(
+        "--base-sharding", choices=["fsdp", "replicate"], default="fsdp",
+        help="frozen base placement: FSDP-shard across devices, or replicate "
+             "(full ~24 GiB copy per device instead of 24/n_devices, removes "
+             "per-step weight all-gathers)",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
@@ -218,8 +239,15 @@ def main():
     # --- model ---
     print("loading base checkpoint (this can take a few minutes)...")
     t0 = time.time()
-    params = load_krea2_params(args.base_ckpt, mesh=mesh, dtype=jnp.bfloat16)
+    params = load_krea2_params(
+        args.base_ckpt, mesh=mesh, dtype=jnp.bfloat16,
+        sharding=args.base_sharding,
+    )
     print(f"base params loaded in {time.time() - t0:.0f}s")
+    print(
+        f"attn {args.attn} | remat {args.remat_policy} | "
+        f"base {args.base_sharding}"
+    )
 
     rng = jax.random.PRNGKey(args.seed)
     rng, lora_rng = jax.random.split(rng)
@@ -288,7 +316,12 @@ def main():
         def loss_fn(lora):
             v = dit_forward(
                 params, cfg, xt, batch_txt, t, pos, mask,
-                lora=lora, lora_scale=lora_scale, qchunk=args.qchunk, remat=True,
+                lora=lora, lora_scale=lora_scale, qchunk=args.qchunk,
+                remat={"full": True, "dots": "dots", "none": False}[
+                    args.remat_policy
+                ],
+                attn_impl=args.attn, attn_mesh=mesh,
+                attn_block=args.attn_block,
             )
             return jnp.mean((v.astype(jnp.float32) - target) ** 2)
 

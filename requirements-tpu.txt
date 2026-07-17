@@ -1,7 +1,10 @@
 # TPU training / sampling (the DiT itself)
 # Install JAX for TPU first:
-#   pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-jax>=0.4.35
+#   pip install "jax[tpu]==0.6.2" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# Pinned: the splash-attention path uses experimental Pallas/shard_map APIs
+# that changed after 0.6.x (jax.shard_map / check_vma); bump deliberately and
+# re-run tests/test_attention.py.
+jax==0.6.2
 optax>=0.2.0
 safetensors>=0.4.5
 ml_dtypes>=0.4.0
