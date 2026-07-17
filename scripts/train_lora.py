@@ -151,7 +151,11 @@ def main():
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=None, help="default: rank")
     ap.add_argument(
-        "--targets", choices=["attn", "attn+mlp", "all"], default="attn"
+        "--targets", choices=["attn", "attn+mlp", "all", "full"], default="attn",
+        help="attn: wq/wk/wv/wo; attn+mlp: adds the SwiGLU MLP; all: adds the "
+             "attention sigmoid gate; full: every Linear in the DiT (adds the "
+             "text-fusion transformer and the image/timestep/text/output "
+             "projections — the model authors' recommended coverage)",
     )
     ap.add_argument("--txt-len", default="auto", help='"auto" or an int (<=512)')
     ap.add_argument("--timestep-mu", type=float, default=None,

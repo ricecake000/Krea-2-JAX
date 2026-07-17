@@ -33,8 +33,16 @@ MASK_BIAS = -1e30
 # ---------------------------------------------------------------------------
 
 
-def _lget(lora, key):
-    return None if lora is None else lora.get(key)
+def _lget(lora, *keys):
+    node = lora
+    for k in keys:
+        node = None if node is None else node.get(k)
+    return node
+
+
+def _lindex(lora, i):
+    """Select layer i from a stacked LoRA subtree (None passes through)."""
+    return None if lora is None else jax.tree.map(lambda a: a[i], lora)
 
 
 def linear(x, p, lora=None, lora_scale=1.0):
@@ -205,16 +213,21 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
     return x
 
 
-def text_fusion_block(x, p, heads, kvheads, keymask=None):
+def text_fusion_block(x, p, heads, kvheads, keymask=None, lora=None,
+                      lora_scale=1.0):
     x = x + attention_forward(
         rms_norm(x, p["prenorm"]["scale"]), p["attn"], heads, kvheads,
-        keymask=keymask,
+        keymask=keymask, lora=_lget(lora, "attn"), lora_scale=lora_scale,
     )
-    x = x + swiglu_forward(rms_norm(x, p["postnorm"]["scale"]), p["mlp"])
+    x = x + swiglu_forward(
+        rms_norm(x, p["postnorm"]["scale"]), p["mlp"],
+        lora=_lget(lora, "mlp"), lora_scale=lora_scale,
+    )
     return x
 
 
-def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None):
+def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
+                        lora=None, lora_scale=1.0):
     """TextFusionTransformer: fuse per-layer encoder states then refine.
 
     context: (B, L, txtlayers, txtdim) -> (B, L, txtdim)
@@ -223,21 +236,29 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None):
     x = context.reshape(B * L, N, D)
     for i in range(2):  # layerwise blocks attend across the N encoder layers
         blk = jax.tree.map(lambda a: a[i], p["layerwise_blocks"])
-        x = text_fusion_block(x, blk, cfg.txtheads, cfg.txtkvheads)
+        x = text_fusion_block(
+            x, blk, cfg.txtheads, cfg.txtkvheads,
+            lora=_lindex(_lget(lora, "layerwise_blocks"), i),
+            lora_scale=lora_scale,
+        )
     x = x.reshape(B, L, N, D).transpose(0, 1, 3, 2)  # (B, L, D, N)
-    x = jnp.einsum("bldn,on->bldo", x, p["projector"]["weight"])[..., 0]
+    x = linear(x, p["projector"], _lget(lora, "projector"), lora_scale)[..., 0]
     for i in range(2):  # refiner blocks attend across the L text tokens
         blk = jax.tree.map(lambda a: a[i], p["refiner_blocks"])
-        x = text_fusion_block(x, blk, cfg.txtheads, cfg.txtkvheads, keymask=keymask)
+        x = text_fusion_block(
+            x, blk, cfg.txtheads, cfg.txtkvheads, keymask=keymask,
+            lora=_lindex(_lget(lora, "refiner_blocks"), i),
+            lora_scale=lora_scale,
+        )
     return x
 
 
-def last_layer_forward(x, p, tvec):
+def last_layer_forward(x, p, tvec, lora=None, lora_scale=1.0):
     """Modulated RMSNorm + projection back to patch pixels."""
     mods = tvec + p["modulation"]["lin"][None]  # (B, 2, features)
     scale, shift = mods[:, 0:1], mods[:, 1:2]
     x = (1 + scale) * rms_norm(x, p["norm"]["scale"]) + shift
-    return linear(x, p["linear"])
+    return linear(x, p["linear"], _lget(lora, "linear"), lora_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -262,19 +283,28 @@ def dit_forward(
     B, Limg, _ = img.shape
     Ltxt = context.shape[1]
 
-    x = linear(img, params["first"])
+    x = linear(img, params["first"], _lget(lora, "first"), lora_scale)
 
     tv = timestep_embedding(t, cfg.tdim, dtype=x.dtype)
-    tv = linear(tv, params["tmlp"]["0"])
-    tv = linear(gelu_tanh(tv), params["tmlp"]["2"])          # (B, 1, features)
-    tvec6 = linear(gelu_tanh(tv), params["tproj"]["1"])      # (B, 1, 6*features)
+    tv = linear(tv, params["tmlp"]["0"], _lget(lora, "tmlp", "0"), lora_scale)
+    tv = linear(
+        gelu_tanh(tv), params["tmlp"]["2"], _lget(lora, "tmlp", "2"), lora_scale
+    )                                                        # (B, 1, features)
+    tvec6 = linear(
+        gelu_tanh(tv), params["tproj"]["1"], _lget(lora, "tproj", "1"),
+        lora_scale,
+    )                                                        # (B, 1, 6*features)
 
     txt = text_fusion_forward(
-        context, params["txtfusion"], cfg, keymask=mask[:, :Ltxt]
+        context, params["txtfusion"], cfg, keymask=mask[:, :Ltxt],
+        lora=_lget(lora, "txtfusion"), lora_scale=lora_scale,
     )
     txt = rms_norm(txt, params["txtmlp"]["0"]["scale"])
-    txt = linear(txt, params["txtmlp"]["1"])
-    txt = linear(gelu_tanh(txt), params["txtmlp"]["3"])
+    txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"), lora_scale)
+    txt = linear(
+        gelu_tanh(txt), params["txtmlp"]["3"], _lget(lora, "txtmlp", "3"),
+        lora_scale,
+    )
 
     combined = jnp.concatenate([txt, x], axis=1)
 
@@ -307,7 +337,10 @@ def dit_forward(
         body = jax.checkpoint(body, prevent_cse=False)
     combined, _ = jax.lax.scan(body, combined, xs)
 
-    out = last_layer_forward(combined, params["last"], tv)
+    out = last_layer_forward(
+        combined, params["last"], tv, lora=_lget(lora, "last"),
+        lora_scale=lora_scale,
+    )
     return out[:, Ltxt : Ltxt + Limg]
 
 
