@@ -112,12 +112,15 @@ def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp"):
             n = max(by_idx) + 1
             assert len(by_idx) == n, f"missing block index under {prefix}.{rest}"
             with jax.default_device(cpu):
-                arr = jnp.stack([by_idx[i] for i in range(n)], axis=0)
+                # pop as we stack: keeping every per-block tensor alive
+                # alongside its stacked copy doubles the ~26 GB host peak
+                arr = jnp.stack([by_idx.pop(i) for i in range(n)], axis=0)
             _nest(
                 params,
                 prefix.split(".") + rest.split("."),
                 _place(arr, mesh, stacked=True, sharding=sharding),
             )
+            del arr
     return params
 
 
