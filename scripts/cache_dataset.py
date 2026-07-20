@@ -52,7 +52,14 @@ class TextEncoder:
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.device = device
+        self.dtype = dtype
         self.max_length = max_length
+
+    def to_dtype(self, dtype):
+        # Module.to converts parameter-by-parameter, so peak memory is
+        # model + largest tensor, not 2x model.
+        self.model.to(dtype)
+        self.dtype = dtype
 
     @torch.no_grad()
     def __call__(self, text: str):
@@ -99,6 +106,10 @@ class VaeEncoder:
             1, -1, 1, 1, 1
         )
         self.device = device
+        self.dtype = dtype
+
+    def to_dtype(self, dtype):
+        self.vae.to(dtype)
         self.dtype = dtype
 
     @torch.no_grad()
@@ -148,6 +159,12 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--text-encoder", default="Qwen/Qwen3-VL-4B-Instruct")
     ap.add_argument("--vae", default="Qwen/Qwen-Image")
+    ap.add_argument(
+        "--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto",
+        help="compute dtype; auto = bf16 on GPU, fp32 on CPU. fp16 uses the "
+             "tensor cores on pre-Ampere GPUs (V100/T4, which lack bf16 "
+             "hardware); non-finite outputs fall back to bf16 per encoder",
+    )
     args = ap.parse_args()
 
     width = args.width if args.width is not None else args.resolution
@@ -190,8 +207,28 @@ def main():
         return txt_shape[0]
 
     # Encoders load lazily: a fully cached rerun never touches the models.
-    dtype = torch.bfloat16 if args.device != "cpu" else torch.float32
+    if args.dtype == "auto":
+        dtype = torch.bfloat16 if args.device != "cpu" else torch.float32
+    else:
+        dtype = {
+            "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32
+        }[args.dtype]
     text_encoder = vae = None
+
+    def ensure_finite(tensor, encoder, recompute, label, name):
+        """fp16 can overflow (max 65504) where bf16 does not; on a non-finite
+        result, permanently switch that encoder to bf16 and redo the sample."""
+        if torch.isfinite(tensor).all():
+            return tensor
+        if encoder.dtype == torch.bfloat16:
+            raise SystemExit(f"non-finite {label} for {name} even in bf16")
+        print(f"WARNING: non-finite {label} for {name}; "
+              f"switching {type(encoder).__name__} to bf16")
+        encoder.to_dtype(torch.bfloat16)
+        tensor = recompute()
+        if not torch.isfinite(tensor).all():
+            raise SystemExit(f"non-finite {label} for {name} even in bf16")
+        return tensor
 
     def cached_latent(out, name):
         """Reuse the stored latent when only the caption changed: the image,
@@ -231,13 +268,26 @@ def main():
         if latent is None:
             if vae is None:
                 vae = VaeEncoder(args.vae, args.device, dtype)
-            latent = vae(load_image(path, width, height))
-        hiddens, mask = text_encoder(caption)
+            latent = ensure_finite(
+                vae(load_image(path, width, height)), vae,
+                lambda: vae(load_image(path, width, height)),
+                "latent", path.name,
+            )
+
+        def encode_txt():
+            hiddens, mask = text_encoder(caption)
+            # Compact away padding: valid tokens are (prompt..., suffix) —
+            # text RoPE positions are all zero and padding is masked
+            # everywhere, so dropping padded rows and re-padding later is
+            # mathematically exact. (Padded rows are also excluded from the
+            # finite check: they may legitimately overflow and are dropped.)
+            return hiddens[mask].contiguous(), mask  # (n_valid, 12, 2560)
+
+        hiddens, mask = encode_txt()
+        hiddens = ensure_finite(
+            hiddens, text_encoder, lambda: encode_txt()[0], "txt", path.name
+        )
         n_valid = int(mask.sum().item())
-        # Compact away padding: valid tokens are (prompt..., suffix) — text
-        # RoPE positions are all zero and padding is masked everywhere, so
-        # dropping padded rows and re-padding later is mathematically exact.
-        hiddens = hiddens[mask].contiguous()  # (n_valid, 12, 2560)
 
         save_file(
             {
@@ -258,6 +308,7 @@ def main():
         "txt_dim": 2560,
         "txt_layers": 12,
         "max_length": args.max_length,
+        "compute_dtype": args.dtype,
         "caption_prefix": args.caption_prefix,
         "text_encoder": args.text_encoder,
         "vae": args.vae,
