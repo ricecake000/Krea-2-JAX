@@ -160,6 +160,15 @@ def main():
     ap.add_argument("--text-encoder", default="Qwen/Qwen3-VL-4B-Instruct")
     ap.add_argument("--vae", default="Qwen/Qwen-Image")
     ap.add_argument(
+        "--num-shards", type=int, default=1,
+        help="split the run across N independent processes (e.g. one per "
+             "GPU); file numbering stays global, so shards never collide. "
+             "Sharded runs skip meta.json — run once more without shard "
+             "args afterwards: every entry is reused (no model load) and "
+             "the full meta.json is written",
+    )
+    ap.add_argument("--shard-index", type=int, default=0)
+    ap.add_argument(
         "--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto",
         help="compute dtype; auto = bf16 on GPU, fp32 on CPU. fp16 uses the "
              "tensor cores on pre-Ampere GPUs (V100/T4, which lack bf16 "
@@ -180,6 +189,18 @@ def main():
     if not images:
         raise SystemExit(f"no images found in {data_dir}")
     print(f"found {len(images)} images")
+
+    if not 0 <= args.shard_index < args.num_shards:
+        raise SystemExit("--shard-index must be in [0, --num-shards)")
+    # Interleaved split balances content across shards; enumerate before
+    # slicing so cache filenames keep their global index.
+    jobs = [
+        (i, p) for i, p in enumerate(images)
+        if i % args.num_shards == args.shard_index
+    ]
+    if args.num_shards > 1:
+        print(f"shard {args.shard_index}/{args.num_shards}: "
+              f"{len(jobs)} images")
 
     def cached_txt_len(out, caption, name):
         """txt token count if `out` is a valid cache entry for exactly this
@@ -243,7 +264,7 @@ def main():
         return lat if lat.shape == (16, height // 8, width // 8) else None
 
     samples = []
-    for i, path in enumerate(images):
+    for i, path in jobs:
         cap_path = path.with_suffix(".txt")
         caption = (
             cap_path.read_text().strip() if cap_path.exists() else args.default_caption
@@ -299,6 +320,11 @@ def main():
         )
         samples.append({"file": out.name, "txt_len": n_valid, "image": path.name})
         print(f"[{i + 1}/{len(images)}] {path.name} (txt tokens: {n_valid})")
+
+    if args.num_shards > 1:
+        print(f"shard {args.shard_index}/{args.num_shards} done: "
+              f"{len(samples)} samples (meta.json left to the merge pass)")
+        return
 
     meta = {
         "width": width,
