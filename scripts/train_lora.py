@@ -185,6 +185,12 @@ def main():
              "per-step weight all-gathers)",
     )
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--max-hours", type=float, default=None,
+        help="wall-clock budget for the train loop (compile time included); "
+             "on expiry the current step is saved as the final checkpoint "
+             "and training exits cleanly",
+    )
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument(
@@ -351,6 +357,7 @@ def main():
     np_rng = np.random.default_rng([args.seed, start_step])
     perm, perm_pos = np_rng.permutation(N), 0
     ema_loss, t_log = None, time.time()
+    t_train, last_step = time.time(), start_step
     for step in range(start_step + 1, args.steps + 1):
         if perm_pos + args.batch_size > N:
             perm, perm_pos = np_rng.permutation(N), 0
@@ -377,8 +384,16 @@ def main():
             )
         if args.save_every and step % args.save_every == 0 and step < args.steps:
             save(step)
+        last_step = step
+        if (
+            args.max_hours
+            and time.time() - t_train > args.max_hours * 3600
+        ):
+            print(f"--max-hours {args.max_hours} reached; "
+                  f"stopping at step {step}")
+            break
 
-    save(args.steps, final=True)
+    save(last_step, final=True)
     print("done.")
 
 
