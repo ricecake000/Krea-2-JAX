@@ -1,10 +1,14 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 *.safetensors
 cache/
 lora_out/
 data/
 venv/
 .venv/
+samples/
+*.log
 *.png
 !docs/*.png
+.claude/
