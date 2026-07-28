@@ -144,6 +144,12 @@ def main():
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument(
+        "--optimizer", choices=["adamw", "prodigy"], default="adamw",
+        help="prodigy (optax.contrib) estimates the step size itself: --lr "
+             "becomes a multiplier (use 1.0 with --warmup-steps 0) and the "
+             "running estimate d is printed in the step log",
+    )
     ap.add_argument("--warmup-steps", type=int, default=100)
     ap.add_argument("--cosine-decay", action="store_true")
     ap.add_argument("--weight-decay", type=float, default=0.0)
@@ -279,9 +285,15 @@ def main():
              optax.constant_schedule(args.lr)],
             [args.warmup_steps],
         )
+    if args.optimizer == "prodigy":
+        inner = optax.contrib.prodigy(
+            sched, weight_decay=args.weight_decay, safeguard_warmup=True
+        )
+    else:
+        inner = optax.adamw(sched, weight_decay=args.weight_decay)
     tx = optax.chain(
         optax.clip_by_global_norm(args.grad_clip),
-        optax.adamw(sched, weight_decay=args.weight_decay),
+        inner,
     )
     opt_state = replicate_tree(tx.init(lora), mesh)
     start_step = 0
@@ -377,9 +389,12 @@ def main():
             ema_loss = loss if ema_loss is None else 0.9 * ema_loss + 0.1 * loss
             dt = time.time() - t_log
             t_log = time.time()
+            extra = ""
+            if args.optimizer == "prodigy":
+                extra = f"  d {float(opt_state[1].estim_lr):.2e}"
             print(
                 f"step {step:6d}/{args.steps}  loss {loss:.4f}  "
-                f"ema {ema_loss:.4f}  lr {float(sched(step)):.2e}  "
+                f"ema {ema_loss:.4f}  lr {float(sched(step)):.2e}{extra}  "
                 f"{dt / args.log_every:.2f}s/it"
             )
         if args.save_every and step % args.save_every == 0 and step < args.steps:
