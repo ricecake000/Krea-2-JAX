@@ -295,7 +295,9 @@ def main():
         optax.clip_by_global_norm(args.grad_clip),
         inner,
     )
-    opt_state = replicate_tree(tx.init(lora), mesh)
+    # init from a copy: prodigy's params0 would otherwise alias the lora
+    # buffers, and train_step donates both trees (double-donation error)
+    opt_state = replicate_tree(tx.init(jax.tree.map(jnp.copy, lora)), mesh)
     start_step = 0
     if resume:
         state_path = train_state_path(resume)
