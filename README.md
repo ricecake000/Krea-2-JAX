@@ -125,6 +125,19 @@ Prompt encoding and VAE decoding run on host CPU via PyTorch; the DiT
 sampling loop runs on TPU. For the Turbo checkpoint use
 `--steps 8 --cfg 0 --mu 1.15`.
 
+Sampling-side optimizations (outputs unchanged, see `tests/test_sampling.py`):
+
+- `--attn splash` (default on TPU): fused Pallas attention, so the
+  float32 `(heads, chunk, L)` logits never round-trip through HBM. On more
+  than one device the heads are split across chips (no duplicated attention).
+  `--attn ref` restores the query-chunked reference path.
+- Padded text tokens are dropped before sampling (text sits at RoPE position
+  0 and padding is masked, so the image output is identical) — a short
+  prompt runs ~4.35k instead of 4.6k tokens at 1024px. `--no-compact-text`
+  keeps the padded length.
+- The text branch (text fusion + txtmlp) does not depend on the timestep and
+  runs once per prompt instead of every step.
+
 ## 4. Deploy: merge into Turbo
 
 ```bash
@@ -149,6 +162,7 @@ pip install einops optax
 python tests/test_parity.py        # forward parity (~4e-7, asserts <2e-4), LoRA == merged
 python tests/test_train_and_io.py  # train step, save/load, merge script
 python tests/test_sharding.py      # 8-device FSDP parity (emulated on CPU)
+python tests/test_sampling.py      # sampler: text caching, text compaction, head-sharded splash
 ```
 
 ## Repo layout
