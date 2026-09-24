@@ -165,7 +165,8 @@ def scaled_dot_product_attention(q, k, v, keymask=None, qchunk=512):
 
 
 def splash_attention(
-    q, k, v, keymask=None, mesh=None, block=256, interpret=False
+    q, k, v, keymask=None, mesh=None, block=256, interpret=False,
+    shard="batch",
 ):
     """Fused TPU (Pallas "Splash") attention, numerically matching
     `scaled_dot_product_attention` to bf16/online-softmax rounding.
@@ -180,9 +181,16 @@ def splash_attention(
     produce finite values (never an empty softmax — image tokens are always
     valid keys). Requires L to be a multiple of `block`.
 
-    mesh: when the batch is sharded, the kernel must run under shard_map
-    (GSPMD cannot partition a Pallas call); pass the mesh used for batch
-    sharding. With mesh=None the kernel runs on the local device (tests).
+    mesh: on a multi-device mesh the kernel must run under shard_map (GSPMD
+    cannot partition a Pallas call). With mesh=None the kernel runs on the
+    local device (single chip, tests).
+    shard: how the shard_map splits the work across `mesh`:
+      "batch" — the batch is sharded over the mesh axis (training).
+      "heads" — attention heads are split over the mesh; for sampling, where
+        the batch (often 1) is replicated. KV heads are split alongside their
+        query groups when the mesh divides them, otherwise KV is expanded to
+        one head per query head first; if neither divides, every device
+        computes all heads.
     interpret: run the kernel in Pallas interpret mode (CPU-testable).
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -204,11 +212,30 @@ def splash_attention(
     if L % block != 0:
         raise ValueError(f"splash attention needs L ({L}) % block ({block}) == 0")
 
+    if shard not in ("batch", "heads"):
+        raise ValueError(f"unknown splash shard mode: {shard!r}")
+
     # The kernel applies no softmax scale; fold 1/sqrt(D) into q.
     q = q * jnp.asarray(1.0 / math.sqrt(D), q.dtype)
 
+    head_spec = P()
+    local_hq = Hq
+    if mesh is not None and shard == "heads":
+        n = mesh.size
+        Hk = k.shape[1]
+        if Hk % n == 0:
+            head_spec = P(None, "fsdp")
+        elif Hq % n == 0:
+            # query head h uses KV head h // G: expanding KV to Hq heads keeps
+            # that pairing after an even split of the head axis
+            k = jnp.repeat(k, Hq // Hk, axis=1)
+            v = jnp.repeat(v, Hq // Hk, axis=1)
+            head_spec = P(None, "fsdp")
+        if head_spec != P():
+            local_hq = Hq // n
+
     kernel = make_splash_mha(
-        MultiHeadMask([FullMask((L, L)) for _ in range(Hq)]),
+        MultiHeadMask([FullMask((L, L)) for _ in range(local_hq)]),
         head_shards=1,
         q_seq_shards=1,
         block_sizes=BlockSizes(
@@ -231,7 +258,15 @@ def splash_attention(
             lambda q1, k1, v1, s1, s2: kernel(q1, k1, v1, SegmentIds(s1, s2))
         )(q, k, v, q_seg, kv_seg)
 
-    if mesh is not None:
+    if mesh is not None and shard == "heads":
+        batched = shard_map(
+            batched,
+            mesh=mesh,
+            in_specs=(head_spec, head_spec, head_spec, P(), P()),
+            out_specs=head_spec,
+            check_rep=False,
+        )
+    elif mesh is not None:
         batched = shard_map(
             batched,
             mesh=mesh,
@@ -254,7 +289,7 @@ def splash_attention(
 def attention_forward(
     x, p, heads, kvheads, freqs=None, keymask=None, lora=None, lora_scale=1.0,
     qchunk=512, attn_impl="ref", attn_mesh=None, attn_block=256,
-    attn_interpret=False,
+    attn_interpret=False, attn_shard="batch",
 ):
     """Sigmoid-gated multi-head attention (`Attention` in the reference)."""
     B, L, _ = x.shape
@@ -278,7 +313,7 @@ def attention_forward(
     if attn_impl == "splash":
         out = splash_attention(
             q, k, v, keymask=keymask, mesh=attn_mesh, block=attn_block,
-            interpret=attn_interpret,
+            interpret=attn_interpret, shard=attn_shard,
         )
     elif attn_impl == "ref":
         out = scaled_dot_product_attention(q, k, v, keymask=keymask, qchunk=qchunk)
@@ -297,7 +332,7 @@ def swiglu_forward(x, p, lora=None, lora_scale=1.0):
 def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
                         lora=None, lora_scale=1.0, qchunk=512,
                         attn_impl="ref", attn_mesh=None, attn_block=256,
-                        attn_interpret=False):
+                        attn_interpret=False, attn_shard="batch"):
     mods = tvec6 + p["mod"]["lin"]  # (B, 1, 6*features)
     prescale, preshift, pregate, postscale, postshift, postgate = jnp.split(
         mods, 6, axis=-1
@@ -307,7 +342,7 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
         h, p["attn"], cfg.heads, cfg.kvheads, freqs=freqs, keymask=keymask,
         lora=_lget(lora, "attn"), lora_scale=lora_scale, qchunk=qchunk,
         attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
-        attn_interpret=attn_interpret,
+        attn_interpret=attn_interpret, attn_shard=attn_shard,
     )
     h = (1 + postscale) * rms_norm(x, p["postnorm"]["scale"]) + postshift
     x = x + postgate * swiglu_forward(
@@ -356,6 +391,25 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
     return x
 
 
+def text_tokens_forward(params, cfg: Krea2Config, context, keymask=None,
+                        lora=None, lora_scale=1.0):
+    """Text branch of the DiT: text fusion + txtmlp -> (B, L, features).
+
+    Independent of the timestep and the image, so it can be computed once
+    per prompt and reused across sampling steps (`dit_forward(txt_tokens=)`).
+    """
+    txt = text_fusion_forward(
+        context, params["txtfusion"], cfg, keymask=keymask,
+        lora=_lget(lora, "txtfusion"), lora_scale=lora_scale,
+    )
+    txt = rms_norm(txt, params["txtmlp"]["0"]["scale"])
+    txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"), lora_scale)
+    return linear(
+        gelu_tanh(txt), params["txtmlp"]["3"], _lget(lora, "txtmlp", "3"),
+        lora_scale,
+    )
+
+
 def last_layer_forward(x, p, tvec, lora=None, lora_scale=1.0):
     """Modulated RMSNorm + projection back to patch pixels."""
     mods = tvec + p["modulation"]["lin"][None]  # (B, 2, features)
@@ -382,11 +436,17 @@ def dit_forward(
     qchunk=512,
     remat=True,
     attn_impl="ref",     # "ref" (exact fp32 softmax) or "splash" (fused TPU)
-    attn_mesh=None,      # mesh for shard_map around splash (sharded batch)
+    attn_mesh=None,      # mesh for shard_map around splash (see attn_shard)
     attn_block=256,      # splash tile size; must divide the padded seq len
     attn_interpret=False,  # run splash in Pallas interpret mode (CPU tests)
+    attn_shard="batch",  # splash under attn_mesh: shard "batch" or "heads"
+    txt_tokens=None,     # precomputed text_tokens_forward(...); skips context
 ):
     """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels).
+
+    txt_tokens: the output of `text_tokens_forward` for this context. The
+    text branch does not depend on t, so a sampler computes it once per
+    prompt and passes it to every step (`context` is then unused).
 
     remat: True/"full" checkpoints each scanned block (recompute everything in
     backward), "dots" uses the dots_with_no_batch_dims_saveable policy (dense
@@ -394,7 +454,7 @@ def dit_forward(
     to skip recomputing the big matmuls), False/"none" disables remat.
     """
     B, Limg, _ = img.shape
-    Ltxt = context.shape[1]
+    Ltxt = (txt_tokens if txt_tokens is not None else context).shape[1]
 
     x = linear(img, params["first"], _lget(lora, "first"), lora_scale)
 
@@ -408,16 +468,13 @@ def dit_forward(
         lora_scale,
     )                                                        # (B, 1, 6*features)
 
-    txt = text_fusion_forward(
-        context, params["txtfusion"], cfg, keymask=mask[:, :Ltxt],
-        lora=_lget(lora, "txtfusion"), lora_scale=lora_scale,
-    )
-    txt = rms_norm(txt, params["txtmlp"]["0"]["scale"])
-    txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"), lora_scale)
-    txt = linear(
-        gelu_tanh(txt), params["txtmlp"]["3"], _lget(lora, "txtmlp", "3"),
-        lora_scale,
-    )
+    if txt_tokens is None:
+        txt = text_tokens_forward(
+            params, cfg, context, mask[:, :Ltxt], lora=lora,
+            lora_scale=lora_scale,
+        )
+    else:
+        txt = txt_tokens.astype(x.dtype)
 
     combined = jnp.concatenate([txt, x], axis=1)
 
@@ -435,7 +492,7 @@ def dit_forward(
     block_fn = partial(
         single_stream_block, cfg=cfg, lora_scale=lora_scale, qchunk=qchunk,
         attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
-        attn_interpret=attn_interpret,
+        attn_interpret=attn_interpret, attn_shard=attn_shard,
     )
 
     if lora is not None and "blocks" in lora:
