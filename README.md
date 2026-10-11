@@ -1,7 +1,9 @@
-# Krea-2-LoRA-JAX
+# Krea-2-JAX
 
-LoRA fine-tuning of [Krea 2](https://www.krea.ai/krea-2-open-source) on **TPU**
-with **JAX**.
+[Krea 2](https://www.krea.ai/krea-2-open-source) in pure functional **JAX**:
+**LoRA fine-tuning on TPU** and **full fine-tuning on multi-GPU hosts
+(8x AMD MI355X / ROCm)**, with sampling and export back to the official
+checkpoint format.
 
 Krea 2 is a 12.9B-parameter single-stream Diffusion Transformer (flow
 matching, Qwen3-VL-4B text conditioning, Qwen-Image f8/16ch VAE) released with
@@ -10,16 +12,24 @@ open weights as **Krea 2 RAW** (base, for training) and **Krea 2 Turbo**
 functional JAX — numerically verified against the
 [official PyTorch implementation](https://github.com/krea-ai/krea-2) down to
 float32 rounding (measured ~4e-7 max relative error; tests assert < 2e-4 to
-absorb platform/BLAS variance) — and trains LoRA adapters on TPU:
+absorb platform/BLAS variance). Two training paths share it:
 
-- **FSDP sharding** of the frozen bf16 base across all TPU devices
-  (`lax.scan` over blocks + gradient rematerialization, query-chunked
-  exact attention), so a v4-8 / v5e-8 / v6e-8 single host is enough.
+- `scripts/train_lora.py`: LoRA adapters on a single-host TPU (v4-8 / v5e-8 /
+  v6e-8), frozen bf16 base FSDP-sharded across the devices.
+- `scripts/train_full.py`: every DiT weight, fp32 master + sharded AdamW +
+  EMA, on one host with 8 accelerators (developed for 8x MI355X; see
+  [Full fine-tuning](#full-fine-tuning-8x-mi355x--rocm)).
+
+Common to both:
+
+- **FSDP sharding** across all devices (`lax.scan` over blocks + gradient
+  rematerialization, batch-sharded activations), with exact query-chunked
+  attention everywhere plus fused kernels on TPU (Splash) and MI355X (jax-aiter).
 - **Flow-matching objective** matching the official formulation:
   `x_t = (1-t)·x0 + t·ε`, target `v = ε − x0`, logit-normal timesteps with
   the same resolution-dependent shift (`mu`) the official sampler uses.
 - The frozen **text encoder and VAE run once, offline** (PyTorch, CPU or
-  GPU): latents and Qwen3-VL hidden states are cached to disk, and the TPU
+  GPU): latents and Qwen3-VL hidden states are cached to disk, and the training
   loop touches only the DiT.
 - LoRA export as safetensors (PEFT-style `lora_A`/`lora_B` on official
   state-dict paths) plus a **merge script** producing a plain full-weight
@@ -31,8 +41,8 @@ express strongly on Turbo (official recommendation).
 ## Setup (single-host TPU VM)
 
 ```bash
-git clone https://github.com/ricecake000/Krea-2-LoRA-JAX
-cd Krea-2-LoRA-JAX
+git clone https://github.com/ricecake000/Krea-2-JAX
+cd Krea-2-JAX
 
 pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 pip install -r requirements-tpu.txt
