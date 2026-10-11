@@ -1,0 +1,22 @@
+# Full fine-tuning on AMD GPUs (scripts/train_full.py), e.g. 8x MI355X (gfx950).
+# Install JAX for ROCm first, per AMD's JAX-on-ROCm docs for your ROCm version;
+# for ROCm 7:
+#   pip install jax jax-rocm7-plugin      # pulls the matching jax-rocm7-pjrt
+# jax is unpinned here: the TPU-only splash-attention path (pinned in
+# requirements-tpu.txt) is not used on GPU (--attn ref).
+#
+# Optional: jax-aiter (fused flash attention for --attn aiter, MI355X/gfx950
+# only). Not on PyPI; it supports exactly one stack, so install it by hand:
+#   image  ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14   (TheRock 7.14 GA)
+#   pip install "jax==0.11.0" "jaxlib==0.11.0" \
+#     "jax-rocm7-plugin==0.11.0.post1" "jax-rocm7-pjrt==0.11.0.post1"
+#   pip install ./jax_aiter-0.1.0a2+full-cp312-cp312-manylinux_2_39_x86_64.whl
+# (wheel from https://github.com/ROCm/jax-aiter/releases/tag/v0.1.0-alpha2;
+# Python 3.12). Everything else in this repo runs without it.
+jax
+optax>=0.2.0
+orbax-checkpoint
+safetensors>=0.4.5
+ml_dtypes>=0.4.0
+numpy
+pillow

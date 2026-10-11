@@ -124,6 +124,91 @@ def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp"):
     return params
 
 
+def abstract_krea2_params(cfg, dtype=jnp.float32):
+    """`jax.ShapeDtypeStruct` pytree of the DiT parameters (no weights, no
+    torch), with exactly the nesting/stacking `load_krea2_params` produces:
+    `blocks`, `txtfusion.layerwise_blocks` and `txtfusion.refiner_blocks`
+    stacked with the layer axis first. Unsharded (pair with
+    `param_shardings` for AOT compilation).
+
+    Shapes follow the official `SingleStreamDiT` module: torch Linear
+    (out, in) layout; `first`, `tmlp.*`, `txtmlp.1/3`, `tproj.1` and
+    `last.linear` always carry a bias, the attention/MLP linears (blocks and
+    text fusion) only when `cfg.bias`, `txtfusion.projector` never; SwiGLU
+    hidden = round_up(int(2*features/3)*multiplier, 128); the text fusion
+    always has 2 layerwise + 2 refiner blocks.
+    """
+
+    def leaf(*shape):
+        return jax.ShapeDtypeStruct(tuple(int(d) for d in shape), dtype)
+
+    def lin(out_f, in_f, bias):
+        p = {"weight": leaf(out_f, in_f)}
+        if bias:
+            p["bias"] = leaf(out_f)
+        return p
+
+    def norm(features):
+        return {"scale": leaf(features)}
+
+    def swiglu(features):
+        hidden = int(2 * features / 3) * cfg.multiplier
+        hidden = 128 * ((hidden + 127) // 128)
+        return {
+            "gate": lin(hidden, features, cfg.bias),
+            "up": lin(hidden, features, cfg.bias),
+            "down": lin(features, hidden, cfg.bias),
+        }
+
+    def attention(dim, heads, kvheads):
+        hd = dim // heads
+        return {
+            "wq": lin(hd * heads, dim, cfg.bias),
+            "wk": lin(hd * kvheads, dim, cfg.bias),
+            "wv": lin(hd * kvheads, dim, cfg.bias),
+            "gate": lin(dim, dim, cfg.bias),
+            "wo": lin(dim, dim, cfg.bias),
+            "qknorm": {"qnorm": norm(hd), "knorm": norm(hd)},
+        }
+
+    def stack(n, tree):
+        return jax.tree.map(
+            lambda s: jax.ShapeDtypeStruct((n,) + tuple(s.shape), s.dtype), tree
+        )
+
+    F, T = cfg.features, cfg.txtdim
+    block = {
+        "mod": {"lin": leaf(6 * F)},
+        "prenorm": norm(F),
+        "postnorm": norm(F),
+        "attn": attention(F, cfg.heads, cfg.kvheads),
+        "mlp": swiglu(F),
+    }
+    txt_block = {
+        "prenorm": norm(T),
+        "postnorm": norm(T),
+        "attn": attention(T, cfg.txtheads, cfg.txtkvheads),
+        "mlp": swiglu(T),
+    }
+    return {
+        "first": lin(F, cfg.channels * cfg.patch ** 2, True),
+        "blocks": stack(cfg.layers, block),
+        "tmlp": {"0": lin(F, cfg.tdim, True), "2": lin(F, F, True)},
+        "txtfusion": {
+            "layerwise_blocks": stack(2, txt_block),
+            "projector": lin(1, cfg.txtlayers, False),
+            "refiner_blocks": stack(2, txt_block),
+        },
+        "txtmlp": {"0": norm(T), "1": lin(F, T, True), "3": lin(F, F, True)},
+        "last": {
+            "norm": norm(F),
+            "linear": lin(cfg.patch * cfg.patch * cfg.channels, F, True),
+            "modulation": {"lin": leaf(2, F)},
+        },
+        "tproj": {"1": lin(6 * F, F, True)},
+    }
+
+
 def _place(arr, mesh, stacked, sharding="fsdp"):
     if mesh is None:
         return arr
@@ -132,6 +217,180 @@ def _place(arr, mesh, stacked, sharding="fsdp"):
     else:
         spec = param_partition_spec(arr.shape, mesh.size, stacked)
     return jax.device_put(arr, NamedSharding(mesh, spec))
+
+
+def _is_stacked_path(keys):
+    """True when a params-tree path lies under one of STACKED_PREFIXES."""
+    dotted = ".".join(keys)
+    return any(dotted.startswith(p + ".") for p in STACKED_PREFIXES)
+
+
+def _path_keys(path):
+    return [str(getattr(k, "key", k)) for k in path]
+
+
+def param_shardings(params, mesh, sharding="fsdp"):
+    """NamedSharding pytree matching how `load_krea2_params` placed each leaf.
+
+    Mirrors `_place`: sharding="fsdp" uses `param_partition_spec` (stacked
+    subtrees skip the leading block axis), "replicate" uses P(). Works on
+    real arrays or `jax.ShapeDtypeStruct` leaves (only `.shape` is read).
+    """
+    if sharding not in ("fsdp", "replicate"):
+        raise ValueError(f"unknown base sharding: {sharding!r}")
+
+    def one(path, leaf):
+        if sharding == "replicate":
+            spec = P()
+        else:
+            spec = param_partition_spec(
+                leaf.shape, mesh.size, _is_stacked_path(_path_keys(path))
+            )
+        return NamedSharding(mesh, spec)
+
+    return jax.tree_util.tree_map_with_path(one, params)
+
+
+_ST_DTYPES = {
+    np.dtype(jnp.bfloat16): "BF16",
+    np.dtype(np.float16): "F16",
+    np.dtype(np.float32): "F32",
+    np.dtype(np.float64): "F64",
+}
+
+
+def _official_entries(params):
+    """Unstack a params tree into official safetensors entries.
+
+    Returns (entries, leaves): entries is a list of (official key, leaf
+    index, layer index or None, per-tensor shape) sorted by key, leaves the
+    flattened leaves. Stacked subtrees (STACKED_PREFIXES) become per-layer
+    keys ('blocks.{i}.attn.wq.weight', ...); everything else is dotted
+    as-is. Only `.shape` of each leaf is read.
+    """
+    leaves_with_path = jax.tree_util.tree_flatten_with_path(params)[0]
+    entries = []
+    leaves = []
+    for li, (kp, leaf) in enumerate(leaves_with_path):
+        keys = _path_keys(kp)
+        dotted = ".".join(keys)
+        shape = tuple(int(d) for d in leaf.shape)
+        leaves.append(leaf)
+        prefix = next(
+            (p for p in STACKED_PREFIXES if dotted.startswith(p + ".")), None
+        )
+        if prefix is None:
+            entries.append((dotted, li, None, shape))
+        else:
+            if len(shape) < 1:
+                raise ValueError(f"{dotted}: stacked leaf has no block axis")
+            rest = dotted[len(prefix) + 1:]
+            for i in range(shape[0]):
+                entries.append((f"{prefix}.{i}.{rest}", li, i, shape[1:]))
+    names = [e[0] for e in entries]
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate safetensors keys while unstacking params")
+    entries.sort(key=lambda e: e[0])
+    return entries, leaves
+
+
+def official_key_shapes(params):
+    """{official safetensors key: shape tuple} that `save_krea2_params`
+    would write for `params` (same unstacking; nothing is fetched, so it
+    works on sharded arrays or ShapeDtypeStruct leaves)."""
+    entries, _ = _official_entries(params)
+    return {name: shape for name, _, _, shape in entries}
+
+
+def save_krea2_params(path, params, dtype=jnp.bfloat16, metadata=None):
+    """Write a params tree as an official-layout Krea 2 safetensors file.
+
+    Inverse of `load_krea2_params`: stacked subtrees (STACKED_PREFIXES) are
+    unstacked back to per-layer keys ('blocks.{i}.attn.wq.weight', ...),
+    everything else is dotted as-is, and every tensor is cast to `dtype`.
+    The file is streamed leaf by leaf (one host fetch per leaf, written
+    straight to disk), so the host never holds more than one leaf; works for
+    sharded or unsharded trees. Leaves are fetched from a temporary cast copy,
+    so no host copy stays cached on the live arrays afterwards. Tensors are
+    written in sorted key order with a deterministic header, so the same tree
+    always gives identical bytes. The write is atomic: data goes to a sibling
+    temp file that is fsynced and then renamed onto `path`; on any error the
+    temp file is removed and an existing `path` is left untouched.
+    """
+    import json
+    import os
+    import struct
+    import sys
+
+    if sys.byteorder != "little":  # safetensors data is little-endian
+        raise NotImplementedError("save_krea2_params needs a little-endian host")
+    out_dtype = np.dtype(dtype)
+    if out_dtype not in _ST_DTYPES:
+        raise ValueError(f"unsupported safetensors dtype: {out_dtype}")
+    itemsize = out_dtype.itemsize
+
+    # (official key, leaf index, layer index or None, per-tensor shape);
+    # shared with official_key_shapes so the two cannot drift
+    entries, leaves = _official_entries(params)
+
+    header = {}
+    if metadata:
+        header["__metadata__"] = {str(k): str(v) for k, v in metadata.items()}
+    offset = 0
+    for name, _, _, shape in entries:
+        nbytes = int(np.prod(shape, dtype=np.int64)) * itemsize
+        header[name] = {
+            "dtype": _ST_DTYPES[out_dtype],
+            "shape": list(shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        offset += nbytes
+    hbytes = json.dumps(header, separators=(",", ":"), sort_keys=True).encode()
+    hbytes += b" " * (-len(hbytes) % 8)  # 8-byte align the data section
+
+    # group per-layer writes by leaf so each leaf is fetched once, but keep
+    # the on-disk order sorted by key (offsets above)
+    by_leaf = {}
+    for name, li, idx, _ in entries:
+        by_leaf.setdefault(li, []).append((header[name]["data_offsets"][0], idx))
+    data_start = 8 + len(hbytes)
+    path = os.fspath(path)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(struct.pack("<Q", len(hbytes)))
+            f.write(hbytes)
+            f.truncate(data_start + offset)
+            for li in sorted(by_leaf):
+                leaf = leaves[li]
+                if isinstance(leaf, jax.Array):
+                    # Fetch from a short-lived cast copy: np.asarray caches
+                    # the gathered host value on the array it reads, so
+                    # reading the live leaf would pin the whole tree in host
+                    # RAM. astype is a no-op (same object) for a matching
+                    # dtype, so force a real copy then.
+                    tmp = leaf.astype(out_dtype)
+                    if tmp is leaf:
+                        tmp = jnp.copy(leaf)
+                    arr = np.asarray(tmp)
+                else:
+                    tmp = None
+                    arr = np.asarray(leaf).astype(out_dtype, copy=False)
+                for off, idx in by_leaf[li]:
+                    part = arr if idx is None else arr[idx]
+                    f.seek(data_start + off)
+                    f.write(np.ascontiguousarray(part).tobytes())
+                    del part
+                del leaf, tmp, arr
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------

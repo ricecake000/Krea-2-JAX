@@ -46,8 +46,38 @@ def _lindex(lora, i):
     return None if lora is None else jax.tree.map(lambda a: a[i], lora)
 
 
-def linear(x, p, lora=None, lora_scale=1.0):
-    """x @ W^T (+ b) with an optional LoRA delta, torch Linear layout (out, in)."""
+def _constrain(x, act_sharding):
+    """with_sharding_constraint when a sharding is given (None: identity)."""
+    if act_sharding is None:
+        return x
+    return jax.lax.with_sharding_constraint(x, act_sharding)
+
+
+def _shard_map(f, mesh, in_specs, out_specs):
+    """shard_map with replication checks off, across JAX versions
+    (`jax.shard_map(check_vma=)` on new JAX, the experimental
+    `shard_map(check_rep=)` on old)."""
+    sm = getattr(jax, "shard_map", None)
+    if sm is not None:
+        try:
+            return sm(f, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
+                      check_vma=False)
+        except TypeError:
+            pass
+    from jax.experimental.shard_map import shard_map
+
+    return shard_map(f, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
+                     check_rep=False)
+
+
+def linear(x, p, lora=None, lora_scale=1.0, act_sharding=None):
+    """x @ W^T (+ b) with an optional LoRA delta, torch Linear layout (out, in).
+
+    act_sharding: optional `jax.sharding.Sharding` applied to the output with
+    `with_sharding_constraint` (e.g. NamedSharding(mesh, P("fsdp")) keeps
+    activations batch-sharded so the SPMD partitioner all-gathers weights
+    instead of activations). None leaves the output unconstrained.
+    """
     y = jnp.einsum("...i,oi->...o", x, p["weight"])
     if "bias" in p:
         y = y + p["bias"]
@@ -55,7 +85,7 @@ def linear(x, p, lora=None, lora_scale=1.0):
         a, b = lora["lora_A"], lora["lora_B"]
         h = jnp.einsum("...i,ri->...r", x.astype(a.dtype), a)
         y = y + (lora_scale * jnp.einsum("...r,or->...o", h, b)).astype(y.dtype)
-    return y
+    return _constrain(y, act_sharding)
 
 
 def rms_norm(x, scale, eps=1e-5):
@@ -192,7 +222,6 @@ def splash_attention(
         SegmentIds,
         make_splash_mha,
     )
-    from jax.experimental.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
 
     B, Hq, L, D = q.shape
@@ -232,18 +261,177 @@ def splash_attention(
         )(q, k, v, q_seg, kv_seg)
 
     if mesh is not None:
-        batched = shard_map(
+        batched = _shard_map(
             batched,
             mesh=mesh,
             in_specs=(
                 P("fsdp"), P("fsdp"), P("fsdp"), P("fsdp"), P("fsdp"),
             ),
             out_specs=P("fsdp"),
-            check_rep=False,
         )
 
     out = batched(q, k, v, q_seg, kv_seg)  # (B, Hq, L, D)
     return out.transpose(0, 2, 1, 3).reshape(B, L, Hq * D)
+
+
+def varlen_reference_kernel(q3, k3, v3, seqstart_q, seqstart_k, cu_q, cu_k,
+                            max_seqlen_q, max_seqlen_k, softmax_scale=None,
+                            causal=False, deterministic=False, **_):
+    """Pure-JAX emulation of jax-aiter `flash_attn_varlen` in padded group
+    mode, restricted to FIXED-STRIDE segments (seqstart = i * L).
+
+    q3: (B*L, Hq, D); k3, v3: (B*L, Hk, D). B = len(seqstart_q) - 1 and
+    L = total // B are static (from shapes). Segment i's real tokens are the
+    first cu_*[i+1] - cu_*[i] rows of its physical span. Each segment runs
+    non-causal attention of its logical query prefix over its logical key
+    prefix (fp32 softmax, GQA); padding query rows are zero. Returns
+    `(out,)` with out (B*L, Hq, D) in q3's dtype, like the kernel.
+
+    The emulation only covers the layout `aiter_attention` produces, and it
+    checks its arguments rather than ignoring them: Python-int max_seqlen_*
+    must equal L (ValueError otherwise); seqstart_q / seqstart_k must equal
+    arange(B+1)*L and cu_q must equal cu_k — checked on traced values
+    (jit-safe), a mismatch turns the whole output into NaN so a wrong call
+    fails parity checks loudly instead of silently computing something else.
+    """
+    del deterministic
+    if causal:
+        raise NotImplementedError("varlen_reference_kernel: causal=True")
+    total, Hq, D = q3.shape
+    Hk = k3.shape[1]
+    B = seqstart_q.shape[0] - 1
+    if B <= 0 or total % B:
+        raise ValueError(
+            f"varlen_reference_kernel: {total} tokens do not split into "
+            f"{B} fixed-stride segments"
+        )
+    L = total // B
+    for name, m in (("max_seqlen_q", max_seqlen_q),
+                    ("max_seqlen_k", max_seqlen_k)):
+        if isinstance(m, (int, np.integer)) and int(m) != L:
+            raise ValueError(
+                f"varlen_reference_kernel: {name}={int(m)} but the fixed "
+                f"segment stride is L={L} (only max_seqlen == L is emulated)"
+            )
+    if seqstart_k.shape != seqstart_q.shape or cu_q.shape != seqstart_q.shape \
+            or cu_k.shape != seqstart_q.shape:
+        raise ValueError(
+            "varlen_reference_kernel: seqstart_q/seqstart_k/cu_q/cu_k must all "
+            f"have shape ({B + 1},); got {seqstart_q.shape}, "
+            f"{seqstart_k.shape}, {cu_q.shape}, {cu_k.shape}"
+        )
+    expected = jnp.arange(B + 1, dtype=jnp.int32) * L
+    mismatch = (
+        jnp.any(seqstart_q.astype(jnp.int32) != expected)
+        | jnp.any(seqstart_k.astype(jnp.int32) != expected)
+        | jnp.any(cu_q.astype(jnp.int32) != cu_k.astype(jnp.int32))
+    )
+    q = q3.reshape(B, L, Hq, D).transpose(0, 2, 1, 3)
+    k = k3.reshape(B, L, Hk, D).transpose(0, 2, 1, 3)
+    v = v3.reshape(B, L, Hk, v3.shape[-1]).transpose(0, 2, 1, 3)
+    if softmax_scale is not None and not math.isclose(
+        float(softmax_scale), 1.0 / math.sqrt(D), rel_tol=1e-12
+    ):
+        # scaled_dot_product_attention applies 1/sqrt(D); fold the rest into q
+        q = q * jnp.asarray(float(softmax_scale) * math.sqrt(D), q.dtype)
+    ar = jnp.arange(L, dtype=jnp.int32)[None, :]
+    len_q = (cu_q[1:] - cu_q[:-1]).astype(jnp.int32)
+    len_k = (cu_k[1:] - cu_k[:-1]).astype(jnp.int32)
+    keymask = ar < len_k[:, None]                      # (B, L)
+    qvalid = ar < len_q[:, None]                       # (B, L)
+    qchunk = 512 if L % 512 == 0 else L
+    out = scaled_dot_product_attention(q, k, v, keymask=keymask, qchunk=qchunk)
+    out = jnp.where(qvalid[:, :, None], out, jnp.zeros((), out.dtype))
+    # unsupported seqstart / cu_q != cu_k: poison everything (see docstring)
+    out = jnp.where(mismatch, jnp.asarray(jnp.nan, out.dtype), out)
+    return (out.reshape(total, Hq, v3.shape[-1]).astype(q3.dtype),)
+
+
+def _load_aiter_kernel(sharded):
+    """jax-aiter varlen flash attention adapted to the `aiter_attention`
+    kernel calling convention. Imported lazily: jax-aiter only exists on
+    ROCm gfx950 nodes. Under shard_map (sharded=True) the raw entry point
+    is used — the public `flash_attn_varlen` wraps its FFI calls in
+    custom_partitioning, which conflicts with shard_map's manual mode."""
+    try:
+        from jax_aiter.mha import flash_attn_varlen, flash_attn_varlen_raw
+    except ImportError as e:  # includes ModuleNotFoundError
+        raise ImportError(
+            "attn_impl='aiter' needs the jax-aiter package (ROCm/jax-aiter, "
+            "gfx950 / MI355X only, with its flash-attention libraries: "
+            "`jax-aiter-fetch-mha`); it is not importable here: "
+            f"{e}. Use attn_impl='ref' or pass "
+            "kernel=varlen_reference_kernel for a CPU emulation."
+        ) from e
+    if not sharded:
+        return flash_attn_varlen
+
+    def raw_kernel(q3, k3, v3, seqstart_q, seqstart_k, cu_q, cu_k,
+                   max_seqlen_q, max_seqlen_k, softmax_scale=None,
+                   causal=False, deterministic=False, **_):
+        if softmax_scale is None:
+            softmax_scale = q3.shape[-1] ** -0.5
+        return flash_attn_varlen_raw(
+            q3, k3, v3, seqstart_q, seqstart_k, cu_q, cu_k,
+            int(max_seqlen_q), int(max_seqlen_k), 0.0, float(softmax_scale),
+            bool(causal), (-1, -1),
+        )
+
+    return raw_kernel
+
+
+def aiter_attention(q, k, v, keymask=None, mesh=None, kernel=None):
+    """Varlen flash attention (jax-aiter `flash_attn_varlen`, padded group
+    mode) for PREFIX key masks.
+
+    q: (B, Hq, L, D); k, v: (B, Hk, L, D); keymask: (B, L) bool whose valid
+    entries form a prefix of each row (dit_forward reorders tokens so this
+    holds); None = all valid. The batch is packed to (B*L, H, D) with
+    fixed-stride physical segments (seqstart = i*L) and cumulative logical
+    lengths from keymask, so each sample attends over its valid prefix only.
+    Valid queries see exactly the valid key set (same as the key-only mask of
+    `scaled_dot_product_attention`); padded query rows come out as zeros.
+    Returns (B, L, Hq*D).
+
+    mesh: when the batch is sharded, the packed call runs under shard_map over
+    the "fsdp" batch axis (per-device local cu_seqlens), like
+    `splash_attention`. kernel: callable with the `flash_attn_varlen`
+    signature (e.g. `varlen_reference_kernel`); None imports jax-aiter.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    B, Hq, L, D = q.shape
+    Hk = k.shape[1]
+    if kernel is None:
+        kernel = _load_aiter_kernel(sharded=mesh is not None)
+    if keymask is None:
+        keymask = jnp.ones((B, L), dtype=bool)
+    scale = 1.0 / math.sqrt(D)
+
+    def packed(q, k, v, keymask):
+        b = q.shape[0]
+        q3 = q.transpose(0, 2, 1, 3).reshape(b * L, Hq, D)
+        k3 = k.transpose(0, 2, 1, 3).reshape(b * L, Hk, D)
+        v3 = v.transpose(0, 2, 1, 3).reshape(b * L, Hk, v.shape[-1])
+        seqstart = jnp.arange(b + 1, dtype=jnp.int32) * L
+        cu_logical = jnp.concatenate([
+            jnp.zeros((1,), jnp.int32),
+            jnp.cumsum(keymask.astype(jnp.int32).sum(-1)).astype(jnp.int32),
+        ])
+        res = kernel(q3, k3, v3, seqstart, seqstart, cu_logical, cu_logical,
+                     L, L, softmax_scale=scale, causal=False,
+                     deterministic=False)
+        out = res[0] if isinstance(res, (tuple, list)) else res
+        return out.reshape(b, L, Hq * v.shape[-1])
+
+    if mesh is not None:
+        packed = _shard_map(
+            packed,
+            mesh=mesh,
+            in_specs=(P("fsdp"), P("fsdp"), P("fsdp"), P("fsdp")),
+            out_specs=P("fsdp"),
+        )
+    return packed(q, k, v, keymask)
 
 
 # ---------------------------------------------------------------------------
@@ -254,16 +442,17 @@ def splash_attention(
 def attention_forward(
     x, p, heads, kvheads, freqs=None, keymask=None, lora=None, lora_scale=1.0,
     qchunk=512, attn_impl="ref", attn_mesh=None, attn_block=256,
-    attn_interpret=False,
+    attn_interpret=False, act_sharding=None, attn_kernel=None,
 ):
     """Sigmoid-gated multi-head attention (`Attention` in the reference)."""
     B, L, _ = x.shape
     headdim = p["wq"]["weight"].shape[0] // heads
+    sh = act_sharding
 
-    q = linear(x, p["wq"], _lget(lora, "wq"), lora_scale)
-    k = linear(x, p["wk"], _lget(lora, "wk"), lora_scale)
-    v = linear(x, p["wv"], _lget(lora, "wv"), lora_scale)
-    gate = linear(x, p["gate"], _lget(lora, "gate"), lora_scale)
+    q = linear(x, p["wq"], _lget(lora, "wq"), lora_scale, act_sharding=sh)
+    k = linear(x, p["wk"], _lget(lora, "wk"), lora_scale, act_sharding=sh)
+    v = linear(x, p["wv"], _lget(lora, "wv"), lora_scale, act_sharding=sh)
+    gate = linear(x, p["gate"], _lget(lora, "gate"), lora_scale, act_sharding=sh)
 
     q = q.reshape(B, L, heads, headdim).transpose(0, 2, 1, 3)
     k = k.reshape(B, L, kvheads, headdim).transpose(0, 2, 1, 3)
@@ -280,24 +469,31 @@ def attention_forward(
             q, k, v, keymask=keymask, mesh=attn_mesh, block=attn_block,
             interpret=attn_interpret,
         )
+    elif attn_impl == "aiter":
+        out = aiter_attention(
+            q, k, v, keymask=keymask, mesh=attn_mesh, kernel=attn_kernel
+        )
     elif attn_impl == "ref":
         out = scaled_dot_product_attention(q, k, v, keymask=keymask, qchunk=qchunk)
     else:
         raise ValueError(f"unknown attn_impl: {attn_impl!r}")
     out = out * jax.nn.sigmoid(gate)
-    return linear(out, p["wo"], _lget(lora, "wo"), lora_scale)
+    return linear(out, p["wo"], _lget(lora, "wo"), lora_scale, act_sharding=sh)
 
 
-def swiglu_forward(x, p, lora=None, lora_scale=1.0):
-    g = linear(x, p["gate"], _lget(lora, "gate"), lora_scale)
-    u = linear(x, p["up"], _lget(lora, "up"), lora_scale)
-    return linear(jax.nn.silu(g) * u, p["down"], _lget(lora, "down"), lora_scale)
+def swiglu_forward(x, p, lora=None, lora_scale=1.0, act_sharding=None):
+    sh = act_sharding
+    g = linear(x, p["gate"], _lget(lora, "gate"), lora_scale, act_sharding=sh)
+    u = linear(x, p["up"], _lget(lora, "up"), lora_scale, act_sharding=sh)
+    return linear(jax.nn.silu(g) * u, p["down"], _lget(lora, "down"),
+                  lora_scale, act_sharding=sh)
 
 
 def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
                         lora=None, lora_scale=1.0, qchunk=512,
                         attn_impl="ref", attn_mesh=None, attn_block=256,
-                        attn_interpret=False):
+                        attn_interpret=False, act_sharding=None,
+                        attn_kernel=None):
     mods = tvec6 + p["mod"]["lin"]  # (B, 1, 6*features)
     prescale, preshift, pregate, postscale, postshift, postgate = jnp.split(
         mods, 6, axis=-1
@@ -307,30 +503,34 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
         h, p["attn"], cfg.heads, cfg.kvheads, freqs=freqs, keymask=keymask,
         lora=_lget(lora, "attn"), lora_scale=lora_scale, qchunk=qchunk,
         attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
-        attn_interpret=attn_interpret,
+        attn_interpret=attn_interpret, act_sharding=act_sharding,
+        attn_kernel=attn_kernel,
     )
     h = (1 + postscale) * rms_norm(x, p["postnorm"]["scale"]) + postshift
     x = x + postgate * swiglu_forward(
-        h, p["mlp"], lora=_lget(lora, "mlp"), lora_scale=lora_scale
+        h, p["mlp"], lora=_lget(lora, "mlp"), lora_scale=lora_scale,
+        act_sharding=act_sharding,
     )
     return x
 
 
 def text_fusion_block(x, p, heads, kvheads, keymask=None, lora=None,
-                      lora_scale=1.0):
+                      lora_scale=1.0, act_sharding=None):
     x = x + attention_forward(
         rms_norm(x, p["prenorm"]["scale"]), p["attn"], heads, kvheads,
         keymask=keymask, lora=_lget(lora, "attn"), lora_scale=lora_scale,
+        act_sharding=act_sharding,
     )
     x = x + swiglu_forward(
         rms_norm(x, p["postnorm"]["scale"]), p["mlp"],
         lora=_lget(lora, "mlp"), lora_scale=lora_scale,
+        act_sharding=act_sharding,
     )
     return x
 
 
 def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
-                        lora=None, lora_scale=1.0):
+                        lora=None, lora_scale=1.0, act_sharding=None):
     """TextFusionTransformer: fuse per-layer encoder states then refine.
 
     context: (B, L, txtlayers, txtdim) -> (B, L, txtdim)
@@ -342,26 +542,29 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
         x = text_fusion_block(
             x, blk, cfg.txtheads, cfg.txtkvheads,
             lora=_lindex(_lget(lora, "layerwise_blocks"), i),
-            lora_scale=lora_scale,
+            lora_scale=lora_scale, act_sharding=act_sharding,
         )
     x = x.reshape(B, L, N, D).transpose(0, 1, 3, 2)  # (B, L, D, N)
-    x = linear(x, p["projector"], _lget(lora, "projector"), lora_scale)[..., 0]
+    x = linear(x, p["projector"], _lget(lora, "projector"), lora_scale,
+               act_sharding=act_sharding)[..., 0]
     for i in range(2):  # refiner blocks attend across the L text tokens
         blk = jax.tree.map(lambda a: a[i], p["refiner_blocks"])
         x = text_fusion_block(
             x, blk, cfg.txtheads, cfg.txtkvheads, keymask=keymask,
             lora=_lindex(_lget(lora, "refiner_blocks"), i),
-            lora_scale=lora_scale,
+            lora_scale=lora_scale, act_sharding=act_sharding,
         )
     return x
 
 
-def last_layer_forward(x, p, tvec, lora=None, lora_scale=1.0):
+def last_layer_forward(x, p, tvec, lora=None, lora_scale=1.0,
+                       act_sharding=None):
     """Modulated RMSNorm + projection back to patch pixels."""
     mods = tvec + p["modulation"]["lin"][None]  # (B, 2, features)
     scale, shift = mods[:, 0:1], mods[:, 1:2]
     x = (1 + scale) * rms_norm(x, p["norm"]["scale"]) + shift
-    return linear(x, p["linear"], _lget(lora, "linear"), lora_scale)
+    return linear(x, p["linear"], _lget(lora, "linear"), lora_scale,
+                  act_sharding=act_sharding)
 
 
 # ---------------------------------------------------------------------------
@@ -381,10 +584,13 @@ def dit_forward(
     lora_scale=1.0,
     qchunk=512,
     remat=True,
-    attn_impl="ref",     # "ref" (exact fp32 softmax) or "splash" (fused TPU)
-    attn_mesh=None,      # mesh for shard_map around splash (sharded batch)
+    attn_impl="ref",     # "ref" (exact fp32 softmax), "splash" (fused TPU)
+                         # or "aiter" (jax-aiter varlen flash attn, ROCm)
+    attn_mesh=None,      # mesh for shard_map around splash/aiter (sharded batch)
     attn_block=256,      # splash tile size; must divide the padded seq len
     attn_interpret=False,  # run splash in Pallas interpret mode (CPU tests)
+    act_sharding=None,   # Sharding for linear outputs + the scan carry
+    attn_kernel=None,    # aiter only: flash_attn_varlen-compatible callable
 ):
     """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels).
 
@@ -392,31 +598,47 @@ def dit_forward(
     backward), "dots" uses the dots_with_no_batch_dims_saveable policy (dense
     projection outputs are saved, attention still rematerializes — spends HBM
     to skip recomputing the big matmuls), False/"none" disables remat.
+
+    act_sharding: optional Sharding (normally NamedSharding(mesh, P("fsdp")))
+    applied to every linear output and to the scan carry at block entry and
+    exit, so activations stay batch-sharded under FSDP. None: unconstrained.
+
+    attn_impl="aiter": tokens are reordered per sample (after the padding to
+    a multiple of 256) so valid tokens form a prefix — stable, so text then
+    image order is kept — as the varlen kernel needs; positions and mask are
+    permuted with them and the original order is restored after the blocks,
+    so outputs are positionally identical to the other impls.
     """
     B, Limg, _ = img.shape
     Ltxt = context.shape[1]
+    sh = act_sharding
 
-    x = linear(img, params["first"], _lget(lora, "first"), lora_scale)
+    x = linear(img, params["first"], _lget(lora, "first"), lora_scale,
+               act_sharding=sh)
 
     tv = timestep_embedding(t, cfg.tdim, dtype=x.dtype)
-    tv = linear(tv, params["tmlp"]["0"], _lget(lora, "tmlp", "0"), lora_scale)
+    tv = linear(tv, params["tmlp"]["0"], _lget(lora, "tmlp", "0"), lora_scale,
+                act_sharding=sh)
     tv = linear(
-        gelu_tanh(tv), params["tmlp"]["2"], _lget(lora, "tmlp", "2"), lora_scale
+        gelu_tanh(tv), params["tmlp"]["2"], _lget(lora, "tmlp", "2"), lora_scale,
+        act_sharding=sh,
     )                                                        # (B, 1, features)
     tvec6 = linear(
         gelu_tanh(tv), params["tproj"]["1"], _lget(lora, "tproj", "1"),
-        lora_scale,
+        lora_scale, act_sharding=sh,
     )                                                        # (B, 1, 6*features)
 
     txt = text_fusion_forward(
         context, params["txtfusion"], cfg, keymask=mask[:, :Ltxt],
         lora=_lget(lora, "txtfusion"), lora_scale=lora_scale,
+        act_sharding=sh,
     )
     txt = rms_norm(txt, params["txtmlp"]["0"]["scale"])
-    txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"), lora_scale)
+    txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"),
+                 lora_scale, act_sharding=sh)
     txt = linear(
         gelu_tanh(txt), params["txtmlp"]["3"], _lget(lora, "txtmlp", "3"),
-        lora_scale,
+        lora_scale, act_sharding=sh,
     )
 
     combined = jnp.concatenate([txt, x], axis=1)
@@ -429,23 +651,35 @@ def dit_forward(
         mask = jnp.pad(mask, ((0, 0), (0, padlen)))
         pos = jnp.pad(pos, ((0, 0), (0, padlen), (0, 0)))
 
+    inv_perm = None
+    if attn_impl == "aiter":
+        # valid tokens first (stable): the varlen kernel's logical prefix
+        perm = jnp.argsort((~mask).astype(jnp.int32), axis=1, stable=True)
+        inv_perm = jnp.argsort(perm, axis=1)
+        combined = jnp.take_along_axis(combined, perm[..., None], axis=1)
+        mask = jnp.take_along_axis(mask, perm, axis=1)
+        pos = jnp.take_along_axis(pos, perm[..., None], axis=1)
+
     freqs = rope_freqs(pos, cfg.axdims, cfg.theta)
 
     blocks = params["blocks"]
     block_fn = partial(
         single_stream_block, cfg=cfg, lora_scale=lora_scale, qchunk=qchunk,
         attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
-        attn_interpret=attn_interpret,
+        attn_interpret=attn_interpret, act_sharding=sh,
+        attn_kernel=attn_kernel,
     )
 
     if lora is not None and "blocks" in lora:
         def body(carry, layer):
             p, l = layer
-            return block_fn(carry, p, tvec6, freqs, mask, lora=l), None
+            out = block_fn(_constrain(carry, sh), p, tvec6, freqs, mask, lora=l)
+            return _constrain(out, sh), None
         xs = (blocks, lora["blocks"])
     else:
         def body(carry, p):
-            return block_fn(carry, p, tvec6, freqs, mask), None
+            out = block_fn(_constrain(carry, sh), p, tvec6, freqs, mask)
+            return _constrain(out, sh), None
         xs = blocks
 
     if remat is True or remat == "full":
@@ -460,9 +694,12 @@ def dit_forward(
         raise ValueError(f"unknown remat mode: {remat!r}")
     combined, _ = jax.lax.scan(body, combined, xs)
 
+    if inv_perm is not None:
+        combined = jnp.take_along_axis(combined, inv_perm[..., None], axis=1)
+
     out = last_layer_forward(
         combined, params["last"], tv, lora=_lget(lora, "last"),
-        lora_scale=lora_scale,
+        lora_scale=lora_scale, act_sharding=sh,
     )
     return out[:, Ltxt : Ltxt + Limg]
 
