@@ -24,9 +24,23 @@ sequence, so the aiter path's token reorder is exercised); per-sample
 relative-norm error of the image-token velocities vs --dit-tol; --dit-grad
 also compares d(loss)/d(img tokens) under remat.
 
+f32 truth (--dit-truth f32, needs --dtype bf16): the DiT check first runs
+attn_impl="ref" with f32 params (exact upcasts of the bf16 checkpoint) on the
+same bf16-rounded img/context upcast to f32, then frees the f32 params and
+measures BOTH ref-bf16 and test-bf16 (aiter, or the emul kernel) against it,
+per sample, fwd and (--dit-grad) d/d(img). PASS iff every sample has
+test_err <= --dit-truth-ratio * ref_err + 1e-3: the kernel may be as
+inaccurate as bf16 reference math, not more. All runs use remat="full" (f32
+at 1024^2 must fit). The aiter-vs-ref lines are then printed as (info) only.
+
 On the node:
     python scripts/node_attention_parity.py --kernel aiter
     python scripts/node_attention_parity.py --kernel aiter --base-ckpt raw.safetensors
+    python scripts/node_attention_parity.py --kernel aiter --skip-kernel \
+        --base-ckpt raw.safetensors --width 1024 --height 1024 \
+        --act-sharding on --dit-grad --dit-truth f32 --qchunk 256
+(1024^2 with --txt-len 77 pads to 4352 tokens: --qchunk must divide it, or
+the ref attention goes dense; the DiT check prints a WARNING then.)
 
 CPU smoke:
     JAX_PLATFORMS=cpu python scripts/node_attention_parity.py --kernel emul \
@@ -97,6 +111,12 @@ def parse_args(argv=None):
                     help="DiT check: also compare grads wrt the image tokens")
     ap.add_argument("--dit-tol", type=float, default=None,
                     help="max per-sample relnorm (default 5e-2 bf16, 1e-4 f32)")
+    ap.add_argument("--dit-truth", choices=["none", "f32"], default="none",
+                    help="DiT check: f32 = measure ref-bf16 and test-bf16 "
+                         "against a ref-f32 truth (needs --dtype bf16)")
+    ap.add_argument("--dit-truth-ratio", type=float, default=1.5,
+                    help="truth mode: PASS iff test_err <= ratio * ref_err "
+                         "+ 1e-3 for every sample")
     return ap.parse_args(argv)
 
 
@@ -255,15 +275,21 @@ def kernel_check(args, tol):
     return ok
 
 
+def relnorms(x, y):
+    """Per-sample parity_full.relnorm of x vs reference y (float64 before any
+    norm, non-finite -> inf), as a list of floats."""
+    return [relnorm(np.asarray(x[b], np.float64), np.asarray(y[b], np.float64))
+            for b in range(x.shape[0])]
+
+
 def dit_report(name, x, y, tol):
     """Per-sample relnorm of x vs reference y (parity_full.relnorm: float64
     before any norm, non-finite -> inf). Prints one line per sample plus the
     verdict; returns True iff every sample's relnorm is finite and <= tol."""
     worst = 0.0
-    for b in range(x.shape[0]):
+    for b, rn in enumerate(relnorms(x, y)):
         xb = np.asarray(x[b], np.float64)
         yb = np.asarray(y[b], np.float64)
-        rn = relnorm(xb, yb)
         d = np.abs(xb - yb).max()
         mr = float(d / (np.abs(yb).max() + 1e-30))
         worst = max(worst, rn)
@@ -274,7 +300,42 @@ def dit_report(name, x, y, tol):
     return not bad
 
 
-def random_params(cfg, dtype, seed):
+# absolute floor of the truth verdict: protects against ref_err ~ 0 (a tiny
+# model or an exactly representable case), where any ratio would be noise
+TRUTH_ABS_FLOOR = 1e-3
+
+
+def truth_report(name, ref, test, truth, ratio):
+    """ref-bf16 and test-bf16 vs the f32 truth, per sample. Returns True iff
+    every sample has test_err <= ratio * ref_err + 1e-3 (non-finite -> FAIL).
+    The "worst ratio" in the summary is informational (it is inf when
+    ref_err == 0); the verdict is the per-sample allowance test."""
+    r_err, t_err = relnorms(ref, truth), relnorms(test, truth)
+    worst, ok = 0.0, True
+    for b, (re_, te) in enumerate(zip(r_err, t_err)):
+        finite = math.isfinite(te) and math.isfinite(re_)
+        allow = ratio * re_ + TRUTH_ABS_FLOOR
+        bad = not (finite and te <= allow)
+        ok &= not bad
+        if finite and re_ > 0:
+            rt = te / re_
+        else:  # relnorm maps NaN/inf to inf; ref_err == 0 -> inf unless te == 0
+            rt = 0.0 if (finite and te == 0) else float("inf")
+        worst = max(worst, rt)
+        tag = ("  <-- FAIL (non-finite error)" if not finite
+               else "  <-- FAIL" if bad else "")
+        print(f"  truth {name} sample {b}: ref(bf16) relnorm {re_:.2e}, "
+              f"test relnorm {te:.2e}, ratio {rt:.2f}, allowance {allow:.2e}{tag}")
+    print(f"  truth {name}: worst ratio {worst:.2f} (tol {ratio:.2f}); verdict "
+          f"{'PASS' if ok else 'FAIL'} (test <= ratio*ref + {TRUTH_ABS_FLOOR:g})"
+          f"{'' if ok else '  <-- FAIL'}")
+    return ok
+
+
+def random_params(cfg, dtype, seed, via_bf16=False):
+    """N(0, 0.02) weights in `dtype`. via_bf16: round each leaf to bf16 first
+    and upcast exactly (truth mode: the f32 tree then holds exactly the values
+    the bf16 runs get from it, as with a bf16 checkpoint)."""
     import jax
     import jax.numpy as jnp
 
@@ -283,15 +344,18 @@ def random_params(cfg, dtype, seed):
     abstract = abstract_krea2_params(cfg, dtype=jnp.float32)
     leaves, treedef = jax.tree.flatten(abstract)
     key = jax.random.PRNGKey(seed + 1)
+    mid = jnp.bfloat16 if via_bf16 else dtype
     leaves = [
         (jax.random.normal(jax.random.fold_in(key, i), s.shape, jnp.float32) * 0.02
-         ).astype(dtype)
+         ).astype(mid).astype(dtype)
         for i, s in enumerate(leaves)
     ]
     return jax.tree.unflatten(treedef, leaves)
 
 
 def dit_check(args, dit_tol):
+    import gc
+
     import jax
     import ml_dtypes
     import jax.numpy as jnp
@@ -302,6 +366,7 @@ def dit_check(args, dit_tol):
     from krea2_jax.model import dit_forward
     from parity_full import make_inputs
 
+    truth = args.dit_truth == "f32"
     cfg = KREA2_CONFIG
     if args.model_config:
         cfg = dataclasses.replace(cfg, **json.loads(args.model_config))
@@ -311,12 +376,15 @@ def dit_check(args, dit_tol):
     n = max(d for d in range(1, len(devs) + 1) if B % d == 0)
     mesh = Mesh(np.array(devs[:n]), axis_names=("fsdp",))
 
+    # truth mode loads f32 (the checkpoint is bf16, so these are exact
+    # upcasts) and derives the bf16 tree from it after the truth runs
+    load_dt = jnp.float32 if truth else dt
     t0 = time.perf_counter()
     if args.base_ckpt:
-        params = load_krea2_params(args.base_ckpt, mesh=mesh, dtype=dt)
+        params = load_krea2_params(args.base_ckpt, mesh=mesh, dtype=load_dt)
     else:
         from krea2_jax.checkpoint import param_shardings
-        params = random_params(cfg, dt, args.seed)
+        params = random_params(cfg, load_dt, args.seed, via_bf16=truth)
         params = jax.device_put(params, param_shardings(params, mesh))
     print(f"dit check: params ready in {time.perf_counter() - t0:.1f}s "
           f"(features={cfg.features} layers={cfg.layers}), mesh of {n} device(s)")
@@ -332,6 +400,17 @@ def dit_check(args, dit_tol):
     t, pos, mask = put(inp["t"], np.float32), put(inp["pos"], np.float32), put(inp["mask"])
     print(f"  {inp['htok'] * inp['wtok']} img tokens + {args.txt_len} txt, "
           f"txt valid lens {inp['lens'].tolist()}, act_sharding={args.act_sharding}")
+    # dit_forward pads txt + img tokens to a multiple of cfg.seq_pad_multiple;
+    # the ref attention goes dense (full L x L f32 scores) when qchunk does
+    # not divide that length
+    full = args.txt_len + inp["htok"] * inp["wtok"]
+    L = full + (-full) % cfg.seq_pad_multiple
+    if L > args.qchunk and L % args.qchunk:
+        d = 1
+        while d * 2 <= args.qchunk and L % (d * 2) == 0:
+            d *= 2
+        print(f"  WARNING: qchunk {args.qchunk} does not divide padded L={L} "
+              f"-> dense attention; use --qchunk {d}")
 
     common = dict(qchunk=args.qchunk)
     if args.act_sharding == "on":
@@ -340,33 +419,72 @@ def dit_check(args, dit_tol):
     kern = get_kernel(args.kernel)
     if kern is not None:
         aiter_kw["attn_kernel"] = kern
+    # remat is a no-op for the values; "full" keeps f32 at 1024^2 in memory
+    fwd_remat = "full" if truth else False
 
     def fwd(kw):
-        return jax.jit(lambda p, *a: dit_forward(p, cfg, *a, remat=False, **common, **kw))
+        return jax.jit(lambda p, *a: dit_forward(p, cfg, *a, remat=fwd_remat,
+                                                 **common, **kw))
+
+    def gfn(kw, wcot):
+        def loss(x, p, c, t, pos, mask):
+            o = dit_forward(p, cfg, x, c, t, pos, mask, remat="full",
+                            **common, **kw)
+            return jnp.sum(o.astype(jnp.float32) * wcot)
+        return jax.jit(jax.grad(loss))
+
+    def make_wcot(shape):
+        rng = np.random.default_rng(args.seed + 7)
+        return put(rng.standard_normal(shape).astype(np.float32))
+
+    if truth:
+        # the same bf16-rounded inputs upcast to f32: truth and bf16 runs
+        # differ only in compute precision
+        img32 = put(np.asarray(inp["img"], np_dt), np.float32)
+        ctx32 = put(np.asarray(inp["context"], np_dt), np.float32)
+        ref_kw = dict(attn_impl="ref")
+        t1 = time.perf_counter()
+        out_truth = np.asarray(fwd(ref_kw)(params, img32, ctx32, t, pos, mask)
+                               .astype(jnp.float32))
+        if args.dit_grad:
+            wcot = make_wcot(out_truth.shape)
+            g_truth = np.asarray(gfn(ref_kw, wcot)(img32, params, ctx32, t, pos, mask)
+                                 .astype(jnp.float32))
+        print(f"  f32 truth (ref, remat=full) done in {time.perf_counter() - t1:.1f}s")
+        # bf16 tree, then free the f32 one before the bf16 runs: peak is
+        # f32 + bf16 only briefly
+        params32 = params
+        params = jax.tree.map(lambda a: a.astype(jnp.bfloat16), params32)
+        jax.block_until_ready(params)
+        jax.tree.map(lambda a: a.delete(), params32)
+        del params32, img32, ctx32
+        gc.collect()
 
     f_ref, f_ai = fwd(dict(attn_impl="ref")), fwd(aiter_kw)
     a = (params, img, context, t, pos, mask)
     out_r = np.asarray(f_ref(*a).astype(jnp.float32))
     out_a = np.asarray(f_ai(*a).astype(jnp.float32))
 
-    ok = dit_report("aiter-vs-ref fwd", out_a, out_r, dit_tol)
+    if truth:
+        dit_report("aiter-vs-ref fwd (info)", out_a, out_r, dit_tol)
+        ok = truth_report("fwd", out_r, out_a, out_truth, args.dit_truth_ratio)
+    else:
+        ok = dit_report("aiter-vs-ref fwd", out_a, out_r, dit_tol)
 
     if args.dit_grad:
-        rng = np.random.default_rng(args.seed + 7)
-        wcot = put(rng.standard_normal(out_r.shape).astype(np.float32))
-
-        def gfn(kw):
-            def loss(x, p, c, t, pos, mask):
-                o = dit_forward(p, cfg, x, c, t, pos, mask, remat="full",
-                                **common, **kw)
-                return jnp.sum(o.astype(jnp.float32) * wcot)
-            return jax.jit(jax.grad(loss))
-
+        if not truth:
+            wcot = make_wcot(out_r.shape)
         ga = (img, params, context, t, pos, mask)
-        g_r = np.asarray(gfn(dict(attn_impl="ref"))(*ga).astype(jnp.float32))
-        g_a = np.asarray(gfn(aiter_kw)(*ga).astype(jnp.float32))
-        ok &= dit_report("aiter-vs-ref d/d(img)", g_a, g_r, dit_tol)
+        g_r = np.asarray(gfn(dict(attn_impl="ref"), wcot)(*ga).astype(jnp.float32))
+        g_a = np.asarray(gfn(aiter_kw, wcot)(*ga).astype(jnp.float32))
+        if truth:
+            dit_report("aiter-vs-ref d/d(img) (info)", g_a, g_r, dit_tol)
+            ok &= truth_report("d/d(img)", g_r, g_a, g_truth, args.dit_truth_ratio)
+        else:
+            ok &= dit_report("aiter-vs-ref d/d(img)", g_a, g_r, dit_tol)
 
+    if truth:
+        print(f"truth check {'PASSED' if ok else f'FAILED (ratio tol {args.dit_truth_ratio:.2f})'}")
     if args.iters > 0:
         it = max(1, min(args.iters, 5))
         print(f"  dit fwd ms: ref {timeit(f_ref, a, it, 1):.1f}, "
@@ -377,6 +495,15 @@ def dit_check(args, dit_tol):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.dit_truth == "f32" and args.dtype != "bf16":
+        raise SystemExit("--dit-truth f32 needs --dtype bf16 (it measures the "
+                         "bf16 runs against an f32 reference)")
+    if args.dit_truth == "f32" and not (args.base_ckpt or args.random_weights):
+        raise SystemExit("--dit-truth f32 needs a DiT check: pass --base-ckpt "
+                         "or --random-weights")
+    if not (math.isfinite(args.dit_truth_ratio) and args.dit_truth_ratio > 0):
+        raise SystemExit(f"--dit-truth-ratio must be finite and > 0 "
+                         f"(got {args.dit_truth_ratio})")
     if args.emulate_devices:
         os.environ["XLA_FLAGS"] = (
             os.environ.get("XLA_FLAGS", "")

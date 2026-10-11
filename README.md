@@ -331,14 +331,17 @@ Run these before the first real training job; none needs the dataset cache.
    the `shard_map` wrapper); `--base-ckpt` (or `--random-weights` with a tiny
    `--model-config`) adds a DiT-level `attn_impl="ref"` vs `"aiter"` check at
    `--width/--height` with mid-sequence text padding (`--dit-grad`: also the
-   gradients). `--kernel emul` swaps in the pure-JAX emulation of the padded
+   gradients; `--dit-truth f32` instead measures ref-bf16 and aiter-bf16
+   against a ref-f32 truth and passes iff aiter's error is at most
+   `--dit-truth-ratio` (1.5) × ref-bf16's + 1e-3). `--kernel emul` swaps in the pure-JAX emulation of the padded
    group mode, so it runs on CPU.
 
    ```bash
    python scripts/node_attention_parity.py --kernel aiter --batch 2 --heads 48 \
      --kv-heads 12 --seq 4608 --head-dim 128 --dtype bf16 --iters 20 --shard
    python scripts/node_attention_parity.py --kernel aiter \
-     --base-ckpt ./ckpt/raw.safetensors --width 1024 --height 1024 --dit-grad
+     --base-ckpt ./ckpt/raw.safetensors --width 1024 --height 1024 --dit-grad \
+     --qchunk 256   # 4352 padded tokens at --txt-len 77; 512 would go dense
    ```
 
 4. **`scripts/parity_full.py`** — full-size numerical parity of the official

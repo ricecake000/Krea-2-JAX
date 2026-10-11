@@ -183,8 +183,10 @@ NODE_ATTN_ARGS = (
 def node_attention_parity_emul():
     """scripts/node_attention_parity.py --kernel emul: kernel-level fwd+grads
     vs fp32 truth (f32 unsharded, bf16 under shard_map), the DiT-level
-    ref-vs-aiter check with random tiny weights, and a negative-control kernel
-    that ignores the logical lengths (must fail)."""
+    ref-vs-aiter check with random tiny weights, the --dit-truth f32 mode
+    (ref-bf16 and emul-bf16 vs a ref-f32 truth; rejects --dtype f32, a
+    non-positive --dit-truth-ratio and a missing weight source), and a
+    negative-control kernel that ignores the logical lengths (must fail)."""
     # dit_report self-check (in-process): relnorm via parity_full.relnorm,
     # float64 before any norm (a float32 norm of 1e20s overflowed and the
     # 100%-error case used to report relnorm 0 / PASS); NaN -> inf -> FAIL
@@ -193,7 +195,7 @@ def node_attention_parity_emul():
 
     import numpy as np
     sys.path.insert(0, str(REPO / "scripts"))
-    from node_attention_parity import dit_report
+    from node_attention_parity import dit_report, truth_report
 
     ref = np.full((2, 64, 16), 1e20, np.float32)
     buf = io.StringIO()
@@ -211,6 +213,42 @@ def node_attention_parity_emul():
     assert "worst relnorm inf" in buf.getvalue() and "FAIL" in buf.getvalue(), buf.getvalue()
     print(f"    dit_report: 2*ref vs ref=1e20 f32 -> relnorm {rns[0]:.6f}; "
           "NaN -> inf (FAIL)")
+    # truth_report self-check: truth = ones, x = truth * (1 + e) has relnorm
+    # e per sample; PASS iff every sample has test_err <= ratio*ref_err + 1e-3
+    truth = np.ones((2, 64, 16), np.float64)
+
+    def scaled(*e):
+        return truth * (1.0 + np.asarray(e, np.float64))[:, None, None]
+
+    def tr(e_ref, e_test, ratio=1.5):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = truth_report("fwd", scaled(*e_ref), scaled(*e_test), truth, ratio)
+        return res, buf.getvalue()
+
+    res, out = tr((1e-2, 2e-2), (1.2e-2, 2.9e-2))  # ratios 1.2, 1.45
+    assert res is True and "FAIL" not in out and "verdict PASS" in out, out
+    assert re.search(r"truth fwd: worst ratio 1\.45 ", out), out
+    # sample 1 over its allowance 1.5*2e-2 + 1e-3 = 3.1e-2; sample 0 fine
+    res, out = tr((1e-2, 2e-2), (1.2e-2, 3.3e-2))
+    lines = out.splitlines()
+    assert res is False and "verdict FAIL" in out, out
+    assert "FAIL" not in lines[0] and "FAIL" in lines[1], out
+    assert "allowance 3.10e-02" in lines[1], out
+    nan_test = scaled(1e-2, 2e-2)
+    nan_test[1, 3, 5] = np.nan
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = truth_report("fwd", scaled(1e-2, 2e-2), nan_test, truth, 1.5)
+    out = buf.getvalue()
+    assert res is False and "non-finite" in out and "test relnorm inf" in out, out
+    # 1e-3 absolute floor: ref_err 0 -> allowance 1e-3
+    res, out = tr((0.0, 0.0), (5e-4, 5e-4))
+    assert res is True and "verdict PASS" in out, out
+    res, out = tr((0.0, 0.0), (5e-4, 2e-3))
+    assert res is False and "FAIL" in out.splitlines()[1], out
+    print("    truth_report: within ratio PASS, sample 1 over allowance FAIL, "
+          "NaN FAIL, 1e-3 floor (5e-4 PASS / 2e-3 FAIL)")
     _, out = run_script("node_attention_parity.py", *NODE_ATTN_ARGS,
                         "--kernel", "emul", "--dtype", "f32")
     assert "kernel check PASSED" in out and "ALL ATTENTION PARITY CHECKS PASSED" in out, out
@@ -230,7 +268,35 @@ def node_attention_parity_emul():
                         "--kernel", "emul-nomask", "--dtype", "f32",
                         "--iters", 0, expect_ok=False)
     assert "kernel check FAILED" in out, out
-    print("    node_attention_parity: emul passes (f32, bf16+shard_map, dit), "
+    # f32 truth: ratio 4 because emul and ref are both bf16 with a different
+    # op order; this checks the code path, not aiter numerics
+    _, out = run_script("node_attention_parity.py", *NODE_ATTN_ARGS,
+                        "--kernel", "emul", "--dtype", "bf16", "--skip-kernel",
+                        "--random-weights", "--model-config", TINY_JSON,
+                        "--width", 128, "--height", 192, "--txt-len", 7,
+                        "--act-sharding", "on", "--dit-grad",
+                        "--dit-truth", "f32", "--dit-truth-ratio", 4)
+    assert "truth check PASSED" in out and "dit check PASSED" in out, out
+    assert re.search(r"truth fwd sample \d+: ref\(bf16\) relnorm", out), out
+    assert re.search(r"truth d/d\(img\) sample", out), out
+    assert "(info)" in out, out
+    _, out = run_script("node_attention_parity.py", *NODE_ATTN_ARGS,
+                        "--kernel", "emul", "--dtype", "f32", "--skip-kernel",
+                        "--random-weights", "--model-config", TINY_JSON,
+                        "--dit-truth", "f32", expect_ok=False)
+    assert "needs --dtype bf16" in out, out
+    _, out = run_script("node_attention_parity.py", *NODE_ATTN_ARGS,
+                        "--kernel", "emul", "--dtype", "bf16", "--skip-kernel",
+                        "--random-weights", "--model-config", TINY_JSON,
+                        "--dit-truth", "f32", "--dit-truth-ratio", 0,
+                        expect_ok=False)
+    assert "--dit-truth-ratio must be finite and > 0" in out, out
+    _, out = run_script("node_attention_parity.py", *NODE_ATTN_ARGS,
+                        "--kernel", "emul", "--dtype", "bf16", "--skip-kernel",
+                        "--dit-truth", "f32", expect_ok=False)
+    assert "pass --base-ckpt or --random-weights" in out, out
+    print("    node_attention_parity: emul passes (f32, bf16+shard_map, dit, "
+          "dit f32 truth), truth rejects --dtype f32 / ratio 0 / no weights, "
           "negative control fails")
 
 
