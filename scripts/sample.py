@@ -72,6 +72,17 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--num-images", type=int, default=1)
     ap.add_argument("--qchunk", type=int, default=512)
+    ap.add_argument(
+        "--attn", choices=["ref", "splash"], default="splash",
+        help="attention kernel: 'splash' = fused Pallas TPU kernel (logits "
+             "stay in VMEM; heads split across devices), 'ref' = exact "
+             "query-chunked float32 softmax (materializes logits in HBM)",
+    )
+    ap.add_argument(
+        "--no-compact-text", action="store_true",
+        help="keep the text sequence padded to the encoder max length "
+             "(default drops padded text tokens; outputs are unchanged)",
+    )
     ap.add_argument("--output", default="sample")
     args = ap.parse_args()
 
@@ -105,6 +116,11 @@ def main():
             cfg.text_max_length,
         )
 
+    if args.attn == "splash" and jax.default_backend() != "tpu":
+        print(f"splash attention needs a TPU (backend: {jax.default_backend()}); "
+              "using --attn ref")
+        args.attn = "ref"
+
     mesh = make_mesh()
     print(f"loading DiT onto {mesh.size} device(s)...")
     params = load_krea2_params(args.base_ckpt, mesh=mesh, dtype=jnp.bfloat16)
@@ -129,6 +145,9 @@ def main():
         height=args.height, width=args.width,
         steps=args.steps, guidance=args.cfg, mu=args.mu,
         seed=args.seed, qchunk=args.qchunk,
+        attn_impl=args.attn,
+        attn_mesh=mesh if mesh.size > 1 else None,
+        compact=not args.no_compact_text,
     )
     latents = np.asarray(jax.device_get(latents).astype(jnp.float32))
 

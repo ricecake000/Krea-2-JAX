@@ -135,6 +135,19 @@ Prompt encoding and VAE decoding run on host CPU via PyTorch; the DiT
 sampling loop runs on TPU. For the Turbo checkpoint use
 `--steps 8 --cfg 0 --mu 1.15`.
 
+Sampling-side optimizations (outputs unchanged, see `tests/test_sampling.py`):
+
+- `--attn splash` (default on TPU): fused Pallas attention, so the
+  float32 `(heads, chunk, L)` logits never round-trip through HBM. On more
+  than one device the heads are split across chips (no duplicated attention).
+  `--attn ref` restores the query-chunked reference path.
+- Padded text tokens are dropped before sampling (text sits at RoPE position
+  0 and padding is masked, so the image output is identical) — a short
+  prompt runs ~4.35k instead of 4.6k tokens at 1024px. `--no-compact-text`
+  keeps the padded length.
+- The text branch (text fusion + txtmlp) does not depend on the timestep and
+  runs once per prompt instead of every step.
+
 ## 4. Deploy: merge into Turbo
 
 ```bash
@@ -454,6 +467,7 @@ python tests/test_aiter_attention.py  # padded-group-mode emulation == reference
 python tests/test_act_sharding.py  # real-config AOT: abstract params == torch meta
                                    # state_dict; no activation collectives when on
 python tests/test_scripts_smoke.py # aot_analysis / bench_step / parity scripts (tiny model)
+python tests/test_sampling.py      # sampler: text caching, text compaction, head-sharded splash
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
