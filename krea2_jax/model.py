@@ -4,6 +4,11 @@ Parameters live in a nested dict whose structure mirrors the official PyTorch
 state_dict (see `checkpoint.py` for the mapping), with the 28 transformer
 blocks (and the 2+2 text-fusion blocks) stacked along a leading axis so the
 forward pass can `lax.scan` over them with gradient rematerialization.
+`dit_forward(layer_loop="unroll")` instead runs the 28 blocks as an unrolled
+Python loop, normally over `params["blocks"]` kept as a LIST of per-layer
+trees (`checkpoint.load_krea2_params(unstack=("blocks",))` /
+`checkpoint.unstack_blocks`), which removes the per-layer slice/update copies
+the scan needs on GPU.
 
 LoRA is expressed as a second, optional pytree with the same nesting; every
 `linear()` call takes an optional LoRA leaf `{"lora_A": (r, in), "lora_B":
@@ -44,6 +49,17 @@ def _lget(lora, *keys):
 def _lindex(lora, i):
     """Select layer i from a stacked LoRA subtree (None passes through)."""
     return None if lora is None else jax.tree.map(lambda a: a[i], lora)
+
+
+def _layer(tree, i):
+    """Layer i of a repeated-block subtree: element i of a per-layer list,
+    or a static index into every leaf of a stacked tree (None passes
+    through)."""
+    if tree is None:
+        return None
+    if isinstance(tree, (list, tuple)):
+        return tree[i]
+    return jax.tree.map(lambda a: a[i], tree)
 
 
 def _constrain(x, act_sharding):
@@ -629,7 +645,7 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
     B, L, N, D = context.shape
     x = context.reshape(B * L, N, D)
     for i in range(2):  # layerwise blocks attend across the N encoder layers
-        blk = jax.tree.map(lambda a: a[i], p["layerwise_blocks"])
+        blk = _layer(p["layerwise_blocks"], i)
         x = text_fusion_block(
             x, blk, cfg.txtheads, cfg.txtkvheads,
             lora=_lindex(_lget(lora, "layerwise_blocks"), i),
@@ -639,7 +655,7 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
     x = linear(x, p["projector"], _lget(lora, "projector"), lora_scale,
                act_sharding=act_sharding)[..., 0]
     for i in range(2):  # refiner blocks attend across the L text tokens
-        blk = jax.tree.map(lambda a: a[i], p["refiner_blocks"])
+        blk = _layer(p["refiner_blocks"], i)
         x = text_fusion_block(
             x, blk, cfg.txtheads, cfg.txtkvheads, keymask=keymask,
             lora=_lindex(_lget(lora, "refiner_blocks"), i),
@@ -710,6 +726,7 @@ def dit_forward(
     act_sharding=None,   # Sharding for linear outputs + the scan carry
     attn_kernel=None,    # aiter only: flash_attn_varlen-compatible callable
     txt_tokens=None,     # precomputed text_tokens_forward(...); skips context
+    layer_loop="scan",   # "scan" (lax.scan over stacked blocks) or "unroll"
 ):
     """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels).
 
@@ -725,6 +742,24 @@ def dit_forward(
     act_sharding: optional Sharding (normally NamedSharding(mesh, P("fsdp")))
     applied to every linear output and to the scan carry at block entry and
     exit, so activations stay batch-sharded under FSDP. None: unconstrained.
+
+    layer_loop: how the 28 transformer blocks run. "scan" (default):
+    `jax.lax.scan` over `params["blocks"]` stacked along a leading layer axis
+    (a list there is a TypeError). "unroll": the same per-block body (same
+    remat wrapping, same carry constraints) applied in a Python for-loop, so
+    the HLO holds 28 copies of the block (longer compile) but no while loop.
+    The point is the copy storm of the scan on GPU: every iteration
+    dynamic-slices the stacked weight shards (feeding the FSDP all-gathers),
+    dynamic-update-slices the remat-saved activations into stacked residual
+    buffers and the reduce-scattered weight grads into the stacked grads —
+    ~42 D2D memcpys per layer per step, since XLA cannot fuse a slice into a
+    collective or a DUS into a GEMM/collective result. "unroll" with
+    `params["blocks"]` as a LIST of per-layer trees (and the LoRA
+    `lora["blocks"]` as a list or stacked) has none of these: each layer's
+    weights, saved activations and grads live in their own buffers. A stacked
+    `params["blocks"]` is accepted by "unroll" (statically indexed per
+    layer, numerically identical) but its gradient is still assembled into
+    the stacked layout, so only the list form removes the copies.
 
     attn_impl="aiter": tokens are reordered per sample (after the padding to
     a multiple of 256) so valid tokens form a prefix — stable, so text then
@@ -742,6 +777,12 @@ def dit_forward(
     constrains the batch to the "fsdp" axis when the batch divides it and
     otherwise leaves sharding to the partitioner (no shard_map).
     """
+    if layer_loop not in ("scan", "unroll"):
+        raise ValueError(f"unknown layer_loop: {layer_loop!r} "
+                         "(expected 'scan' or 'unroll')")
+    if layer_loop == "scan" and isinstance(params["blocks"], (list, tuple)):
+        raise TypeError("layer_loop='scan' needs stacked blocks; use "
+                        "layer_loop='unroll' or stack_blocks()")
     B, Limg, _ = img.shape
     Ltxt = (txt_tokens if txt_tokens is not None else context).shape[1]
     sh = act_sharding
@@ -799,7 +840,10 @@ def dit_forward(
         act_sharding=sh, attn_kernel=attn_kernel,
     )
 
-    if lora is not None and "blocks" in lora:
+    # one predicate for the body choice and (unrolled) the per-layer
+    # argument: the pair body always gets (p, l), l possibly None
+    pair_body = lora is not None and "blocks" in lora
+    if pair_body:
         def body(carry, layer):
             p, l = layer
             out = block_fn(_constrain(carry, sh), p, tvec6, freqs, mask, lora=l)
@@ -811,17 +855,45 @@ def dit_forward(
             return _constrain(out, sh), None
         xs = blocks
 
+    # prevent_cse=False is only safe under scan (the loop already keeps XLA
+    # from CSE-ing the backward recomputation into the forward); unrolled,
+    # the barrier is needed or the remat would silently be undone
+    cse = layer_loop == "unroll"
     if remat is True or remat == "full":
-        body = jax.checkpoint(body, prevent_cse=False)
+        body = jax.checkpoint(body, prevent_cse=cse)
     elif remat == "dots":
         body = jax.checkpoint(
             body,
             policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
-            prevent_cse=False,
+            prevent_cse=cse,
         )
     elif remat not in (False, None, "none"):
         raise ValueError(f"unknown remat mode: {remat!r}")
-    combined, _ = jax.lax.scan(body, combined, xs)
+    if layer_loop == "scan":
+        combined, _ = jax.lax.scan(body, combined, xs)
+    else:
+        # unrolled: list blocks are used as-is (no slice anywhere); a stacked
+        # tree is indexed statically per layer
+        if isinstance(blocks, (list, tuple)):
+            n_layers = len(blocks)
+        else:
+            n_layers = jax.tree.leaves(blocks)[0].shape[0]
+        lora_blocks = lora["blocks"] if pair_body else None
+        if isinstance(lora_blocks, (list, tuple)):
+            n_lora = len(lora_blocks)
+        elif lora_blocks is not None:
+            # stacked: every leaf's leading axis is the layer axis
+            n_lora = {a.shape[0] for a in jax.tree.leaves(lora_blocks)}
+            n_lora = n_lora.pop() if len(n_lora) == 1 else n_lora
+        else:
+            n_lora = n_layers
+        if n_lora != n_layers:
+            raise ValueError(f"lora['blocks'] has {n_lora} layers, "
+                             f"params['blocks'] has {n_layers}")
+        for i in range(n_layers):
+            p = _layer(blocks, i)
+            layer = (p, _layer(lora_blocks, i)) if pair_body else p
+            combined, _ = body(combined, layer)
 
     if inv_perm is not None:
         combined = jnp.take_along_axis(combined, inv_perm[..., None], axis=1)

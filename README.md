@@ -246,6 +246,23 @@ on; `off` exists for A/B comparisons. Both `--act-sharding` and `--attn` are
 recorded in the checkpoint's run config and only warn when changed on
 `--resume`.
 
+### Unrolled layer loop (`--layer-loop`, default `scan`)
+
+`scan` runs the 28 blocks with `lax.scan` over weights stacked on a layer
+axis. On GPU every scan iteration costs ~42 device-to-device copies:
+dynamic-slices of the stacked weight shards feeding the FSDP all-gathers,
+dynamic-update-slices of the remat-saved GEMM outputs into stacked residual
+buffers and of the reduce-scattered weight grads into the stacked grads
+(~60 ms/step on MI350X, same count on B300). `--layer-loop unroll` (in
+`train_full.py`, `bench_step.py` and `aot_analysis.py`) loads the blocks as
+a list of 28 per-layer arrays (`load_krea2_params(unstack=("blocks",))`)
+and runs them in an unrolled Python loop, so the graph has no slice, DUS or
+while loop at all (numerics identical; `tests/test_layer_loop.py` checks
+the compiled HLO). The cost is compile time (28 copies of the block body).
+Exports are the same official keys and bytes either way, but orbax
+checkpoints are not interchangeable between modes (the train-state tree
+differs): `layer_loop` is a hard resume key. LoRA training stays on `scan`.
+
 ### jax-aiter flash attention (`--attn aiter`, MI355X only)
 
 [jax-aiter](https://github.com/ROCm/jax-aiter) exposes AMD's AITER kernels
@@ -491,6 +508,7 @@ Useful knobs:
 | `--remat-policy` | dots | `full` saves the most HBM, `none` the least compute |
 | `--attn` | ref | `ref` (exact fp32 softmax; portable default), `aiter` (jax-aiter flash attention; use it on MI355X, ~2.5x `ref`), `splash` (TPU) |
 | `--act-sharding` | on | constrain activations to batch sharding (see above); `off` only for A/B |
+| `--layer-loop` | scan | `unroll`: per-layer weight arrays + unrolled block loop, no per-layer slice/DUS copies on GPU, longer compile (see above); not resumable across modes |
 | `--save-every` / `--keep` | 1000 / 3 | orbax checkpoints of params + optimizer + EMA |
 | `--export-every` | 0 | extra `model_stepNNNNNN.safetensors` exports (0 = only at the end) |
 | `--max-hours` | – | stop cleanly (checkpoint + export) after a wall-clock budget; counts only the train loop (see below) |
@@ -573,7 +591,8 @@ encoder's identity (`text_encoder_id`: sha256 of tokenizer.json, the
 resolved text config and the full contents of every safetensors file the
 loader reads, so any weight value change counts; path and file-name
 independent; hashing ~8 GB takes a few seconds to a minute at startup) and position mode, `--timestep-mu`,
-`--logit-mean/--logit-std` or turning the EMA on/off is a hard error: those
+`--logit-mean/--logit-std`, `--layer-loop` (checkpoints from before it was
+recorded count as `scan`) or turning the EMA on/off is a hard error: those
 would silently change the data order, captions, RNG, objective or
 train-state shape. Changing `--steps`, `--lr`, `--warmup-steps`,
 `--cosine-decay`, `--min-lr`, `--weight-decay`, `--beta1/2`, `--eps`,
@@ -631,6 +650,8 @@ python tests/test_act_sharding.py  # real-config AOT: abstract params == torch m
                                    # state_dict; no activation collectives when on
 python tests/test_scripts_smoke.py # aot_analysis / bench_step / parity scripts (tiny model)
 python tests/test_sampling.py      # sampler: text caching, text compaction, head-sharded splash
+python tests/test_layer_loop.py    # --layer-loop unroll == scan (outputs + grads), list-block
+                                   # checkpoint I/O + shardings, no slice/DUS in the HLO
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).

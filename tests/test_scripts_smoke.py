@@ -6,7 +6,8 @@ tiny model config on 8 emulated devices:
                          with it off (the partitioner moves activations)
   bench_step_modes       scripts/bench_step.py --random-weights in fwd,
                          fwdbwd and train modes (2 timed steps each), plus
-                         train with --attn cudnn
+                         train with --attn cudnn and train with
+                         --layer-loop unroll (per-layer list blocks)
   modal_text_parity_flow scripts/modal_text_parity.py control flow (exit
                          codes, skip-on-tokenizer-failure, exit 1) with a
                          mocked subprocess runner, no Modal SDK
@@ -148,6 +149,16 @@ def bench_step_modes():
     loss = float(re.search(r"loss ([\d.eE+-]+|nan|inf)", out).group(1))
     assert loss == loss and loss < 1e3, f"cudnn: bad loss {loss}"
     print(f"    bench_step --mode train --attn cudnn: median {m.group(1)} ms")
+    # --layer-loop unroll: blocks as a per-layer list, unrolled layer loop
+    _, out = run_script("bench_step.py", *common, "--mode", "train",
+                        "--layer-loop", "unroll")
+    assert "layer-loop unroll" in out, out
+    m = re.search(r"step time: median ([\d.]+) ms over (\d+) steps", out)
+    assert m and int(m.group(2)) == 2, out
+    loss = float(re.search(r"loss ([\d.eE+-]+|nan|inf)", out).group(1))
+    assert loss == loss and loss < 1e3, f"unroll: bad loss {loss}"
+    print(f"    bench_step --mode train --layer-loop unroll: median "
+          f"{m.group(1)} ms")
 
 
 PARITY_ARGS = (

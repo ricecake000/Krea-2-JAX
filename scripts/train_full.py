@@ -177,7 +177,14 @@ RESUME_HARD_KEYS = (
     "artist_prob", "n_samples", "dataset_fingerprint", "lat_channels",
     "base_ckpt", "model_config", "text_model_config", "position_mode",
     "timestep_mu", "logit_mean", "logit_std", "text_encoder_id",
+    "layer_loop",
 )
+# Value of a hard key in checkpoints written before the key existed (every
+# such checkpoint used it): compared instead of reporting it unrecorded.
+# layer_loop: "scan" stacks the blocks, "unroll" keeps them as a per-layer
+# list, so params / opt_state / ema trees differ and cannot be restored
+# into the other mode.
+_RESUME_KEY_DEFAULTS = {"layer_loop": "scan"}
 # Changing these is legitimate (e.g. extending a run) but changes the
 # optimizer / LR schedule from the resumed step on: warning.
 # text_encoder is only the --text-encoder name (a local dir's basename or
@@ -201,9 +208,23 @@ def check_resume_config(saved, current, step):
     Raises SystemExit listing every differing RESUME_HARD_KEYS entry (and an
     EMA enabled/disabled flip); prints a warning for differing
     RESUME_SOFT_KEYS entries. A checkpoint without a config (older format)
-    only warns. Returns the list of warning lines printed.
+    only warns, except that the historical defaults of _RESUME_KEY_DEFAULTS
+    (keys every such checkpoint used, e.g. layer_loop "scan") are still
+    enforced as hard keys. Returns the list of warning lines printed.
     """
     if saved is None:
+        hard = [f"  {k}: checkpoint {v!r}, now {current[k]!r}"
+                for k, v in _RESUME_KEY_DEFAULTS.items() if current[k] != v]
+        if hard:
+            raise SystemExit(
+                f"--resume: checkpoint step {step} was saved with a different "
+                "run configuration (it has no saved run configuration, so it "
+                "predates these settings and used their historical defaults). "
+                "These settings change the train-state shape and cannot "
+                "change mid-run:\n" + "\n".join(hard)
+                + "\nRerun with the checkpoint's values, or use a fresh "
+                "--output-dir."
+            )
         msg = (f"WARNING: checkpoint step {step} has no saved run configuration "
                "(older checkpoint); cannot verify that this run matches it")
         print(msg, flush=True)
@@ -211,10 +232,12 @@ def check_resume_config(saved, current, step):
     hard, soft, unrecorded, soft_changed = [], [], [], []
     for keys, out in ((RESUME_HARD_KEYS, hard), (RESUME_SOFT_KEYS, soft)):
         for k in keys:
-            if k not in saved:
+            if k not in saved and k not in _RESUME_KEY_DEFAULTS:
                 unrecorded.append(k)
-            elif saved[k] != current[k]:
-                out.append(f"  {k}: checkpoint {saved[k]!r}, now {current[k]!r}")
+                continue
+            old = saved.get(k, _RESUME_KEY_DEFAULTS.get(k))
+            if old != current[k]:
+                out.append(f"  {k}: checkpoint {old!r}, now {current[k]!r}")
                 if out is soft:
                     soft_changed.append(k)
     old_ema = saved.get("ema_decay")
@@ -338,7 +361,9 @@ def make_train_step(cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
     False). Timestep shift: per-sample mu from h*w (per_sample_mu) unless
     mu_override. Loss: masked_flow_loss. hp is the argparse namespace;
     fields used: logit_mean, logit_std, qchunk, attn, attn_block,
-    remat_policy, ema_decay, act_sharding. Shared by train_full.main,
+    remat_policy, ema_decay, act_sharding, layer_loop (params, pshard and
+    the opt/ema trees must then hold `blocks` as a per-layer list for
+    "unroll", stacked for "scan"). Shared by train_full.main,
     scripts/aot_analysis.py (abstract shapes) and scripts/bench_step.py.
     """
     remat = REMAT_MODES[hp.remat_policy]
@@ -377,7 +402,7 @@ def make_train_step(cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
                 p16, cfg, xt, context, t, pos, mask,
                 lora=None, qchunk=hp.qchunk, remat=remat,
                 attn_impl=hp.attn, attn_mesh=mesh, attn_block=hp.attn_block,
-                act_sharding=act,
+                act_sharding=act, layer_loop=hp.layer_loop,
             )
             return masked_flow_loss(v, target, n_img)
 
@@ -473,6 +498,15 @@ def parse_args(argv=None):
                     help="gradient checkpointing: 'full' recomputes each "
                          "block, 'dots' saves dense-projection outputs, "
                          "'none' saves everything")
+    ap.add_argument("--layer-loop", choices=["scan", "unroll"], default="scan",
+                    help="'scan': lax.scan over the 28 stacked blocks; "
+                         "'unroll': keep the blocks as per-layer arrays and "
+                         "run them in an unrolled loop, which removes the "
+                         "per-layer dynamic-slice / dynamic-update-slice "
+                         "copies of the scan on GPU (weight slices, saved "
+                         "activations, stacked grads) at the cost of a "
+                         "longer compile. Checkpoints are not "
+                         "interchangeable between the two (resume refuses)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-hours", type=float, default=None,
                     help="wall-clock budget for the train loop; on expiry the "
@@ -824,6 +858,7 @@ def main(argv=None):
         "logit_std": args.logit_std,
         "act_sharding": args.act_sharding,
         "attn": args.attn,
+        "layer_loop": args.layer_loop,
     }
     if resume_step is not None:
         # before the (slow) base load and before --resume-step renames
@@ -841,7 +876,8 @@ def main(argv=None):
     print("loading base checkpoint as fp32 (this can take a few minutes)...")
     t0 = time.time()
     params = load_krea2_params(
-        args.base_ckpt, mesh=mesh, dtype=jnp.float32, sharding="fsdp"
+        args.base_ckpt, mesh=mesh, dtype=jnp.float32, sharding="fsdp",
+        unstack=("blocks",) if args.layer_loop == "unroll" else (),
     )
     pshard = param_shardings(params, mesh)
     n_params = sum(x.size for x in jax.tree.leaves(params))
@@ -851,6 +887,7 @@ def main(argv=None):
           f"{n_params * (16 if use_ema else 12) / 2**30 / n_dev:.1f} GiB/device")
     print(f"attn {args.attn} | remat {args.remat_policy} | "
           f"act-sharding {args.act_sharding} | "
+          f"layer-loop {args.layer_loop} | "
           f"ema {args.ema_decay if use_ema else 'off'}")
 
     # --- optimizer ---

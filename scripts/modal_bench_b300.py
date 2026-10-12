@@ -42,6 +42,32 @@ already have --attn cudnn / --profile-dir; checked locally before launch).
 Steps 1-3 run in a child python process (this file with --micro-child) so
 that their JAX client releases the GPU before bench_step.py starts.
 
+Copy-storm probe (--copies; ONE B300 container, variants run sequentially):
+
+    modal run scripts/modal_bench_b300.py --copies
+    modal run scripts/modal_bench_b300.py --copies --variants base,unroll --batch 4
+    modal run scripts/modal_bench_b300.py --copies --xla-flags=--xla_gpu_autotune_level=0
+
+  Each variant = bench_step --random-weights --mode fwdbwd --img-tokens 4096
+  --text-rows 512 (1024^2, txt512) --remat-policy dots --act-sharding on
+  --attn $ATTN --qchunk 512 --steps 4 --warmup 1 --profile-dir DIR, its own
+  cold compile cache, and XLA_FLAGS += --xla_dump_to=/tmp/hlo_<variant>
+  --xla_dump_hlo_as_text --xla_dump_hlo_module_re=fwdbwd (+ --xla-flags):
+    base        layer loop as lax.scan (current default)
+    dsf         + --xla_gpu_enable_dynamic_slice_fusion=true
+    unroll      bench_step --layer-loop unroll (per-layer params, no stacking)
+    unroll_dsf  both
+  Options: --variants (default base,dsf,unroll,unroll_dsf), --batch (4),
+  --steps (4: 2 profiled + 2 timed), --xla-flags "..." (every variant; use
+  the --xla-flags=... form), --timeout-min (default 40, max 60).
+  Local outputs: .../results/modal/<ts>/copies/report.md + variants.jsonl and
+  per variant copies/<variant>/: perfetto_trace.json.gz, *.xplane.pb, the
+  jit_fwdbwd *after_optimizations.txt.gz, hlo_copy_report.{md,json}
+  (scripts/hlo_copy_report.py), trace_copy_stats.json (memcpy and
+  slice/DUS fusion kernels/step, kept apart, plus their copy-like sum).
+  Standalone trace check (no Modal):
+    python scripts/modal_bench_b300.py --parse-trace perfetto_trace.json.gz
+
 Local CPU smoke test of steps 1-3 (no Modal, tiny sizes):
     JAX_PLATFORMS=cpu python scripts/modal_bench_b300.py --micro-child --allow-cpu \\
         --sizes 256,512 --attn-shape 1,2,256,64 --reps 2 --out /tmp/micro.json
@@ -49,6 +75,7 @@ Local CPU smoke test of steps 1-3 (no Modal, tiny sizes):
 
 import argparse
 import collections
+import gzip
 import json
 import os
 import re
@@ -59,8 +86,10 @@ import time
 from pathlib import Path
 from typing import Literal
 
-if __name__ == "__main__" and "--micro-child" in sys.argv:
-    modal = None   # the micro child (also run inside the container) never needs Modal
+if __name__ == "__main__" and ("--micro-child" in sys.argv
+                               or "--parse-trace" in sys.argv):
+    modal = None   # the micro child (also run inside the container) and the
+    #                standalone trace parser never need Modal
 else:
     try:
         import modal
@@ -74,6 +103,7 @@ REMOTE_REPO = "/repo"
 LOCAL_REPO = Path(__file__).resolve().parent.parent
 LOCAL_RESULTS = Path("/home/mj/krea2-ops/mi350x/results/modal")
 FUNCTION_TIMEOUT_S = 40 * 60
+COPIES_MAX_TIMEOUT_MIN = 60   # hard Modal timeout of the copies probe
 DEFAULT_BATCHES = "2,4,8"
 DEFAULT_PROFILE_BATCH = 4
 ATTN_CHOICES = ("ref", "cudnn")
@@ -82,6 +112,32 @@ REMOTE_PROFILE_ROOT = "/tmp/prof"
 MAX_RETURN_BYTES = 200 * 2**20   # per returned file
 ATTN_SHAPE = (2, 24, 4608, 128)   # B, H, L, D
 MATMUL_SIZES = (4096, 8192, 16384)
+
+# --copies probe: name -> (extra bench_step args, extra XLA_FLAGS)
+COPIES_VARIANTS = {
+    "base": ((), ""),
+    "dsf": ((), "--xla_gpu_enable_dynamic_slice_fusion=true"),
+    "unroll": (("--layer-loop", "unroll"), ""),
+    "unroll_dsf": (("--layer-loop", "unroll"),
+                   "--xla_gpu_enable_dynamic_slice_fusion=true"),
+}
+DEFAULT_COPIES_VARIANTS = "base,dsf,unroll,unroll_dsf"
+DEFAULT_COPIES_BATCH = 4
+DEFAULT_COPIES_STEPS = 4
+PROFILE_STEPS = 2          # bench_step profiles the first 2 timed steps
+REMOTE_COPIES_PROF = "/tmp/prof_copies"
+HLO_DUMP_FLAGS = ("--xla_dump_hlo_as_text "
+                  "--xla_dump_hlo_module_re=fwdbwd")
+# GPU copy kernels: CUDA memcpy128 / memcpy32_post / MemcpyD2D, ROCm
+# __amd_rocclr_copyBuffer, XLA *copy* fusions
+COPY_KERNEL_RE = r"memcpy|copybuffer|copy"
+# slice / dynamic-update-slice fusions XLA lowered to a real (non-memcpy)
+# kernel, e.g. loop_dynamic_update_slice_fusion on B300: the same copies, so a
+# variant that only turned memcpys into these kernels must not look fixed.
+# Matched on the kernel name, only for kernels the memcpy regex did not take
+# (a kernel is never counted in both categories).
+SLICE_FUSION_KERNEL_RE = (r"dynamic_slice_fusion|dynamic_update_slice_fusion"
+                          r"|dynamic-slice|dynamic-update-slice")
 
 # Measured on 1x MI350X (jax 0.11.0 ROCm). bench_step there: --base-ckpt (real
 # weights) --mode fwdbwd 1024^2 txt512 dots --qchunk 512 --act-sharding on
@@ -304,11 +360,12 @@ def parse_bench(lines):
     return out
 
 
-def bench_cmd(python, repo, attn, batch, extra=()):
+def bench_cmd(python, repo, attn, batch, extra=(), steps=5):
+    # 1024^2 = 64x64 patches = 4096 image tokens; 512 text rows
     return [python, f"{repo}/scripts/bench_step.py", "--random-weights",
-            "--mode", "fwdbwd", "--width", "1024", "--height", "1024",
-            "--txt-len", "512", "--remat-policy", "dots", "--attn", attn,
-            "--qchunk", "512", "--act-sharding", "on", "--steps", "5",
+            "--mode", "fwdbwd", "--img-tokens", "4096", "--text-rows", "512",
+            "--remat-policy", "dots", "--attn", attn,
+            "--qchunk", "512", "--act-sharding", "on", "--steps", str(steps),
             "--warmup", "1", *extra, "--batch-size", str(batch)]
 
 
@@ -317,7 +374,7 @@ def bench_env(base_env, attn):
             "JAX_COMPILATION_CACHE_DIR": f"/tmp/jax_cache_{attn}"}
 
 
-def run_one(python, repo, env, attn, b, deadline, kind, extra=()):
+def run_one(python, repo, env, attn, b, deadline, kind, extra=(), steps=5):
     """One bench_step subprocess -> result dict (never raises)."""
     left = deadline - time.time()
     if left < 120:
@@ -327,8 +384,8 @@ def run_one(python, repo, env, attn, b, deadline, kind, extra=()):
         print(r["error"], flush=True)
         return r
     t0 = time.time()
-    rc, lines, tail, to = stream(bench_cmd(python, repo, attn, b, extra), env,
-                                 repo, left - 60)
+    rc, lines, tail, to = stream(bench_cmd(python, repo, attn, b, extra,
+                                           steps), env, repo, left - 60)
     r = {"kind": kind, "attn": attn, "batch": b, **parse_bench(lines),
          "rc": rc, "wall_s": round(time.time() - t0, 1)}
     if rc != 0:
@@ -552,11 +609,13 @@ def build_report(micro, ladder, prof, env_extra, opts):
     return "\n".join(out)
 
 
-def check_local_bench_step(attn, profile):
+def check_local_bench_step(attn, profile, need=()):
     """Fail before spending credits if the local checkout (what /repo will
-    contain) lacks the bench_step options this run needs."""
+    contain) lacks the bench_step options this run needs (`need`: extra
+    option strings such as "--layer-loop")."""
     src = (LOCAL_REPO / "scripts" / "bench_step.py").read_text()
-    missing = []
+    missing = [o for o in ("--img-tokens", "--text-rows", *need)
+               if f'"{o}"' not in src]
     m = re.search(r'"--attn"\s*,\s*choices\s*=\s*\[([^\]]*)\]', src)
     if m:
         if f'"{attn}"' not in m.group(1) and f"'{attn}'" not in m.group(1):
@@ -572,12 +631,17 @@ def check_local_bench_step(attn, profile):
             "before `modal run`.")
 
 
-def write_local_results(res, out_root=LOCAL_RESULTS):
+def _new_out_dir(out_root):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir, i = Path(out_root) / stamp, 1
     while out_dir.exists():   # never overwrite an earlier run's results
         out_dir, i = Path(out_root) / f"{stamp}-{i}", i + 1
     out_dir.mkdir(parents=True)
+    return out_dir
+
+
+def write_local_results(res, out_root=LOCAL_RESULTS):
+    out_dir = _new_out_dir(out_root)
     paths = []
     p = out_dir / "report.md"
     p.write_text(res["report"] + "\n")
@@ -590,6 +654,381 @@ def write_local_results(res, out_root=LOCAL_RESULTS):
         p.write_bytes(data)
         paths.append(p)
     return out_dir, paths
+
+
+# ------------------------------------------------------- copies probe helpers
+def parse_variants(s):
+    out = [v for v in str(s).replace(" ", "").split(",") if v]
+    bad = [v for v in out if v not in COPIES_VARIANTS]
+    if not out or bad:
+        raise SystemExit(f"--variants must be a comma-separated subset of "
+                         f"{list(COPIES_VARIANTS)}, got {s!r}")
+    if len(set(out)) != len(out):
+        raise SystemExit(f"--variants has duplicates: {s!r}")
+    return out
+
+
+def merge_xla_flags(*parts):
+    """Concatenate XLA_FLAGS fragments (never overwrite)."""
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
+def copies_cache_dir(probe_id, name):
+    """Compile cache dir of one variant of one copies_probe invocation:
+    unique per probe so a second probe in a warm container compiles cold
+    (and dumps fresh HLO) instead of reusing the first probe's executables."""
+    return f"/tmp/jax_cache_copies_{probe_id}_{name}"
+
+
+def new_probe_id():
+    import uuid
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def copies_variant_env(base_env, attn, name, user_flags="", probe_id=None):
+    """bench_env + a per-variant, per-probe cold compile cache + XLA_FLAGS =
+    existing flags + the variant's flags + --xla-flags + the HLO dump
+    flags. probe_id: chosen once per copies_probe call (new_probe_id())."""
+    env = bench_env(base_env, attn)
+    env["JAX_COMPILATION_CACHE_DIR"] = copies_cache_dir(
+        probe_id or new_probe_id(), name)
+    env["XLA_FLAGS"] = merge_xla_flags(
+        env.get("XLA_FLAGS", ""), COPIES_VARIANTS[name][1], user_flags,
+        f"--xla_dump_to=/tmp/hlo_{name} {HLO_DUMP_FLAGS}")
+    return env
+
+
+def find_hlo_file(root):
+    """Newest jit_fwdbwd *after_optimizations.txt under an XLA dump dir."""
+    root = Path(root)
+    if not root.exists():
+        return None
+    hs = [p for p in root.rglob("*after_optimizations.txt")
+          if p.is_file() and "jit_fwdbwd" in p.name]
+    return max(hs, key=lambda p: p.stat().st_mtime) if hs else None
+
+
+def _union_ms(intervals):
+    total, cur_s, cur_e = 0.0, None, None
+    for a, b in sorted(intervals):
+        if cur_e is None or a > cur_e:
+            if cur_e is not None:
+                total += cur_e - cur_s
+            cur_s, cur_e = a, b
+        else:
+            cur_e = max(cur_e, b)
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return total / 1e3
+
+
+def trace_copy_stats(path, copy_regex=COPY_KERNEL_RE,
+                     step_regex=r"^bench_step$",
+                     default_steps=PROFILE_STEPS,
+                     slice_regex=SLICE_FUSION_KERNEL_RE):
+    """Per-step copy kernel count/time and GPU busy time from a jax.profiler
+    perfetto trace (*.json.gz / *.json, or a profile dir -> newest trace).
+
+    Conventions as in krea2-ops/mi350x/tools/trace_breakdown.py: GPU
+    processes = process_name containing "gpu"/"device"; kernel tracks = their
+    threads named "Stream ..." (fallback "XLA Ops" if no stream track); step
+    span = [first start, last end] of the host `bench_step` annotations
+    (StepTraceAnnotation), extended to the end of a kernel straddling it; the
+    divisor = number of annotations (distinct step_num), else default_steps
+    with the whole kernel span as the step span. Two disjoint copy
+    categories over the complete ("X") kernel events overlapping the span,
+    by kernel name (case-insensitive): "memcpy" = matches copy_regex;
+    "slice_fusion" = does not match copy_regex but matches slice_regex
+    (slice / DUS fusions lowered to a real kernel); "copy_like" = their sum.
+    Raw durations are summed. gpu busy = union of kernel intervals clipped
+    to the span. Per-step numbers are per device. The copy_* keys are the
+    memcpy category (kept for older readers)."""
+    p = Path(path)
+    if p.is_dir():
+        p = find_profile_files(p)[0]
+        if p is None:
+            raise FileNotFoundError(f"no trace under {path}")
+    opener = gzip.open if p.name.endswith(".gz") else open
+    with opener(p, "rt") as f:
+        d = json.load(f)
+    ev = d.get("traceEvents", []) if isinstance(d, dict) else d
+    pname, tname = {}, {}
+    for e in ev:
+        if e.get("ph") == "M" and isinstance(e.get("args"), dict):
+            if e.get("name") == "process_name":
+                pname[e.get("pid")] = str(e["args"].get("name", ""))
+            elif e.get("name") == "thread_name":
+                tname[(e.get("pid"), e.get("tid"))] = str(
+                    e["args"].get("name", ""))
+    gpu_pids = {pid for pid, n in pname.items()
+                if re.search(r"gpu|device", n, re.I)}
+    tracks = {k for k, n in tname.items()
+              if k[0] in gpu_pids and re.search(r"stream", n, re.I)}
+    track_kind = "stream"
+    if not tracks:
+        tracks = {k for k, n in tname.items()
+                  if k[0] in gpu_pids and re.search(r"xla ops", n, re.I)}
+        track_kind = "xla ops (op-level fallback)"
+    kernels = []
+    for e in ev:
+        if e.get("ph") != "X" or (e.get("pid"), e.get("tid")) not in tracks:
+            continue
+        try:
+            ts, dur = float(e["ts"]), float(e.get("dur", 0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        args = e.get("args") if isinstance(e.get("args"), dict) else {}
+        kernels.append((ts, ts + dur, str(e.get("name", "")),
+                        str(args.get("hlo_op", "")), e.get("pid")))
+    srx = re.compile(step_regex)
+    steps = [e for e in ev if e.get("ph") == "X" and e.get("pid") not in
+             gpu_pids and srx.search(str(e.get("name", ""))) and "ts" in e]
+    if steps:
+        nums = [(e.get("args") or {}).get("step_num") for e in steps]
+        n_steps = (len(set(nums)) if all(n is not None for n in nums)
+                   else len(steps))
+        s0 = min(float(e["ts"]) for e in steps)
+        s1 = max(float(e["ts"]) + float(e.get("dur", 0)) for e in steps)
+        late = [k[1] for k in kernels if k[0] < s1 < k[1]]
+        if late:
+            s1 = max(s1, max(late))
+        step_source = f"{len(steps)} bench_step annotations"
+    else:
+        n_steps = default_steps
+        s0 = min((k[0] for k in kernels), default=0.0)
+        s1 = max((k[1] for k in kernels), default=0.0)
+        step_source = (f"no step annotations: whole kernel span / "
+                       f"{default_steps} steps")
+    n_dev = len({k[0] for k in tracks}) or 1
+    div = max(n_steps, 1) * n_dev
+    crx = re.compile(copy_regex, re.I)
+    srx_slice = re.compile(slice_regex, re.I)
+
+    def category(name):
+        if crx.search(name):
+            return "memcpy"
+        if srx_slice.search(name):
+            return "slice_fusion"
+        return None
+
+    inspan = [k for k in kernels if k[0] < s1 and k[1] > s0]
+    copies = [k for k in inspan if category(k[2]) == "memcpy"]
+    slices = [k for k in inspan if category(k[2]) == "slice_fusion"]
+    busy = 0.0
+    for pid in {k[4] for k in inspan}:
+        busy += _union_ms([(max(k[0], s0), min(k[1], s1))
+                           for k in inspan if k[4] == pid])
+
+    def breakdown(ks):
+        by_name = collections.defaultdict(lambda: [0, 0.0])
+        by_op = collections.defaultdict(lambda: [0, 0.0])
+        for k in ks:
+            by_name[k[2]][0] += 1
+            by_name[k[2]][1] += (k[1] - k[0]) / 1e3
+            if k[3]:
+                op = re.sub(r"\.\d+$", "", k[3])
+                by_op[op][0] += 1
+                by_op[op][1] += (k[1] - k[0]) / 1e3
+        return per_step(by_name), dict(list(per_step(by_op).items())[:12])
+
+    def per_step(dd):
+        return {n: {"count_per_step": round(c / div, 2),
+                    "ms_per_step": round(ms / div, 3)}
+                for n, (c, ms) in sorted(dd.items(), key=lambda kv: -kv[1][1])}
+
+    def ms_of(ks):
+        return sum(k[1] - k[0] for k in ks) / 1e3
+
+    copy_by_name, copy_by_op = breakdown(copies)
+    slice_by_name, slice_by_op = breakdown(slices)
+    return {
+        "trace": str(p), "track_kind": track_kind, "n_tracks": len(tracks),
+        "n_devices": n_dev, "steps": n_steps, "step_source": step_source,
+        "step_span_ms_per_step": round((s1 - s0) / 1e3 / max(n_steps, 1), 3),
+        "kernels_per_step": round(len(inspan) / div, 2),
+        "gpu_busy_ms_per_step": round(busy / div, 3),
+        # memcpy kernels (copy_* = the same numbers, older key names)
+        "memcpy_regex": copy_regex,
+        "memcpy_kernels_per_step": round(len(copies) / div, 2),
+        "memcpy_ms_per_step": round(ms_of(copies) / div, 3),
+        "copy_regex": copy_regex,
+        "copy_kernels_per_step": round(len(copies) / div, 2),
+        "copy_ms_per_step": round(ms_of(copies) / div, 3),
+        "copy_kernels_in_trace": sum(1 for k in kernels
+                                     if category(k[2]) == "memcpy"),
+        "copy_by_name": copy_by_name,
+        "copy_by_hlo_op": copy_by_op,
+        # slice / DUS fusion kernels (not memcpy-named)
+        "slice_fusion_regex": slice_regex,
+        "slice_fusion_kernels_per_step": round(len(slices) / div, 2),
+        "slice_fusion_ms_per_step": round(ms_of(slices) / div, 3),
+        "slice_fusion_kernels_in_trace": sum(
+            1 for k in kernels if category(k[2]) == "slice_fusion"),
+        "slice_fusion_by_name": slice_by_name,
+        "slice_fusion_by_hlo_op": slice_by_op,
+        # memcpy + slice/DUS fusion
+        "copy_like_kernels_per_step": round((len(copies) + len(slices))
+                                            / div, 2),
+        "copy_like_ms_per_step": round((ms_of(copies) + ms_of(slices))
+                                       / div, 3),
+    }
+
+
+def build_copies_report(rows, opts):
+    """rows: one dict per variant (run fields + 'trace' stats dict + 'hlo'
+    totals dict + 'hlo_summary' line); opts: attn/batch/steps/xla_flags/
+    env_extra/notes. Returns markdown."""
+    out = [f"# Copy-storm probe on B300 (bench_step fwdbwd, attn="
+           f"{opts.get('attn')}, batch {opts.get('batch')})", ""]
+    for k, v in (opts.get("env_extra") or {}).items():
+        out.append(f"- {k}: {v}")
+    out.append(f"- bench_step --random-weights --mode fwdbwd --img-tokens 4096 "
+               f"--text-rows 512 --remat-policy dots --act-sharding on --qchunk "
+               f"512 --steps {opts.get('steps')} --warmup 1 --profile-dir "
+               f"(first {PROFILE_STEPS} timed steps profiled, the rest timed); "
+               "each variant compiles cold (own cache dir, unique per probe, "
+               "removed first) with an HLO dump")
+    if opts.get("xla_flags"):
+        out.append(f"- --xla-flags on every variant: `{opts['xla_flags']}`")
+    for n in opts.get("notes", []):
+        out.append(f"- {n}")
+    out += ["", "| variant | step ms | vs base | samples/s | compile s | "
+            "memcpy kernels/step | memcpy ms/step | slice/DUS fusion "
+            "kernels/step | slice/DUS fusion ms/step | copy-like total "
+            "kernels/step | copy-like total ms/step | GPU busy ms/step "
+            "(stream union) | HLO copy-like dyn | HLO dyn (krea2_jax) | "
+            "HLO MiB/exec | status |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    base_ms = next((r.get("ms") for r in rows
+                    if r.get("variant") == "base" and r.get("ms")), None)
+    for r in rows:
+        t = r.get("trace") or {}
+        h = r.get("hlo") or {}
+        vs = ("n/a" if not base_ms or not r.get("ms") else
+              f"{100 * (r['ms'] / base_ms - 1):+.1f}%")
+        mib = h.get("bytes_per_exec")
+        out.append(
+            f"| {r.get('variant')} | {_fmt(r.get('ms'), 1)} | {vs} | "
+            f"{_fmt(r.get('sps'), 3)} | {_fmt(r.get('compile_s'))} | "
+            f"{_fmt(t.get('memcpy_kernels_per_step'), 1)} | "
+            f"{_fmt(t.get('memcpy_ms_per_step'), 2)} | "
+            f"{_fmt(t.get('slice_fusion_kernels_per_step'), 1)} | "
+            f"{_fmt(t.get('slice_fusion_ms_per_step'), 2)} | "
+            f"{_fmt(t.get('copy_like_kernels_per_step'), 1)} | "
+            f"{_fmt(t.get('copy_like_ms_per_step'), 2)} | "
+            f"{_fmt(t.get('gpu_busy_ms_per_step'), 1)} | "
+            f"{h.get('dynamic', 'n/a')} | {h.get('dynamic_krea2', 'n/a')} | "
+            f"{'n/a' if mib is None else f'{mib / 2**20:.1f}'} | "
+            f"{r.get('error', 'ok')} |")
+    out += ["", "Variants: " + "; ".join(
+        f"{n} = bench_step {' '.join(a) or '(scan)'}"
+        + (f" + XLA_FLAGS {f}" if f else "")
+        for n, (a, f) in COPIES_VARIANTS.items()
+        if n in {r.get('variant') for r in rows})]
+    out += ["", "## hlo_copy_report summaries", ""]
+    for r in rows:
+        out.append(f"- {r.get('variant')}: "
+                   f"{r.get('hlo_summary') or 'n/a (no HLO)'}")
+    for title, key in (("Memcpy kernels", "copy_by_name"),
+                       ("Slice/DUS fusion kernels", "slice_fusion_by_name")):
+        out += ["", f"## {title} by name (per step)", ""]
+        for r in rows:
+            t = r.get("trace") or {}
+            names = list((t.get(key) or {}).items())[:6]
+            out.append(f"- {r.get('variant')}: " + (", ".join(
+                f"{n} {v['count_per_step']} x / {v['ms_per_step']} ms"
+                for n, v in names) or ("none" if t else "n/a")))
+    for r in rows:
+        if r.get("notes"):
+            out.append(f"- {r.get('variant')} notes: " + "; ".join(r["notes"]))
+    out += ["", "Notes:",
+            "- memcpy kernels/step, ms/step: perfetto trace kernels on GPU "
+            f"stream tracks whose name matches /{COPY_KERNEL_RE}/i inside "
+            "the bench_step step span, / number of step annotations "
+            "(scripts/modal_bench_b300.py trace_copy_stats).",
+            "- slice/DUS fusion kernels/step, ms/step: the other kernels "
+            f"whose name matches /{SLICE_FUSION_KERNEL_RE}/i (slice / "
+            "dynamic-update-slice fusions lowered to a real kernel instead "
+            "of a memcpy; never also counted as memcpy). copy-like total = "
+            "memcpy + slice/DUS fusion: a variant that only changed the "
+            "copies' kernel type does not lower it.",
+            "- HLO columns: scripts/hlo_copy_report.py on the optimized "
+            "jit_fwdbwd HLO: copy-like instructions (copy, slice, DS, DUS and "
+            "fusions rooted in them) x while trip counts per step; "
+            "'krea2_jax' = source_file under krea2_jax/; MiB/exec counts DUS "
+            "by update size.",
+            "- step ms is the median of the non-profiled timed steps only "
+            "(few steps: compare with the ladder for precise numbers); "
+            "compile s = bench_step 'first step (compile + run)', includes "
+            "writing the HLO dump."]
+    return "\n".join(out)
+
+
+def analyze_copies_variant(vdir, python=sys.executable):
+    """Run hlo_copy_report.py + trace_copy_stats on a local variant dir.
+    Returns (trace stats or None, hlo totals or None, summary line, notes)."""
+    vdir = Path(vdir)
+    notes, trace, hlo, summary = [], None, None, None
+    tr = vdir / "perfetto_trace.json.gz"
+    if not tr.exists():
+        cands = sorted(vdir.glob("*.trace.json.gz"))
+        tr = cands[0] if cands else None
+    if tr is not None:
+        try:
+            trace = trace_copy_stats(tr)
+            (vdir / "trace_copy_stats.json").write_text(
+                json.dumps(trace, indent=1))
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"trace parse failed: {type(e).__name__}: {e}")
+    hl = sorted(vdir.glob("*after_optimizations.txt.gz"))
+    if hl:
+        js = vdir / "hlo_copy_report.json"
+        try:
+            pr = subprocess.run(
+                [python, str(LOCAL_REPO / "scripts" / "hlo_copy_report.py"),
+                 str(hl[0]), "--json", str(js), "--top", "40"],
+                capture_output=True, text=True, timeout=1800)
+            (vdir / "hlo_copy_report.md").write_text(pr.stdout)
+            if pr.returncode != 0:
+                notes.append(f"hlo_copy_report rc={pr.returncode}: "
+                             f"{pr.stderr.strip()[-300:]}")
+            lines = [ln for ln in pr.stdout.splitlines()
+                     if ln.startswith("copies:")]
+            summary = lines[-1] if lines else None
+            if js.exists():
+                data = json.loads(js.read_text())
+                hlo = dict(data["totals"])
+                hlo["dynamic_krea2"] = sum(
+                    it["multiplier"] for it in data["instructions"]
+                    if "krea2_jax" in it.get("source_file", ""))
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"hlo_copy_report failed: {type(e).__name__}: {e}")
+    return trace, hlo, summary, notes
+
+
+def write_copies_results(res, out_root=LOCAL_RESULTS):
+    """Save the copies probe's files under <ts>/copies/<variant>/, analyze
+    them, write <ts>/copies/report.md + variants.jsonl; returns (dir, md)."""
+    cdir = _new_out_dir(out_root) / "copies"
+    cdir.mkdir()
+    rows = []
+    for r in res.get("variants", []):
+        name = r["variant"]
+        vdir = cdir / name
+        vdir.mkdir()
+        for fname, data in (res.get("files", {}).get(name) or {}).items():
+            (vdir / Path(fname).name).write_bytes(data)
+        if r.get("tail"):
+            (vdir / "stdout_tail.txt").write_text("\n".join(r["tail"]) + "\n")
+        trace, hlo, summary, notes = analyze_copies_variant(vdir)
+        rows.append({**r, "trace": trace, "hlo": hlo, "hlo_summary": summary,
+                     "notes": list(r.get("notes", [])) + notes})
+    md = build_copies_report(rows, res.get("opts", {}))
+    (cdir / "report.md").write_text(md + "\n")
+    (cdir / "variants.jsonl").write_text("".join(
+        json.dumps({k: v for k, v in r.items() if k != "trace"}) + "\n"
+        for r in rows))
+    return cdir, md
 
 
 # ------------------------------------------------------------------ Modal app
@@ -610,31 +1049,7 @@ if modal is not None:
         deadline = time.time() + FUNCTION_TIMEOUT_S - 90
         env = {**os.environ, **GPU_ENV}
         bl = parse_batches(batches)
-        env_extra = {}
-        try:
-            smi = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
-                 "--format=csv,noheader"], capture_output=True, text=True,
-                timeout=60)
-            env_extra["nvidia-smi"] = smi.stdout.strip() or smi.stderr.strip()
-            hdr = subprocess.run(["nvidia-smi"], capture_output=True, text=True,
-                                 timeout=60).stdout
-            m = re.search(r"CUDA Version:\s*([\d.]+)", hdr)
-            if m:
-                env_extra["driver CUDA version"] = m.group(1)
-        except Exception as e:  # noqa: BLE001
-            env_extra["nvidia-smi"] = f"n/a: {e}"
-        try:
-            from importlib import metadata
-            env_extra["pip wheels"] = ", ".join(
-                f"{p} {metadata.version(p)}" for p in
-                ("jax", "jaxlib", "jax-cuda13-plugin", "nvidia-cuda-runtime",
-                 "nvidia-cuda-nvcc", "nvidia-cudnn-cu13", "nvidia-cublas")
-                if _has_dist(metadata, p))
-        except Exception as e:  # noqa: BLE001
-            env_extra["pip wheels"] = f"n/a: {e}"
-        for k, v in env_extra.items():
-            print(f"{k}: {v}", flush=True)
+        env_extra = collect_env_extra()
 
         micro_res = None
         if micro or quick:
@@ -696,13 +1111,66 @@ if modal is not None:
         return {"report": report, "runs": runs, "micro": micro_res,
                 "files": files}
 
+    @app.function(gpu="B300", timeout=COPIES_MAX_TIMEOUT_MIN * 60, cpu=8.0,
+                  memory=32 * 1024)
+    def copies_probe(attn: str = "cudnn", batch: int = DEFAULT_COPIES_BATCH,
+                     variants: str = DEFAULT_COPIES_VARIANTS,
+                     xla_flags: str = "", steps: int = DEFAULT_COPIES_STEPS,
+                     timeout_min: int = FUNCTION_TIMEOUT_S // 60) -> dict:
+        # internal deadline from --timeout-min (<= the hard Modal timeout)
+        deadline = time.time() + min(timeout_min,
+                                     COPIES_MAX_TIMEOUT_MIN) * 60 - 90
+        env = {**os.environ, **GPU_ENV}
+        env_extra = collect_env_extra()
+        runs, files = [], {}
+        probe_id = new_probe_id()  # fresh compile caches for this probe
+        print(f"copies probe id {probe_id}", flush=True)
+        for name in parse_variants(variants):
+            r, f = run_copies_variant(sys.executable, REMOTE_REPO, env, attn,
+                                      batch, name, steps, xla_flags, deadline,
+                                      probe_id)
+            runs.append(r)
+            files[name] = f
+        opts = {"attn": attn, "batch": batch, "steps": steps,
+                "xla_flags": xla_flags, "env_extra": env_extra, "notes": [],
+                "probe_id": probe_id}
+        return {"variants": runs, "files": files, "opts": opts}
+
     @app.local_entrypoint()
     def main(attn: Literal["ref", "cudnn"] = "cudnn",
              batches: str = DEFAULT_BATCHES, micro: bool = False,
              quick: bool = False, profile: bool = True,
-             profile_batch: int = DEFAULT_PROFILE_BATCH):
+             profile_batch: int = DEFAULT_PROFILE_BATCH,
+             copies: bool = False, batch: int = DEFAULT_COPIES_BATCH,
+             variants: str = DEFAULT_COPIES_VARIANTS, xla_flags: str = "",
+             steps: int = DEFAULT_COPIES_STEPS,
+             timeout_min: int = FUNCTION_TIMEOUT_S // 60):
         if attn not in ATTN_CHOICES:
             raise SystemExit(f"--attn must be one of {ATTN_CHOICES}")
+        if copies:
+            vl = parse_variants(variants)
+            if batch <= 0:
+                raise SystemExit(f"--batch must be positive, got {batch}")
+            if steps <= PROFILE_STEPS:
+                raise SystemExit(f"--steps must be > {PROFILE_STEPS} (the "
+                                 "profiled steps are not timed)")
+            if not 1 <= timeout_min <= COPIES_MAX_TIMEOUT_MIN:
+                raise SystemExit(f"--timeout-min must be in 1.."
+                                 f"{COPIES_MAX_TIMEOUT_MIN}")
+            need = ({"--layer-loop"} if any(COPIES_VARIANTS[v][0] for v in vl)
+                    else set())
+            check_local_bench_step(attn, True, need=tuple(need))
+            res = copies_probe.remote(attn=attn, batch=batch,
+                                      variants=",".join(vl),
+                                      xla_flags=xla_flags, steps=steps,
+                                      timeout_min=timeout_min)
+            cdir, md = write_copies_results(res)
+            print("\n" + "=" * 72 + "\n" + md)
+            print(f"\nwrote {cdir}:")
+            for p in sorted(cdir.rglob("*")):
+                if p.is_file():
+                    print(f"  {p}  ({p.stat().st_size / 2**20:.2f} MiB)")
+            return
         parse_batches(batches)
         if not quick:
             check_local_bench_step(attn, profile)
@@ -716,6 +1184,87 @@ if modal is not None:
             print(f"  {p}  ({p.stat().st_size / 2**20:.2f} MiB)")
 
 
+def collect_env_extra():
+    """nvidia-smi + wheel versions (inside the container); printed."""
+    env_extra = {}
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+             "--format=csv,noheader"], capture_output=True, text=True,
+            timeout=60)
+        env_extra["nvidia-smi"] = smi.stdout.strip() or smi.stderr.strip()
+        hdr = subprocess.run(["nvidia-smi"], capture_output=True, text=True,
+                             timeout=60).stdout
+        m = re.search(r"CUDA Version:\s*([\d.]+)", hdr)
+        if m:
+            env_extra["driver CUDA version"] = m.group(1)
+    except Exception as e:  # noqa: BLE001
+        env_extra["nvidia-smi"] = f"n/a: {e}"
+    try:
+        from importlib import metadata
+        env_extra["pip wheels"] = ", ".join(
+            f"{p} {metadata.version(p)}" for p in
+            ("jax", "jaxlib", "jax-cuda13-plugin", "nvidia-cuda-runtime",
+             "nvidia-cuda-nvcc", "nvidia-cudnn-cu13", "nvidia-cublas")
+            if _has_dist(metadata, p))
+    except Exception as e:  # noqa: BLE001
+        env_extra["pip wheels"] = f"n/a: {e}"
+    for k, v in env_extra.items():
+        print(f"{k}: {v}", flush=True)
+    return env_extra
+
+
+def run_copies_variant(python, repo, base_env, attn, batch, name, steps,
+                       user_flags, deadline, probe_id):
+    """One copies-probe variant in the container -> (result dict, files).
+    probe_id (one per copies_probe call) makes the compile cache dir unique,
+    and the dir is removed first: every variant compiles cold."""
+    import shutil
+    extra_args, vflags = COPIES_VARIANTS[name]
+    pdir, hdir = f"{REMOTE_COPIES_PROF}/{name}", f"/tmp/hlo_{name}"
+    cdir = copies_cache_dir(probe_id, name)
+    for d in (pdir, hdir, cdir):
+        shutil.rmtree(d, ignore_errors=True)
+    env = copies_variant_env(base_env, attn, name, user_flags, probe_id)
+    assert env["JAX_COMPILATION_CACHE_DIR"] == cdir
+    print(f"\n=== variant {name}: XLA_FLAGS={env['XLA_FLAGS']!r}", flush=True)
+    r = run_one(python, repo, env, attn, batch, deadline, f"copies:{name}",
+                extra=("--profile-dir", pdir, *extra_args), steps=steps)
+    r.update({"variant": name, "args": list(extra_args),
+              "xla_flags": env["XLA_FLAGS"], "compile_cache_dir": cdir,
+              "probe_id": probe_id, "notes": []})
+    files = {}
+    trace, xplane = find_profile_files(pdir)
+    if trace is None and not r.get("error", "").startswith("skipped"):
+        r["notes"].append(f"no perfetto trace under {pdir}")
+    for p in (trace, xplane):
+        if p is None:
+            continue
+        sz = p.stat().st_size
+        if sz > MAX_RETURN_BYTES:
+            r["notes"].append(f"{p.name} is {sz / 2**20:.0f} MiB > "
+                              f"{MAX_RETURN_BYTES // 2**20} MiB: not returned")
+            continue
+        files[p.name] = p.read_bytes()
+    hlo = find_hlo_file(hdir)
+    if hlo is None:
+        if not r.get("error", "").startswith("skipped"):
+            r["notes"].append(f"no jit_fwdbwd *after_optimizations.txt under "
+                              f"{hdir}")
+    else:
+        raw = hlo.read_bytes()
+        gz = gzip.compress(raw, compresslevel=6)
+        r["hlo_file"] = hlo.name
+        r["hlo_mib"] = round(len(raw) / 2**20, 2)
+        if len(gz) > MAX_RETURN_BYTES:
+            r["notes"].append(f"{hlo.name} is {len(gz) / 2**20:.0f} MiB "
+                              f"gzipped > {MAX_RETURN_BYTES // 2**20} MiB: "
+                              "not returned")
+        else:
+            files[hlo.name + ".gz"] = gz
+    return r, files
+
+
 def _has_dist(metadata, name):
     try:
         metadata.version(name)
@@ -726,3 +1275,22 @@ def _has_dist(metadata, name):
 
 if __name__ == "__main__" and "--micro-child" in sys.argv:
     sys.exit(micro_main(sys.argv[1:]))
+elif __name__ == "__main__" and "--parse-trace" in sys.argv:
+    _ap = argparse.ArgumentParser(
+        description="per-step copy kernel stats of a perfetto trace")
+    _ap.add_argument("--parse-trace", required=True, metavar="TRACE_OR_DIR")
+    _ap.add_argument("--copy-regex", default=COPY_KERNEL_RE,
+                     help="memcpy kernel-name regex")
+    _ap.add_argument("--slice-regex", default=SLICE_FUSION_KERNEL_RE,
+                     help="slice/DUS fusion kernel-name regex (kernels not "
+                          "matched by --copy-regex)")
+    _a = _ap.parse_args()
+    _st = trace_copy_stats(_a.parse_trace, _a.copy_regex,
+                           slice_regex=_a.slice_regex)
+    print(json.dumps(_st, indent=1))
+    print(f"\nper step: memcpy kernels {_st['memcpy_kernels_per_step']} "
+          f"({_st['memcpy_ms_per_step']} ms) | slice/DUS fusion kernels "
+          f"{_st['slice_fusion_kernels_per_step']} "
+          f"({_st['slice_fusion_ms_per_step']} ms) | copy-like total "
+          f"{_st['copy_like_kernels_per_step']} "
+          f"({_st['copy_like_ms_per_step']} ms)")
