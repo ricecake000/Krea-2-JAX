@@ -32,6 +32,7 @@ must exceed PROFILE_STEPS.
 """
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -286,11 +287,17 @@ def main(argv=None):
         if args.profile_dir is not None and i == prof_first:
             prof_t0 = time.time()
             start_profile(args.profile_dir)
+        # profiled steps carry a StepTraceAnnotation so the trace analyzer can
+        # bound "the two steps" exactly (profiler start/stop overhead excluded)
+        ann = (jax.profiler.StepTraceAnnotation("bench_step", step_num=i)
+               if args.profile_dir is not None and prof_first <= i <= prof_last
+               else contextlib.nullcontext())
         t0 = time.perf_counter()
-        state, out = run(state, batch, key)
-        jax.block_until_ready(out)
-        if args.mode == "train":
-            jax.block_until_ready(state)
+        with ann:
+            state, out = run(state, batch, key)
+            jax.block_until_ready(out)
+            if args.mode == "train":
+                jax.block_until_ready(state)
         dt = time.perf_counter() - t0
         if args.profile_dir is not None and prof_first <= i <= prof_last:
             if i == prof_last:
