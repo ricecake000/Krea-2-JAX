@@ -36,7 +36,6 @@ Usage (one process per GPU, then one manifest pass):
 """
 
 import argparse
-import hashlib
 import io
 import json
 import os
@@ -54,8 +53,10 @@ from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_dataset import VaeEncoder, load_image  # noqa: E402
+from krea2_jax.hashing import file_sha256, is_sha256_hex  # noqa: E402
 
 FORMAT = "krea2-latents-v1"
 LAT_CHANNELS = 16
@@ -379,18 +380,6 @@ def verify_latents(cols, scan):
     return len(seen), vae
 
 
-def file_sha256(path, chunk=1 << 20):
-    """Hex sha256 of a file's bytes, streamed in `chunk`-byte reads."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
-
-
 def shard_digests(lat_dir, names, log=print):
     """{name: sha256 of latents/<name>} (reads every shard once)."""
     out, t0, nbytes = {}, time.time(), 0
@@ -406,8 +395,18 @@ def shard_digests(lat_dir, names, log=print):
 
 
 def check_digests(old, new):
-    """Raise SystemExit if a shard in both `old` and `new` has a different
-    digest. Returns (n_compared, added names, removed names)."""
+    """Raise SystemExit if any digest in `old` or `new` is not a 64-char
+    lowercase hex sha256 string (e.g. null, upper case, truncated), or if a
+    shard in both has a different digest. Returns (n_compared, added names,
+    removed names)."""
+    bad = sorted(f"{which}:{k}={v!r}" for which, d in (("existing", old),
+                                                       ("new", new))
+                 for k, v in d.items() if not is_sha256_hex(v))
+    if bad:
+        raise SystemExit(
+            f"digest verification FAILED: {len(bad)} malformed digests "
+            f"(not 64-char lowercase hex sha256), e.g. {bad[:5]}. Pass "
+            "--no-verify-digests to replace them with freshly computed ones.")
     changed = sorted(k for k in old.keys() & new.keys() if old[k] != new[k])
     if changed:
         raise SystemExit(

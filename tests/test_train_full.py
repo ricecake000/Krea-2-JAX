@@ -40,6 +40,9 @@ carry padded image rows):
      keeps inf/NaN in padded rows out of the loss and its gradient,
   n. per-sample mu (from h*w) and a --timestep-mu override both train
      (unit + a short CLI run), and the run config records the new keys.
+  o. a latent shard corrupted under an unchanged manifest is refused at
+     startup (--verify-latents, default) before the base checkpoint load,
+     with no ckpt dir created; --no-verify-latents proceeds.
 
 Requires CPU PyTorch + einops (tiny reference checkpoint, parity check).
 """
@@ -385,6 +388,10 @@ def main():
                      r"64x64 x10\); img tokens 12\.\.16 padded to 16; "
                      r"text_rows 32 ", log1), log1
     assert "text encoder loaded" in log1 and "position_mode contiguous" in log1
+    assert re.search(r"latents verified: 2 shards, [\d.]+ GiB in [\d.]+ s",
+                     log1), log1
+    assert re.search(r"text encoder identity [0-9a-f]{12} \(hashed [\d.]+ "
+                     r"GiB in [\d.]+ s\)", log1), log1
     from krea2_jax import fullft_ckpt as _fc
     rc = _fc.read_meta_at(str(out1 / "ckpt"), 12)["config"]
     for k, val in (("text_rows", TEXT_ROWS), ("img_tokens", IMG_TOKENS),
@@ -871,6 +878,33 @@ def main():
     print(f"n. --timestep-mu 0.8 CLI run: losses "
           f"{', '.join(f'{stepsM[s][0]:.4f}' for s in (1, 2))}, recorded in "
           "the run config: ok")
+
+    # --- o. a latent shard corrupted under an unchanged manifest ---
+    bad_cache = shutil.copytree(cache, tmp / "data_corrupt")
+    shard = bad_cache / "latents" / "train-0001.safetensors"
+    raw = bytearray(shard.read_bytes())
+    raw[-1] ^= 0x01  # one latent bit (the tensor bytes end the file)
+    shard.write_bytes(bytes(raw))
+    outV = tmp / "run_corrupt"
+    proc = subprocess.run(
+        train_cmd(base, bad_cache, outV, ("--steps", "2")),
+        env={**os.environ, "PYTHONUNBUFFERED": "1"}, capture_output=True,
+        text=True, timeout=900)
+    textV = proc.stdout + proc.stderr
+    assert proc.returncode != 0, textV
+    for needle in ("latent digest verification FAILED",
+                   "1 of 2 shards differ", "train-0001.safetensors: expected"):
+        assert needle in textV, (needle, textV)
+    assert "train-0000.safetensors: expected" not in textV, textV
+    assert "loading base checkpoint" not in textV, textV
+    assert not (outV / "ckpt").exists(), sorted(outV.iterdir())
+    outNV = tmp / "run_corrupt_noverify"
+    stepsNV, logNV = run_train(base, bad_cache, outNV,
+                               ("--steps", "2", "--no-verify-latents"))
+    assert sorted(stepsNV) == [1, 2], sorted(stepsNV)
+    assert "latents NOT verified (--no-verify-latents)" in logNV, logNV
+    print("o. corrupted latent shard refused at startup before the base load "
+          "(no ckpt dir); --no-verify-latents proceeds: ok")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("ALL TRAIN-FULL TESTS PASSED")

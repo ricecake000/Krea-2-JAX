@@ -55,6 +55,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from krea2_jax.hashing import file_sha256
 from krea2_jax.text_template import (
     QWEN3_PREFIX_LEN,
     QWEN3_SUFFIX_LEN,
@@ -315,35 +316,31 @@ def _loader_keys(prefix, cfg):
     return keys
 
 
-def _safetensors_header(path):
-    """The JSON header of a safetensors file (no tensor bytes read)."""
-    with open(path, "rb") as f:
-        n = int.from_bytes(f.read(8), "little")
-        return json.loads(f.read(n))
-
-
-def text_encoder_identity(model_dir, cfg):
+def text_encoder_identity(model_dir, cfg, stats=None):
     """Hex sha256 identifying the text encoder a run conditions on.
 
     Covers (a) the bytes of tokenizer.json, (b) the resolved
     Qwen3TextConfig `cfg` (every field, incl. select_layers, position_mode,
-    normed_last_hidden, prefix/suffix_len) as sorted-key JSON, and (c) for
-    every safetensors file load_qwen3_text_params would read for `cfg` (from
-    the index, or the single/globbed files), its byte size and its header
-    entries (dtype, shape, data_offsets) restricted to the keys the loader
-    uses (the language-model keys it loads; vision-tower and lm_head entries
-    are ignored). Only headers are read, never tensor bytes, so this is
-    cheap; it detects a different checkpoint/revision/tokenizer, not a
-    same-layout edit of tensor values. Note the file size covers the whole
-    file, so a vision-tower change in a file that also holds used text
-    weights still changes the identity (conservative). No filesystem paths
-    or file names enter the hash: the same encoder at another path has the
-    same identity."""
+    normed_last_hidden, prefix/suffix_len) as sorted-key JSON, and (c) the
+    full contents of every safetensors file load_qwen3_text_params would
+    read for `cfg` (from the index, or the single/globbed files): each file
+    is streamed through sha256 in 1 MiB reads and its digest enters the
+    hash, in the order of the smallest loader key the file holds. So any
+    change to a weight VALUE (same shape/dtype) changes the identity, as does
+    a different checkpoint/revision/tokenizer/config. Whole files are hashed,
+    so a vision-tower or lm_head edit in a file that also holds used text
+    weights changes it too (conservative); files holding no used key are
+    not read. Cost: one sequential read of those files (~8 GB for
+    Qwen3-VL-4B). No filesystem paths or file names enter the hash: the
+    same encoder at another path or under other file names has the same
+    identity.
+
+    stats: optional dict, filled with {"files": n, "bytes": total bytes
+    hashed} for the caller to report (nothing is printed here)."""
     model_dir = Path(model_dir)
     h = hashlib.sha256()
     h.update(b"tokenizer.json\0")
-    h.update(hashlib.sha256(
-        (model_dir / "tokenizer.json").read_bytes()).digest())
+    h.update(bytes.fromhex(file_sha256(model_dir / "tokenizer.json")))
     h.update(b"config\0")
     h.update(json.dumps(dataclasses.asdict(cfg), sort_keys=True,
                         separators=(",", ":")).encode("utf-8"))
@@ -352,25 +349,18 @@ def text_encoder_identity(model_dir, cfg):
     missing = [k for k in used if k not in wm]
     if missing:
         raise KeyError(f"missing weights {missing[:5]} in {model_dir}")
-    by_file = {}
+    first_key = {}
     for k in used:
-        by_file.setdefault(wm[k], []).append(k)
-    files = []
-    for fp, keys in by_file.items():
-        header = _safetensors_header(fp)
-        tensors = {}
-        for k in sorted(keys):
-            e = header.get(k)
-            if e is None:
-                raise KeyError(f"{k!r} listed for {fp.name} but not in its "
-                               "header")
-            tensors[k] = {"dtype": e["dtype"], "shape": list(e["shape"]),
-                          "data_offsets": list(e["data_offsets"])}
-        files.append({"size": fp.stat().st_size, "tensors": tensors})
-    files.sort(key=lambda d: min(d["tensors"]))
+        fp = wm[k]
+        first_key[fp] = min(first_key.get(fp, k), k)
+    nbytes = 0
     h.update(b"weights\0")
-    h.update(json.dumps(files, sort_keys=True,
-                        separators=(",", ":")).encode("utf-8"))
+    for fp in sorted(first_key, key=first_key.get):
+        fh = hashlib.sha256()
+        nbytes += file_sha256(fp, h=fh)
+        h.update(fh.digest())
+    if stats is not None:
+        stats.update(files=len(first_key), bytes=nbytes)
     return h.hexdigest()
 
 

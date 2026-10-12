@@ -325,8 +325,10 @@ VAE-encodes it per bucket, writes the shard atomically and deletes the tar
 a manifest pass that copies the parquet, checks every id has exactly one
 latent of its bucket's shape and records the sha256 of every shard file in
 `manifest.json` (`"digests"`; this reads all ~49 GB once). The trainer
-requires the digests (an older manifest without them is refused with a
-pointer to `--write-manifest`) and folds them into the dataset fingerprint.
+requires the digests (an older manifest without them, or a null/malformed
+digest, is refused with a pointer to `--write-manifest`), re-hashes every
+shard against them at startup (`--verify-latents`, default on) and folds
+them into the dataset fingerprint.
 Rerunning the manifest pass over a manifest that already has digests
 re-hashes and fails if any shard changed; `--no-verify-digests` accepts the
 new content:
@@ -494,6 +496,7 @@ Useful knobs:
 | `--max-hours` | – | stop cleanly (checkpoint + export) after a wall-clock budget; counts only the train loop (see below) |
 | `--resume` | off | continue the newest checkpoint in `--output-dir/ckpt`; without it the script refuses to reuse a directory that already holds checkpoints |
 | `--resume-step N` | – | resume from an older step N; newer step dirs are renamed `<step>.superseded` |
+| `--verify-latents` | on | re-hash every latent shard at startup (reads the whole ~49 GB cache once) and refuse the run if any shard's bytes differ from its manifest digest; `--no-verify-latents` trusts the manifest |
 | `--prefetch` / `--loader-workers` | 4 / 4 | streaming loader queue depth / reader threads |
 
 The step log prints `loss`, a smoothed `ema_loss`, the pre-clip gradient
@@ -527,7 +530,13 @@ latent cache once and transfer it rather than rebuilding it per lease: the
 VAE posterior sample is unseeded, so a rebuild changes the latents, its
 manifest pass records different shard digests, and `--resume` refuses it
 (dataset fingerprint mismatch) unless the digests match the original
-cache's. A rerun that only needs the final export
+cache's. The cache is treated as immutable for a run: with the default
+`--verify-latents` the trainer re-hashes every shard at startup (before the
+base checkpoint load) and refuses a cache whose bytes differ from its
+manifest, so a shard corrupted in transfer, or rebuilt under the old
+manifest, is caught instead of silently training on (or resuming with) data
+the fingerprint does not describe. `--no-verify-latents` skips the re-hash
+and trusts the manifest. A rerun that only needs the final export
 (checkpoint step >= `--steps`) reads neither the dataset nor the text
 encoder.
 
@@ -561,8 +570,9 @@ every caption and artist name, the VAE id, the tokenizer's template ids and
 the normalized caption probabilities; sample count; latent channels), the
 base checkpoint name, `--model-config`, `--text-model-config`, the text
 encoder's identity (`text_encoder_id`: sha256 of tokenizer.json, the
-resolved text config and the safetensors headers of the loaded language-model
-weights; path independent) and position mode, `--timestep-mu`,
+resolved text config and the full contents of every safetensors file the
+loader reads, so any weight value change counts; path and file-name
+independent; hashing ~8 GB takes a few seconds to a minute at startup) and position mode, `--timestep-mu`,
 `--logit-mean/--logit-std` or turning the EMA on/off is a hard error: those
 would silently change the data order, captions, RNG, objective or
 train-state shape. Changing `--steps`, `--lr`, `--warmup-steps`,

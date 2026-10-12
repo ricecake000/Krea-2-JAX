@@ -24,11 +24,14 @@ import concurrent.futures
 import hashlib
 import json
 import threading
+import time
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 from safetensors import safe_open
+
+from krea2_jax.hashing import file_sha256, is_sha256_hex
 
 BF16 = ml_dtypes.bfloat16
 
@@ -301,8 +304,19 @@ class BucketDataset:
     parquet id must have exactly one latent of the bucket's shape (and vice
     versa), else ValueError listing every problem with counts. The manifest
     must carry `digests` ({shard file: sha256}, written by
-    scripts/cache_latents.py --write-manifest) for every shard; they enter
-    `fingerprint()` (the shard bytes themselves are never hashed here).
+    scripts/cache_latents.py --write-manifest) for every shard, each a
+    64-char lowercase hex string (null or malformed -> ValueError); they
+    enter `fingerprint()`.
+
+    verify_digests: re-hash every shard file (streaming sha256) at
+    construction and raise ValueError listing every shard whose bytes differ
+    from its manifest digest (expected vs actual, counts). The cache is then
+    treated as immutable for the run: a cache rebuilt or corrupted (e.g. in
+    transfer) under an unchanged manifest is refused instead of silently
+    training on data the fingerprint does not describe. False skips the
+    re-hash (headers only, cheap) and trusts the manifest. After
+    construction `verified_shards`, `verified_bytes` and `verify_seconds`
+    report the work done (0, 0, 0.0 when skipped).
 
     template: a text_template.CaptionTemplate (tokenizes captions per batch).
     img_tokens: static image-token rows per sample (h_tok * w_tok <= it).
@@ -313,7 +327,8 @@ class BucketDataset:
     """
 
     def __init__(self, data_dir, template, img_tokens=4096, patch=2,
-                 caption_probs=(0.5, 0.3, 0.2), artist_prob=0.5):
+                 caption_probs=(0.5, 0.3, 0.2), artist_prob=0.5,
+                 verify_digests=True):
         import pyarrow.parquet as pq
 
         self.data_dir = Path(data_dir)
@@ -385,9 +400,12 @@ class BucketDataset:
                 f"{man_path} has no shard \"digests\" (older manifest): "
                 "rerun scripts/cache_latents.py --out <data-dir> "
                 "--write-manifest to record the sha256 of every shard")
-        self.digests = {name: str(digests[name]) for name in self.shards
+        self.digests = {name: digests[name] for name in self.shards
                         if name in digests}
         no_digest = [name for name in self.shards if name not in digests]
+        bad_digest = [f"{name}={self.digests[name]!r}" for name in self.shards
+                      if name in self.digests
+                      and not is_sha256_hex(self.digests[name])]
         index = {int(x): j for j, x in enumerate(self.ids.tolist())}
         shard_of = np.full((self.n,), -1, dtype=np.int32)
         lat_shape = np.zeros((self.n, 3), dtype=np.int64)
@@ -426,6 +444,11 @@ class BucketDataset:
         if no_digest:
             problems.append(f"{len(no_digest)} manifest shards have no digest "
                             f"({_examples(no_digest)}); rerun "
+                            "scripts/cache_latents.py --write-manifest")
+        if bad_digest:
+            problems.append(f"{len(bad_digest)} manifest digests are not "
+                            "64-char lowercase hex sha256 strings "
+                            f"({_examples(bad_digest)}); rerun "
                             "scripts/cache_latents.py --write-manifest")
         if missing_files:
             problems.append(f"{len(missing_files)} manifest shards missing "
@@ -477,6 +500,27 @@ class BucketDataset:
         if problems:
             raise ValueError(f"{self.data_dir}: latent cache does not match "
                              "metadata.parquet:\n  " + "\n  ".join(problems))
+
+        self.verified_shards, self.verified_bytes = 0, 0
+        self.verify_seconds = 0.0
+        if verify_digests:
+            t0 = time.time()
+            changed = []
+            for name in self.shards:
+                path = lat_dir / name
+                actual = file_sha256(path)
+                self.verified_bytes += path.stat().st_size
+                self.verified_shards += 1
+                if actual != self.digests[name]:
+                    changed.append(f"{name}: expected {self.digests[name]}, "
+                                   f"actual {actual}")
+            self.verify_seconds = time.time() - t0
+            if changed:
+                raise ValueError(
+                    f"{self.data_dir}: latent digest verification FAILED: "
+                    f"{len(changed)} of {len(self.shards)} shards differ from "
+                    f"{man_path} (rebuilt or corrupted latents; the cache is "
+                    "immutable for a run):\n  " + "\n  ".join(changed))
 
         self.shard_of = shard_of
         self.hw = hw.astype(np.int32)

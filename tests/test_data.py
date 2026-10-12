@@ -613,6 +613,24 @@ def test_bucket_validation(root, template):
     del m["digests"]
     (root / "v_nodig/latents/manifest.json").write_text(json.dumps(m))
     expect_error(root / "v_nodig", 'no shard "digests"', "--write-manifest")
+    # null / malformed digests are refused (with or without the re-hash)
+    m = json.loads((base / "latents/manifest.json").read_text())
+    name0 = sorted(m["digests"])[0]
+    good = m["digests"][name0]
+    shutil.copytree(base, root / "v_baddig")
+    for bad in (None, good.upper(), good[:-1], "z" * 64, 7):
+        mb = json.loads((base / "latents/manifest.json").read_text())
+        mb["digests"][name0] = bad
+        (root / "v_baddig/latents/manifest.json").write_text(json.dumps(mb))
+        for verify in (True, False):
+            expect_error(root / "v_baddig",
+                         "1 manifest digests are not 64-char lowercase hex",
+                         f"{name0}={bad!r}", verify_digests=verify)
+    # the valid cache: every shard re-hashed at construction
+    ds = BucketDataset(base, template, img_tokens=IMG_TOKENS)
+    assert ds.verified_shards == len(ds.shards) and ds.verify_seconds >= 0
+    assert ds.verified_bytes == sum(
+        (base / "latents" / n).stat().st_size for n in ds.shards)
     for bad in [dict(caption_probs=(0.5, 0.5)), dict(caption_probs=(1, 1, 1)),
                 dict(artist_prob=1.5)]:
         expect_error(base, "", **bad)
@@ -626,7 +644,8 @@ def test_bucket_validation(root, template):
     assert len(ds.fingerprint()) == 64
     expect_error(base, "caption_probs", caption_probs=(0.500002, 0.3, 0.2))
     print("  bucket validation: missing/extra/duplicate/shape/patch/"
-          "img_tokens/manifest/digest errors OK; caption_probs normalized "
+          "img_tokens/manifest/digest (missing/null/malformed) errors OK; "
+          "caption_probs normalized "
           f"{ds.caption_probs}")
 
 
@@ -844,15 +863,37 @@ def test_bucket_fingerprint(ds, root):
     tensors[key] = tensors[key].copy()
     tensors[key][0, 0, 0] = tensors[key][0, 0, 0] + BF16(1.0)
     save_file(tensors, str(shard), metadata=meta)
-    stale = BucketDataset(lat_dir.parent, t, **kw)
-    assert stale.fingerprint() == fp  # manifest only: no latent bytes read
+    # unchanged manifest over modified shard bytes: refused by default
+    # (startup re-hash), naming the shard with expected vs actual digests
+    old_digest = ds.digests[ds.shards[0]]
+    try:
+        BucketDataset(lat_dir.parent, t, **kw)
+    except ValueError as e:
+        msg = str(e)
+        for needle in ("latent digest verification FAILED",
+                       f"1 of {len(ds.shards)} shards differ",
+                       f"{ds.shards[0]}: expected {old_digest}, actual "
+                       f"{file_sha256(shard)}"):
+            assert needle in msg, (needle, msg)
+        assert ds.shards[1] not in msg, msg
+    else:
+        raise AssertionError("modified shard under an unchanged manifest "
+                             "was accepted with verify_digests=True")
+    # documents the opt-out: verify_digests=False trusts the manifest, so
+    # the stale cache is accepted with the old fingerprint (no latent bytes
+    # read)
+    stale = BucketDataset(lat_dir.parent, t, verify_digests=False, **kw)
+    assert (stale.verified_shards, stale.verified_bytes) == (0, 0)
+    assert stale.fingerprint() == fp
     refresh_digests(lat_dir.parent)
     differ["latent value + manifest"] = BucketDataset(lat_dir.parent, t, **kw)
     for what, other in differ.items():
         assert other.fingerprint() != fp, f"{what} did not change it"
     print("  bucket fingerprint: stable across instances/loaders/row order; "
           "changed by caption, artist, bucket, probs, img_tokens, "
-          "text_rows, latent value (regenerated digests) OK")
+          "text_rows, latent value (regenerated digests); modified shard "
+          "under an unchanged manifest refused (verify_digests=False "
+          "accepts) OK")
 
 
 def conditioner_layout(tmpl, captions):

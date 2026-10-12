@@ -376,7 +376,15 @@ def test_manifest_digests(src, out, tmp):
     expect_exit(run, "digest verification FAILED: 1 shards differ",
                 "train-0000.safetensors", "--no-verify-digests")
     assert json.loads(mpath.read_text()) == man0  # left untouched
-    assert BucketDataset(d, tmpl).fingerprint() == fp0  # stale manifest
+    # the trainer's dataset re-hashes shards by default and refuses the
+    # stale manifest; the opt-out keeps the manifest-derived fingerprint
+    try:
+        BucketDataset(d, tmpl)
+    except ValueError as e:
+        assert "train-0000.safetensors" in str(e), e
+    else:
+        raise AssertionError("BucketDataset accepted a stale manifest")
+    assert BucketDataset(d, tmpl, verify_digests=False).fingerprint() == fp0
     _, log = quiet(run, "--no-verify-digests")
     assert "replaced without comparison" in log, log
     man1 = json.loads(mpath.read_text())
@@ -404,6 +412,22 @@ def test_manifest_digests(src, out, tmp):
     print("  --write-manifest digests: recorded == sha256(file), verified on "
           "rerun, changed shard refused (--no-verify-digests accepts), "
           "fingerprint follows OK")
+
+
+def test_check_digests_malformed():
+    """check_digests rejects digest values that are not 64-char lowercase
+    hex sha256 strings, in the existing manifest or the new digests."""
+    good = hashlib.sha256(b"x").hexdigest()
+    assert cl.check_digests({"a": good}, {"a": good, "b": good}) == (
+        1, ["b"], [])
+    for bad in (None, "", good[:-1], good.upper(), good + "0",
+                "g" * 64, 123):
+        for old, new in (({"a": bad}, {"a": good}),
+                         ({"a": good}, {"a": bad})):
+            expect_exit(lambda: cl.check_digests(old, new),
+                        "1 malformed digests", "a=")
+    print("  check_digests rejects malformed digests (null, short, upper "
+          "case, non-hex, non-str) OK")
 
 
 def test_repo_download(src, tmp):
@@ -461,6 +485,7 @@ def main():
         src, out = tmp / "src", tmp / "out"
         test_bf16_roundtrip(tmp)
         test_parse_shards()
+        test_check_digests_malformed()
         test_batched_vae(tmp)
         test_process_shard(src, tmp / "direct")
         test_main_and_manifest(src, out)

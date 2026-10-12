@@ -183,7 +183,7 @@ RESUME_HARD_KEYS = (
 # text_encoder is only the --text-encoder name (a local dir's basename or
 # the HF id as given), so the same weights under another name must not be
 # fatal; what the encoder IS (tokenizer.json bytes, resolved text config,
-# weight headers) is the hard key text_encoder_id
+# sha256 of the loaded weight files' contents) is the hard key text_encoder_id
 # (qwen3_text.text_encoder_identity, path independent).
 RESUME_SOFT_KEYS = (
     "steps", "lr", "warmup_steps", "cosine_decay", "min_lr", "weight_decay",
@@ -491,6 +491,13 @@ def parse_args(argv=None):
     ap.add_argument("--export-every", type=int, default=0,
                     help="also write model_stepNNNNNN.safetensors every N "
                          "steps (0: export only at the end)")
+    ap.add_argument("--verify-latents", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="re-hash every latent shard at startup and refuse "
+                         "the run if any differs from its manifest digest "
+                         "(rebuilt or transfer-corrupted cache); reads the "
+                         "whole cache once. --no-verify-latents trusts the "
+                         "manifest")
     ap.add_argument("--prefetch", type=int, default=4,
                     help="batches buffered by the background loader")
     ap.add_argument("--loader-workers", type=int, default=4,
@@ -723,7 +730,10 @@ def main(argv=None):
     txt_overrides = (json.loads(args.text_model_config)
                      if args.text_model_config else {})
     txt_cfg = from_hf_config(te_dir, **txt_overrides)
-    te_id = text_encoder_identity(te_dir, txt_cfg)
+    t_id, te_stats = time.time(), {}
+    te_id = text_encoder_identity(te_dir, txt_cfg, stats=te_stats)
+    print(f"text encoder identity {te_id[:12]} (hashed "
+          f"{te_stats['bytes'] / 2**30:.2f} GiB in {time.time() - t_id:.1f} s)")
     template = CaptionTemplate(load_tokenizer(te_dir), text_rows=args.text_rows)
     problems = []
     if txt_cfg.prefix_len != template.prefix_len:
@@ -745,10 +755,17 @@ def main(argv=None):
         dataset = BucketDataset(
             args.data_dir, template, img_tokens=args.img_tokens,
             patch=cfg.patch, caption_probs=caption_probs,
-            artist_prob=args.artist_prob,
+            artist_prob=args.artist_prob, verify_digests=args.verify_latents,
         )
     except (ValueError, FileNotFoundError) as e:
         raise SystemExit(f"--data-dir {args.data_dir}: {e}") from e
+    if args.verify_latents:
+        print(f"latents verified: {dataset.verified_shards} shards, "
+              f"{dataset.verified_bytes / 2**30:.2f} GiB in "
+              f"{dataset.verify_seconds:.1f} s")
+    else:
+        print("latents NOT verified (--no-verify-latents): trusting the "
+              "manifest digests")
     if dataset.lat_channels != cfg.channels:
         raise SystemExit(f"dataset latents have {dataset.lat_channels} "
                          f"channels, model expects {cfg.channels}")

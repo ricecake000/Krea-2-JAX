@@ -281,9 +281,10 @@ def test_tiny_dir_and_loader(tmp):
 
 
 def test_text_encoder_identity(d, cfg, tmp):
-    """text_encoder_identity: path independent; changes with a weight's
-    header dtype/shape, tokenizer.json bytes or the resolved config; ignores
-    weight files the loader does not read (vision tower)."""
+    """text_encoder_identity: path and file-name independent; changes with
+    a weight VALUE (same shape/dtype), a weight's dtype/shape,
+    tokenizer.json bytes or the resolved config; ignores weight files the
+    loader does not read (vision tower); reports the bytes it hashed."""
     import dataclasses
     import shutil
 
@@ -292,8 +293,11 @@ def test_text_encoder_identity(d, cfg, tmp):
     from krea2_jax.qwen3_text import from_hf_config, text_encoder_identity
 
     tmp = Path(tmp) / "ident"
-    ident = text_encoder_identity(d, cfg)
+    stats = {}
+    ident = text_encoder_identity(d, cfg, stats=stats)
     assert isinstance(ident, str) and len(ident) == 64
+    assert stats == {"files": 1,
+                     "bytes": (d / "model.safetensors").stat().st_size}, stats
     assert text_encoder_identity(d, cfg) == ident
     # the same encoder copied elsewhere under another name: same identity
     other = shutil.copytree(d, tmp / "elsewhere" / "another_name")
@@ -319,6 +323,13 @@ def test_text_encoder_identity(d, cfg, tmp):
         w[q] = w[q].reshape(1, -1)
         save_file(w, str(v / "model.safetensors"), metadata={"format": "pt"})
 
+    def revalue(v):  # one embedding value changed; same shape and dtype
+        e = "model.language_model.embed_tokens.weight"
+        w = load_file(str(v / "model.safetensors"))
+        w[e] = w[e].copy()
+        w[e][3, 5] += 1.0
+        save_file(w, str(v / "model.safetensors"), metadata={"format": "pt"})
+
     def retok(v):  # same tokens, different tokenizer.json bytes
         j = json.loads((v / "tokenizer.json").read_text())
         (v / "tokenizer.json").write_text(json.dumps(j, indent=1))
@@ -329,6 +340,7 @@ def test_text_encoder_identity(d, cfg, tmp):
                   str(v / "model-visual.safetensors"))
 
     changed = {
+        "value": variant("value", revalue),
         "dtype": variant("dtype", retype),
         "shape": variant("shape", reshape),
         "tokenizer.json": variant("tok", retok),
@@ -341,9 +353,55 @@ def test_text_encoder_identity(d, cfg, tmp):
         assert x != ident, f"{what} did not change the identity"
     assert len(set(changed.values())) == len(changed)
     assert variant("vision", vision) == ident
-    print("  text_encoder_identity: path independent; dtype/shape/tokenizer/"
-          "select_layers/position_mode change it; unused weight files do "
-          "not")
+
+    # same content under another file name (single file, globbed)
+    def rename(v):
+        (v / "model.safetensors").rename(v / "weights-renamed.safetensors")
+    assert variant("renamed", rename) == ident
+
+    # sharded layout with an index: the same shard contents under other
+    # shard file names at another path match; one value edit does not
+    def shard(v, names=("model-00001-of-00002.safetensors",
+                        "model-00002-of-00002.safetensors")):
+        w = load_file(str(v / "model.safetensors"))
+        (v / "model.safetensors").unlink()
+        keys = sorted(w)
+        parts = (keys[:len(keys) // 2], keys[len(keys) // 2:])
+        wm = {}
+        for name, ks in zip(names, parts):
+            save_file({k: w[k] for k in ks}, str(v / name),
+                      metadata={"format": "pt"})
+            wm.update({k: name for k in ks})
+        (v / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {}, "weight_map": wm}))
+    sharded = variant("sharded", shard)
+    assert sharded != ident  # different file contents (two files)
+    sstats = {}
+    rel = shutil.copytree(tmp / "sharded", tmp / "x" / "relocated")
+    idx = json.loads((rel / "model.safetensors.index.json").read_text())
+    ren = {}
+    for old in sorted(set(idx["weight_map"].values())):
+        new = "renamed-" + old[::-1]
+        (rel / old).rename(rel / new)
+        ren[old] = new
+    idx["weight_map"] = {k: ren[f] for k, f in idx["weight_map"].items()}
+    (rel / "model.safetensors.index.json").write_text(json.dumps(idx))
+    assert text_encoder_identity(rel, cfg, stats=sstats) == sharded
+    assert sstats["files"] == 2, sstats
+
+    def shard_revalue(v):
+        shard(v)
+        f = next(iter(sorted(v.glob("model-*.safetensors"))))
+        w = load_file(str(f))
+        k = sorted(w)[0]
+        w[k] = w[k].copy()
+        w[k].reshape(-1)[0] += 1.0
+        save_file(w, str(f), metadata={"format": "pt"})
+    assert variant("sharded_value", shard_revalue) not in (sharded, ident)
+    print("  text_encoder_identity: path/file-name independent (single and "
+          "sharded); weight value/dtype/shape/tokenizer/select_layers/"
+          "position_mode change it; unused weight files do not; stats "
+          "report the hashed bytes")
 
 
 def _parity_main(d, cfg, tmp, mutate_ref=False, mutate_jax=False):
