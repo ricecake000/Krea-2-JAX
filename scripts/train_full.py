@@ -340,11 +340,14 @@ def parse_args(argv=None):
     ap.add_argument("--logit-mean", type=float, default=0.0)
     ap.add_argument("--logit-std", type=float, default=1.0)
     ap.add_argument("--qchunk", type=int, default=512)
-    ap.add_argument("--attn", choices=["ref", "splash", "aiter"], default="ref",
+    ap.add_argument("--attn", choices=["ref", "splash", "aiter", "cudnn"],
+                    default="ref",
                     help="exact fp32-softmax reference attention, the fused "
-                         "Pallas Splash kernel (TPU only), or jax-aiter's "
+                         "Pallas Splash kernel (TPU only), jax-aiter's "
                          "flash_attn_varlen (ROCm gfx950 only; needs the "
-                         "jax-aiter package)")
+                         "jax-aiter package), or cuDNN flash attention via "
+                         "jax.nn.dot_product_attention (NVIDIA GPU; its "
+                         "'xla' path on other backends)")
     ap.add_argument("--attn-block", type=int, default=256,
                     help="splash attention tile size")
     ap.add_argument("--act-sharding", choices=["on", "off"], default="on",

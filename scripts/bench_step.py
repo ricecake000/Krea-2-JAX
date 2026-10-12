@@ -76,7 +76,8 @@ def parse_args(argv=None):
     ap.add_argument("--txt-len", type=int, default=512)
     ap.add_argument("--remat-policy", choices=["full", "dots", "none"],
                     default="dots")
-    ap.add_argument("--attn", choices=["ref", "splash", "aiter"], default="ref")
+    ap.add_argument("--attn", choices=["ref", "splash", "aiter", "cudnn"],
+                    default="ref")
     ap.add_argument("--attn-block", type=int, default=256)
     ap.add_argument("--act-sharding", choices=["on", "off"], default="on")
     ap.add_argument("--base-sharding", choices=["fsdp", "replicate"],

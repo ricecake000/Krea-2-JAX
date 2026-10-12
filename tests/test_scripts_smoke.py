@@ -5,7 +5,8 @@ tiny model config on 8 emulated devices:
                          verdict is NONE with --act-sharding on and FOUND
                          with it off (the partitioner moves activations)
   bench_step_modes       scripts/bench_step.py --random-weights in fwd,
-                         fwdbwd and train modes (2 timed steps each)
+                         fwdbwd and train modes (2 timed steps each), plus
+                         train with --attn cudnn
 
 Structure: every case is a function registered with @case (name = function
 name); `main` runs them all, or only those named on the command line:
@@ -119,6 +120,15 @@ def bench_step_modes():
             loss = float(re.search(r"loss ([\d.eE+-]+|nan|inf)", out).group(1))
             assert loss == loss and loss < 1e3, f"{mode}: bad loss {loss}"
         print(f"    bench_step --mode {mode}: median {m.group(1)} ms")
+    # --attn cudnn (jax.nn.dot_product_attention; its "xla" path on CPU)
+    _, out = run_script("bench_step.py", *common, "--mode", "train",
+                        "--attn", "cudnn")
+    assert "attn cudnn" in out, out
+    m = re.search(r"step time: median ([\d.]+) ms over (\d+) steps", out)
+    assert m and int(m.group(2)) == 2, out
+    loss = float(re.search(r"loss ([\d.eE+-]+|nan|inf)", out).group(1))
+    assert loss == loss and loss < 1e3, f"cudnn: bad loss {loss}"
+    print(f"    bench_step --mode train --attn cudnn: median {m.group(1)} ms")
 
 
 PARITY_ARGS = (
