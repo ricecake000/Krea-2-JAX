@@ -1,5 +1,8 @@
-"""End-to-end test of scripts/train_full.py on CPU with 8 emulated devices
-and a tiny model:
+"""End-to-end test of scripts/train_full.py on CPU with 8 emulated devices,
+a tiny DiT, a tiny Qwen3-VL text encoder (tests/test_qwen3_text.py; run
+online in the step) and a fake aspect-bucketed latent cache (20 samples in
+two buckets, 12 and 16 image tokens, --img-tokens 16, so half the samples
+carry padded image rows):
 
   a. a short full fine-tuning run (fp32 master, AdamW, EMA, orbax saves)
      lowers the flow-matching loss,
@@ -12,8 +15,10 @@ and a tiny model:
   d. the optimizer-state sharding guard accepts the sharded state and fires
      on a replicated one,
   e. --resume validates the run configuration: a different --seed or
-     --batch-size, or a reordered cache (dataset fingerprint), is a hard
-     error, a different --lr warns and continues,
+     --batch-size, an edited caption in metadata.parquet (dataset
+     fingerprint), or a text encoder with different tokenizer.json bytes
+     (text_encoder_id) is a hard error; the same encoder copied to another
+     path resumes cleanly; a different --lr warns and continues,
   f. SIGTERM / SIGINT stop the run gracefully (checkpoint + export, exit 0)
      and --resume continues it exactly,
   g. --resume-step N resumes an older step and sets newer ones aside,
@@ -24,7 +29,20 @@ and a tiny model:
   j. stale <step>.orbax-checkpoint-tmp dirs are removed when the writing
      checkpoint manager opens,
   k. the --attn aiter XLA_FLAGS check parses the command-buffer flag
-     (last occurrence wins, value must be empty).
+     (last occurrence wins, value must be empty),
+  l. build_positions_and_mask_bucketed equals build_positions_and_mask
+     when nothing is padded, and has the documented per-sample layout when
+     it is (eager and jitted),
+  m. a padded sample's loss and gradients do not depend on the values in
+     its padded image rows (direct make_train_step call: loss, grad norm,
+     updated params and AdamW moments bitwise equal), while a valid row
+     does change them; masked_flow_loss matches its numpy formula and
+     keeps inf/NaN in padded rows out of the loss and its gradient,
+  n. per-sample mu (from h*w) and a --timestep-mu override both train
+     (unit + a short CLI run), and the run config records the new keys.
+  o. a latent shard corrupted under an unchanged manifest is refused at
+     startup (--verify-latents, default) before the base checkpoint load,
+     with no ckpt dir created; --no-verify-latents proceeds.
 
 Requires CPU PyTorch + einops (tiny reference checkpoint, parity check).
 """
@@ -55,13 +73,22 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import numpy as np
 
-from test_data import make_fake_cache
+from test_data import make_fake_latent_cache
 from test_parity import get_reference, patch_reference_for_cpu
+from test_qwen3_text import make_tiny_text_encoder_dir
 
 TINY = dict(
     features=128, tdim=32, txtdim=64, heads=4, kvheads=2, multiplier=4,
     layers=2, patch=2, channels=4, txtheads=4, txtkvheads=4, txtlayers=3,
 )
+# Qwen3TextConfig overrides for the tiny encoder: 3 select layers = txtlayers
+TEXT_OVERRIDES = {"select_layers": [0, 1, 2]}
+TEXT_ROWS = 32
+IMG_TOKENS = 16
+# (bucket_w, bucket_h) px -> 4-channel latents (8, 6) / (8, 8) -> 4x3 = 12
+# and 4x4 = 16 image tokens
+BUCKETS = ((48, 64), (64, 64))
+TEXT_ENCODER = None  # set by main(): the tiny encoder dir
 STEP_RE = re.compile(
     r"^step\s+(\d+)/\d+\s+loss\s+(\S+)\s+ema_loss\s+\S+\s+gnorm\s+(\S+)", re.M
 )
@@ -70,7 +97,10 @@ STEP_RE = re.compile(
 def train_cmd(base, cache, out, extra=()):
     return [
         sys.executable, str(REPO / "scripts" / "train_full.py"),
-        "--base-ckpt", str(base), "--cache-dir", str(cache),
+        "--base-ckpt", str(base), "--data-dir", str(cache),
+        "--text-encoder", str(TEXT_ENCODER),
+        "--text-model-config", json.dumps(TEXT_OVERRIDES),
+        "--text-rows", str(TEXT_ROWS), "--img-tokens", str(IMG_TOKENS),
         "--output-dir", str(out), "--model-config", json.dumps(TINY),
         "--steps", "12", "--save-every", "6", "--export-every", "6",
         "--lr", "1e-3", "--warmup-steps", "2", "--batch-size", "8",
@@ -96,7 +126,157 @@ def run_train(base, cache, out, extra=()):
     return steps, proc.stdout
 
 
+def check_positions_helper():
+    """l. bucketed positions/mask vs the fixed-shape helper."""
+    import jax
+    import jax.numpy as jnp
+
+    from krea2_jax.model import (
+        build_positions_and_mask, build_positions_and_mask_bucketed,
+    )
+
+    rng = np.random.default_rng(0)
+    B, Ltxt = 3, 5
+    txt_mask = jnp.asarray(np.arange(Ltxt)[None, :]
+                           < rng.integers(1, Ltxt + 1, size=(B, 1)))
+    for h, w in ((4, 4), (2, 8), (8, 2), (1, 16)):
+        hw = jnp.asarray(np.tile([[h, w]], (B, 1)), jnp.int32)
+        pos_b, mask_b = build_positions_and_mask_bucketed(txt_mask, hw, h * w)
+        pos_f, mask_f = build_positions_and_mask(txt_mask, h, w)
+        assert pos_b.dtype == pos_f.dtype and mask_b.dtype == mask_f.dtype
+        assert np.array_equal(np.asarray(pos_b), np.asarray(pos_f)), (h, w)
+        assert np.array_equal(np.asarray(mask_b), np.asarray(mask_f)), (h, w)
+    hw_np = np.asarray([[4, 3], [2, 5], [4, 4]], np.int32)
+    N = 16
+    pos, mask = build_positions_and_mask_bucketed(txt_mask, hw_np, N)
+    pos_j, mask_j = jax.jit(build_positions_and_mask_bucketed,
+                            static_argnums=2)(txt_mask, jnp.asarray(hw_np), N)
+    assert np.array_equal(np.asarray(pos), np.asarray(pos_j))
+    assert np.array_equal(np.asarray(mask), np.asarray(mask_j))
+    pos, mask = np.asarray(pos), np.asarray(mask)
+    assert pos.shape == (B, Ltxt + N, 3) and pos.dtype == np.float32
+    assert mask.shape == (B, Ltxt + N) and mask.dtype == bool
+    assert not pos[:, :Ltxt].any()
+    assert np.array_equal(mask[:, :Ltxt], np.asarray(txt_mask))
+    for b, (h, w) in enumerate(hw_np.tolist()):
+        n = h * w
+        exp = np.zeros((N, 3), np.float32)
+        exp[:n, 1] = np.arange(n) // w
+        exp[:n, 2] = np.arange(n) % w
+        assert np.array_equal(pos[b, Ltxt:], exp), (b, pos[b, Ltxt:])
+        assert np.array_equal(mask[b, Ltxt:], np.arange(N) < n), b
+    print("l. build_positions_and_mask_bucketed == fixed-shape helper when "
+          "unpadded; per-sample grid + zero/False padding (eager == jit): ok")
+
+
+def check_step_padding_and_mu(cfg, mesh, params, pshard, tx, opt_state,
+                              opt_shard):
+    """m + n (units): padded image rows are inert; per-sample mu vs
+    override; masked_flow_loss formula."""
+    import jax
+    import jax.numpy as jnp
+
+    import train_full
+    from krea2_jax.checkpoint import batch_sharding
+    from krea2_jax.qwen3_text import (
+        from_hf_config, load_qwen3_text_params, load_tokenizer,
+    )
+    from krea2_jax.text_template import CaptionTemplate
+
+    # masked_flow_loss == numpy per-sample mean over valid rows, batch mean
+    rng = np.random.default_rng(5)
+    v = rng.standard_normal((3, 6, 4)).astype(np.float32)
+    tg = rng.standard_normal((3, 6, 4)).astype(np.float32)
+    n_img = np.asarray([6, 4, 1], np.int32)
+    exp = np.mean([np.mean((v[b, :n] - tg[b, :n]) ** 2)
+                   for b, n in enumerate(n_img)])
+    got = float(train_full.masked_flow_loss(jnp.asarray(v), jnp.asarray(tg),
+                                            jnp.asarray(n_img)))
+    assert abs(got - exp) <= 1e-6 * abs(exp), (got, exp)
+    full = float(train_full.masked_flow_loss(
+        jnp.asarray(v), jnp.asarray(tg), jnp.full((3,), 6, jnp.int32)))
+    assert abs(full - float(np.mean((v - tg) ** 2))) <= 1e-6 * full
+    # per-sample mu: cfg.mu_for_seq_len per sample; override: constant
+    n = jnp.asarray([12, 16, 4096], jnp.int32)
+    mu = np.asarray(train_full.per_sample_mu(cfg, n))
+    ref = np.asarray([cfg.mu_for_seq_len(int(k)) for k in (12, 16, 4096)])
+    assert mu.dtype == np.float32 and np.allclose(mu, ref, rtol=1e-6), (mu, ref)
+    assert np.array_equal(np.asarray(train_full.per_sample_mu(cfg, n, 0.8)),
+                          np.full(3, 0.8, np.float32))
+    # padded rows holding inf / NaN: select-before-square keeps the loss and
+    # its gradient finite (loss 4 = 2^2 over the single valid row)
+    lg = jax.jit(jax.value_and_grad(
+        lambda v_: train_full.masked_flow_loss(v_, jnp.zeros_like(v_),
+                                               jnp.asarray([1], jnp.int32))))
+    for bad in (np.inf, np.nan):
+        lv, gv = lg(jnp.asarray([[[2.0], [bad]]], jnp.float32))
+        assert float(lv) == 4.0, (bad, lv)
+        assert np.array_equal(np.asarray(gv), [[[4.0], [0.0]]]), (bad, gv)
+    print(f"m/n. masked_flow_loss == numpy formula, inf/NaN padded rows give "
+          f"loss 4.0 and grad [4, 0]; per_sample_mu {mu.round(4)} "
+          "== mu_for_seq_len per sample, override constant: ok")
+
+    te = Path(TEXT_ENCODER)
+    txt_cfg = from_hf_config(te, **TEXT_OVERRIDES)
+    template = CaptionTemplate(load_tokenizer(te), text_rows=TEXT_ROWS)
+    txt_params = load_qwen3_text_params(te, jnp.bfloat16, mesh=mesh,
+                                        cfg=txt_cfg)
+    hp = train_full.parse_args([
+        "--base-ckpt", "-", "--data-dir", "-", "--text-encoder", "-",
+        "--output-dir", "-", "--qchunk", "256", "--ema-decay", "0",
+    ])
+    B, feat = 8, cfg.channels * cfg.patch * cfg.patch
+    hw = np.asarray([[4, 3], [4, 4]] * (B // 2), np.int32)
+    n_img = hw[:, 0] * hw[:, 1]
+    valid = np.arange(IMG_TOKENS)[None, :] < n_img[:, None]
+    img = rng.standard_normal((B, IMG_TOKENS, feat)).astype(np.float32)
+    clean = np.where(valid[..., None], img, 0.0)
+    garbage = np.where(valid[..., None], img,
+                       50.0 * rng.standard_normal(img.shape))
+    changed = clean.copy()
+    changed[0, 3] += 1.0  # a VALID row of a padded sample
+    ids, txt_len = template.encode_captions(
+        [f"caption {i}, a girl with long hair" for i in range(B)])
+    ds = batch_sharding(mesh)
+    key = jax.random.PRNGKey(3)
+    copy_p = jax.jit(lambda t: jax.tree.map(jnp.copy, t), out_shardings=pshard)
+    copy_o = jax.jit(lambda t: jax.tree.map(jnp.copy, t),
+                     out_shardings=opt_shard)
+
+    def run(step, img_np):
+        batch = [jax.device_put(np.asarray(a, dt), ds) for a, dt in (
+            (img_np, jnp.bfloat16), (hw, np.int32), (ids, np.int32),
+            (txt_len, np.int32))]
+        p, o, _, m = step(copy_p(params), copy_o(opt_state), None, txt_params,
+                          *batch, key)
+        return (float(m["loss"]), float(m["grad_norm"]),
+                [np.asarray(x) for x in jax.tree.leaves(p)],
+                [np.asarray(x) for x in jax.tree.leaves(o)])
+
+    step = train_full.make_train_step(cfg, hp, mesh, tx, False, pshard,
+                                      opt_shard, txt_cfg, IMG_TOKENS)
+    a, g, c = run(step, clean), run(step, garbage), run(step, changed)
+    assert np.isfinite(a[0]) and np.isfinite(a[1]), a[:2]
+    assert a[0] == g[0] and a[1] == g[1], (a[:2], g[:2])
+    for x, y in zip(a[2] + a[3], g[2] + g[3]):
+        assert x.dtype == y.dtype and np.array_equal(x, y), "padding leaked"
+    assert c[0] != a[0] and c[1] != a[1], "a valid row did not matter"
+    print(f"m. padded rows (zeros vs 50*N(0,1) garbage): loss {a[0]:.6f}, "
+          f"gnorm {a[1]:.6f}, params and AdamW moments bitwise equal; a "
+          f"changed valid row moves the loss to {c[0]:.6f}: ok")
+
+    step_mu = train_full.make_train_step(cfg, hp, mesh, tx, False, pshard,
+                                         opt_shard, txt_cfg, IMG_TOKENS,
+                                         mu_override=0.8)
+    o = run(step_mu, clean)
+    assert np.isfinite(o[0]) and np.isfinite(o[1]), o[:2]
+    assert o[0] != a[0], "mu override did not change the timesteps"
+    print(f"n. per-sample mu loss {a[0]:.6f} vs --timestep-mu 0.8 loss "
+          f"{o[0]:.6f} (same key/batch, both finite): ok")
+
+
 def main():
+    global TEXT_ENCODER
     import torch
 
     mmdit = get_reference()
@@ -126,10 +306,19 @@ def main():
           for k, v in model.state_dict().items()}
     base = tmp / "base.safetensors"
     save_file(sd, str(base))
-    cache = tmp / "cache"
+    cache = tmp / "data"
     # 20 samples / batch 8: 2 steps per epoch (tail of 4 dropped), so the
-    # resume at step 6 lands on an epoch boundary mid-run
-    make_fake_cache(cache, 20, lat_shape=(4, 8, 8), txt_layers=3, txt_dim=64)
+    # resume at step 6 lands on an epoch boundary mid-run; two buckets (12
+    # and 16 image tokens at --img-tokens 16) in two shards
+    ids = np.random.default_rng(7).choice(10_000, size=20, replace=False)
+    rows = [{"id": int(i), "bucket_w": BUCKETS[k % 2][0],
+             "bucket_h": BUCKETS[k % 2][1],
+             "artist_name": "" if k % 5 == 0 else f"artist {k % 3}",
+             "tar": f"data/train-{k % 2:04d}.tar"}
+            for k, i in enumerate(ids.tolist())]
+    make_fake_latent_cache(cache, rows, lat_channels=TINY["channels"])
+    te_dir, _ = make_tiny_text_encoder_dir(tmp / "te")
+    TEXT_ENCODER = te_dir
 
     # --- d. optimizer-state sharding guard (unit) ---
     mesh = make_mesh()
@@ -169,6 +358,11 @@ def main():
     expect_guard_failure(jax.tree.unflatten(treedef, leaves),
                          "a single replicated moment")
     print("opt-state guard fires on replicated leaves: ok")
+
+    # --- l, m, n (units on the tiny model) ---
+    check_positions_helper()
+    check_step_padding_and_mu(cfg, mesh, params, pshard, tx, opt_state,
+                              opt_shard)
     # informational: does plain jit(tx.init, in_shardings=...) shard mu/nu?
     plain = jax.jit(tx.init, in_shardings=(pshard,))(params)
     try:
@@ -190,7 +384,30 @@ def main():
     assert losses[-1] < losses[0], "loss at step 12 not below step 1"
     assert np.mean(losses[-3:]) < np.mean(losses[:3]), "loss did not decrease"
     assert "optimizer state:" in log1 and "sharded like params" in log1
-    print("a. full fine-tuning lowers the loss: ok")
+    assert re.search(r"dataset: 20 samples in 2 buckets \(top: 48x64 x10, "
+                     r"64x64 x10\); img tokens 12\.\.16 padded to 16; "
+                     r"text_rows 32 ", log1), log1
+    assert "text encoder loaded" in log1 and "position_mode contiguous" in log1
+    assert re.search(r"latents verified: 2 shards, [\d.]+ GiB in [\d.]+ s",
+                     log1), log1
+    assert re.search(r"text encoder identity [0-9a-f]{12} \(hashed [\d.]+ "
+                     r"GiB in [\d.]+ s\)", log1), log1
+    from krea2_jax import fullft_ckpt as _fc
+    rc = _fc.read_meta_at(str(out1 / "ckpt"), 12)["config"]
+    for k, val in (("text_rows", TEXT_ROWS), ("img_tokens", IMG_TOKENS),
+                   ("caption_probs", [0.5, 0.3, 0.2]), ("artist_prob", 0.5),
+                   ("text_encoder", "te"), ("position_mode", "contiguous"),
+                   ("lat_channels", 4), ("n_samples", 20),
+                   ("timestep_mu", None),
+                   ("text_model_config", TEXT_OVERRIDES)):
+        assert rc.get(k, "<missing>") == val, (k, rc.get(k, "<missing>"))
+    assert "txt_len" not in rc and "resolution" not in rc, rc
+    assert len(rc["dataset_fingerprint"]) == 64, rc
+    from krea2_jax.qwen3_text import from_hf_config, text_encoder_identity
+    assert rc["text_encoder_id"] == text_encoder_identity(
+        TEXT_ENCODER, from_hf_config(TEXT_ENCODER, **TEXT_OVERRIDES)), rc
+    print("a. full fine-tuning lowers the loss; run config records the "
+          "bucketed/text-encoder keys: ok")
 
     # --- b. exported weights ---
     exported = out1 / "model.safetensors"
@@ -201,6 +418,7 @@ def main():
     assert keys == set(sd), (sorted(set(sd) - keys), sorted(keys - set(sd)))
     assert meta["step"] == "12" and meta["source"] == "ema", meta
     assert meta["base"] == "base.safetensors", meta
+    assert meta["resolution"] == "bucketed" and meta["img_tokens"] == "16", meta
     with safe_open(str(out1 / "model_step000006.safetensors"), framework="numpy") as f:
         assert f.metadata()["step"] == "6"
     ft = load_file(str(exported))
@@ -287,10 +505,7 @@ def main():
     assert wdiff <= 1e-3, wdiff
     # refusing to clobber an existing run without --resume
     proc = subprocess.run(
-        [sys.executable, str(REPO / "scripts" / "train_full.py"),
-         "--base-ckpt", str(base), "--cache-dir", str(cache),
-         "--output-dir", str(out2), "--model-config", json.dumps(TINY),
-         "--steps", "20", "--batch-size", "8"],
+        train_cmd(base, cache, out2, ("--steps", "20")),
         env={**os.environ}, capture_output=True, text=True,
     )
     assert proc.returncode != 0 and "--resume" in proc.stderr, proc.stderr[-2000:]
@@ -316,29 +531,62 @@ def main():
         assert f"{key}: checkpoint" in err and f"now {val}" in err, err[-2000:]
         assert "resumed train state" not in proc.stdout
         print(f"  resume with {flag} {val}: refused ({key} mismatch)")
-    # same sample count, two samples swapped in meta.json: the data order
-    # changes, so the dataset fingerprint must refuse the resume
-    meta_path = cache / "meta.json"
-    meta_orig = meta_path.read_text()
+    # same samples and latents, one caption edited in metadata.parquet: the
+    # training text changes, so the dataset fingerprint must refuse the resume
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    pq_path = cache / "metadata.parquet"
+    pq_orig = pq_path.read_bytes()
     try:
-        m = json.loads(meta_orig)
-        m["samples"][0], m["samples"][1] = m["samples"][1], m["samples"][0]
-        meta_path.write_text(json.dumps(m, indent=2))
-        d = fresh_copy("badswap")
+        table = pq.read_table(pq_path)
+        longs = table.column("long").to_pylist()
+        longs[3] = longs[3] + " (edited)"
+        table = table.set_column(table.schema.get_field_index("long"), "long",
+                                 pa.array(longs, type=pa.string()))
+        pq.write_table(table, pq_path)
+        d = fresh_copy("badcaption")
         proc = subprocess.run(
             train_cmd(base, cache, d, ("--resume",)),
             env={**os.environ}, capture_output=True, text=True, timeout=900,
         )
     finally:
-        meta_path.write_text(meta_orig)
+        pq_path.write_bytes(pq_orig)
     err = proc.stderr
-    assert proc.returncode != 0, "resume on a reordered cache did not fail"
+    assert proc.returncode != 0, "resume on an edited caption did not fail"
     assert "different run configuration" in err, err[-2000:]
     assert "dataset_fingerprint: checkpoint" in err, err[-2000:]
     assert "n_samples:" not in err, err[-2000:]
     assert "resumed train state" not in proc.stdout
-    print("  resume with two cache samples swapped: refused "
+    print("  resume with one caption edited in metadata.parquet: refused "
           "(dataset_fingerprint mismatch)")
+    # text encoder identity: a tokenizer.json with other bytes (same tokens,
+    # so the dataset fingerprint is unchanged) is refused; the same encoder
+    # copied to another path (same basename) resumes without a warning
+    te_mod = shutil.copytree(TEXT_ENCODER, tmp / "te_modified" / "te")
+    tj = json.loads((te_mod / "tokenizer.json").read_text())
+    (te_mod / "tokenizer.json").write_text(json.dumps(tj, indent=1))
+    d = fresh_copy("badtokenizer")
+    proc = subprocess.run(
+        train_cmd(base, cache, d, ("--resume", "--text-encoder", str(te_mod))),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    err = proc.stderr
+    assert proc.returncode != 0, "resume with another tokenizer.json ran"
+    assert "different run configuration" in err, err[-2000:]
+    assert "text_encoder_id: checkpoint" in err, err[-2000:]
+    assert "dataset_fingerprint" not in err, err[-2000:]
+    assert "resumed train state" not in proc.stdout
+    print("  resume with a modified tokenizer.json: refused (text_encoder_id "
+          "mismatch)")
+    te_copy = shutil.copytree(TEXT_ENCODER, tmp / "te_elsewhere" / "te")
+    d = fresh_copy("copiedte")
+    stepsT, logT = run_train(base, cache, d,
+                             extra=("--resume", "--text-encoder", str(te_copy)))
+    assert "resumed train state" in logT and sorted(stepsT) == list(range(7, 13))
+    assert "WARNING" not in logT, logT
+    tdiffs = [abs(stepsT[k][0] - steps1[k][0]) for k in range(7, 13)]
+    assert max(tdiffs) <= 1e-5, tdiffs  # same encoder -> same run
+    print("  resume with the same encoder copied to another path: accepted")
     d = fresh_copy("newlr")
     steps3, log3 = run_train(base, cache, d, extra=("--resume", "--lr", "2e-3"))
     assert "WARNING: resuming step 6 with changed optimizer/schedule" in log3, log3
@@ -508,8 +756,11 @@ def main():
     outE = tmp / "run_export_only"
     (outE / "ckpt").mkdir(parents=True)
     shutil.copytree(out1 / "ckpt" / "12", outE / "ckpt" / "12")
+    # export-only needs neither the dataset nor the text encoder (a missing
+    # --text-encoder dir would otherwise be looked up on the HF hub)
     proc = subprocess.run(
-        train_cmd(base, cache, outE, ("--resume",)),
+        train_cmd(base, tmp / "no_such_data", outE,
+                  ("--resume", "--text-encoder", str(tmp / "no_such_te"))),
         env={**os.environ}, capture_output=True, text=True, timeout=900,
     )
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
@@ -613,6 +864,47 @@ def main():
     assert not cbd(f"--foo {flag} {flag}FUSION")
     assert not cbd("--xla_force_host_platform_device_count=8 --foo=1")
     print("k. command_buffers_disabled parses XLA_FLAGS (last token wins): ok")
+
+    # --- n. CLI run with a --timestep-mu override ---
+    outM = tmp / "run_mu"
+    stepsM, logM = run_train(base, cache, outM,
+                             ("--steps", "2", "--timestep-mu", "0.8"))
+    assert sorted(stepsM) == [1, 2], sorted(stepsM)
+    assert all(math.isfinite(v[0]) for v in stepsM.values()), stepsM
+    assert "mu 0.8000 (--timestep-mu, all samples)" in logM, logM
+    assert "(per sample)" in log1, log1
+    cfgM = fullft_ckpt.read_meta_at(str(outM / "ckpt"), 2)["config"]
+    assert cfgM["timestep_mu"] == 0.8, cfgM
+    print(f"n. --timestep-mu 0.8 CLI run: losses "
+          f"{', '.join(f'{stepsM[s][0]:.4f}' for s in (1, 2))}, recorded in "
+          "the run config: ok")
+
+    # --- o. a latent shard corrupted under an unchanged manifest ---
+    bad_cache = shutil.copytree(cache, tmp / "data_corrupt")
+    shard = bad_cache / "latents" / "train-0001.safetensors"
+    raw = bytearray(shard.read_bytes())
+    raw[-1] ^= 0x01  # one latent bit (the tensor bytes end the file)
+    shard.write_bytes(bytes(raw))
+    outV = tmp / "run_corrupt"
+    proc = subprocess.run(
+        train_cmd(base, bad_cache, outV, ("--steps", "2")),
+        env={**os.environ, "PYTHONUNBUFFERED": "1"}, capture_output=True,
+        text=True, timeout=900)
+    textV = proc.stdout + proc.stderr
+    assert proc.returncode != 0, textV
+    for needle in ("latent digest verification FAILED",
+                   "1 of 2 shards differ", "train-0001.safetensors: expected"):
+        assert needle in textV, (needle, textV)
+    assert "train-0000.safetensors: expected" not in textV, textV
+    assert "loading base checkpoint" not in textV, textV
+    assert not (outV / "ckpt").exists(), sorted(outV.iterdir())
+    outNV = tmp / "run_corrupt_noverify"
+    stepsNV, logNV = run_train(base, bad_cache, outNV,
+                               ("--steps", "2", "--no-verify-latents"))
+    assert sorted(stepsNV) == [1, 2], sorted(stepsNV)
+    assert "latents NOT verified (--no-verify-latents)" in logNV, logNV
+    print("o. corrupted latent shard refused at startup before the base load "
+          "(no ckpt dir); --no-verify-latents proceeds: ok")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("ALL TRAIN-FULL TESTS PASSED")

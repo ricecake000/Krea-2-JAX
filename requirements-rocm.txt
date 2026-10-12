@@ -31,3 +31,9 @@ safetensors>=0.4.5
 ml_dtypes>=0.4.0
 numpy
 pillow
+# bucketed data path + online text encoder (krea2_jax/data.py BucketDataset,
+# krea2_jax/qwen3_text.py): caption tokenization, metadata.parquet, and
+# fetching --text-encoder from the HF hub
+tokenizers
+pyarrow
+huggingface_hub

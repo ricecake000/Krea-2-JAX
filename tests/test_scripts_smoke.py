@@ -6,6 +6,9 @@ tiny model config on 8 emulated devices:
                          with it off (the partitioner moves activations)
   bench_step_modes       scripts/bench_step.py --random-weights in fwd,
                          fwdbwd and train modes (2 timed steps each)
+  modal_text_parity_flow scripts/modal_text_parity.py control flow (exit
+                         codes, skip-on-tokenizer-failure, exit 1) with a
+                         mocked subprocess runner, no Modal SDK
 
 Structure: every case is a function registered with @case (name = function
 name); `main` runs them all, or only those named on the command line:
@@ -35,6 +38,14 @@ TINY = dict(
     layers=2, patch=2, channels=4, txtheads=4, txtkvheads=4, txtlayers=3,
 )
 TINY_JSON = json.dumps(TINY)
+# Qwen3TextConfig overrides matching TINY (hidden 64 = txtdim, 3 select
+# layers = txtlayers); same shape as tests/test_qwen3_text.py's tiny encoder
+TINY_TEXT = dict(
+    vocab_size=600, hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+    head_dim=16, intermediate_size=96, mrope_section=[4, 2, 2],
+    select_layers=[0, 1, 2],
+)
+TINY_TEXT_JSON = json.dumps(TINY_TEXT)
 
 CASES = []
 
@@ -80,8 +91,9 @@ def run_script(script, *args, env=None, timeout=900, expect_ok=True):
 # ---------------------------------------------------------------------------
 
 AOT_ARGS = (
-    "--model-config", TINY_JSON, "--batch-size", 16, "--resolution", 256,
-    "--txt-len", 64, "--qchunk", 128, "--emulate-devices", 8,
+    "--model-config", TINY_JSON, "--text-model-config", TINY_TEXT_JSON,
+    "--batch-size", 16, "--img-tokens", 256, "--bucket", "192x320",
+    "--text-rows", 64, "--qchunk", 128, "--emulate-devices", 8,
     "--remat-policy", "dots", "--act-numel", 2e5,
 )
 VERDICT_RE = re.compile(r"^activation collectives: (NONE|FOUND (\d+))", re.M)
@@ -92,8 +104,10 @@ def aot_analysis_verdict():
     verdicts = {}
     for mode in ("on", "off"):
         _, out = run_script("aot_analysis.py", *AOT_ARGS, "--act-sharding", mode)
-        for needle in ("params: ", "sequence: ", "lowered in", "compiled (cpu",
-                       "memory_analysis", "cost_analysis", "collectives: ",
+        for needle in ("params: ", "sequence: bucket 192x320px -> 20x12 = 240 "
+                       "valid of 256 img rows", "text tower: ", "lowered in",
+                       "compiled (cpu", "memory_analysis", "cost_analysis",
+                       "analytic text-tower flops", "collectives: ",
                        "CPU backend caveats"):
             assert needle in out, f"--act-sharding {mode}: no {needle!r}\n{out}"
         m = VERDICT_RE.search(out)
@@ -107,10 +121,15 @@ def aot_analysis_verdict():
 @case
 def bench_step_modes():
     common = ("--random-weights", "--model-config", TINY_JSON,
-              "--batch-size", 8, "--width", 128, "--height", 128,
-              "--txt-len", 16, "--qchunk", 128, "--steps", 2, "--warmup", 1)
+              "--text-model-config", TINY_TEXT_JSON, "--batch-size", 8,
+              "--img-tokens", 64, "--bucket", "96x160", "--text-rows", 16,
+              "--qchunk", 128, "--steps", 2, "--warmup", 1)
     for mode in ("fwd", "fwdbwd", "train"):
         _, out = run_script("bench_step.py", *common, "--mode", mode)
+        assert "bucket 96x160px (60 of 64 img rows" in out, out
+        if mode == "train":
+            assert "text tower (random bf16, replicated)" in out, out
+            assert "+ text tower forward" in out, out
         m = re.search(r"step time: median ([\d.]+) ms over (\d+) steps", out)
         assert m and int(m.group(2)) == 2, out
         assert re.search(r"analytic [\d.]+ TFLOP/s per device", out), out
@@ -298,6 +317,88 @@ def node_attention_parity_emul():
     print("    node_attention_parity: emul passes (f32, bf16+shard_map, dit, "
           "dit f32 truth), truth rejects --dtype f32 / ratio 0 / no weights, "
           "negative control fails")
+
+
+@case
+def modal_text_parity_flow():
+    """scripts/modal_text_parity.py without Modal (the import is guarded):
+    run_checks aggregates the subprocess exit codes, a failed tokenizer-only
+    check skips the model checks, parity_impl reports a failed download, and
+    finish() writes the log, then exits 1 with the one-line reason."""
+    import tempfile
+    from types import SimpleNamespace
+
+    sys.path.insert(0, str(REPO / "scripts"))
+    import modal_text_parity as mtp
+
+    def fake_runner(codes):
+        calls = []
+
+        def runner(cmd, **kw):
+            assert kw == {"cwd": mtp.REMOTE_REPO, "capture_output": True,
+                          "text": True}, kw
+            calls.append(cmd)
+            tag = "tok" if "--tokenizer-only" in cmd else cmd[
+                cmd.index("--dtype") + 1]
+            return SimpleNamespace(returncode=codes.get(tag, 0),
+                                   stdout=f"out {tag}", stderr="")
+        return runner, calls
+
+    runner, calls = fake_runner({})
+    lines, failures = mtp.run_checks("/w", 8, ["f32", "bf16"], 4, runner=runner)
+    assert failures == [] and len(calls) == 3, (failures, calls)
+    assert "[exit 0]\n" in lines and "out bf16" in lines, lines
+
+    runner, calls = fake_runner({"bf16": 3})
+    _, failures = mtp.run_checks("/w", 8, ["f32", "bf16"], 4, runner=runner)
+    assert failures == ["bf16 parity exit 3"] and len(calls) == 3, failures
+
+    runner, calls = fake_runner({"tok": 1})
+    lines, failures = mtp.run_checks("/w", 8, ["f32", "bf16"], 4,
+                                     runner=runner)
+    assert len(calls) == 1 and "--tokenizer-only" in calls[0], calls
+    assert failures == ["tokenizer-only check exit 1",
+                        "model checks skipped (f32,bf16)"], failures
+
+    runner, _ = fake_runner({})
+    text, ok = mtp.parity_impl(8, ["f32"], 4, download=lambda: "/w",
+                               runner=runner)
+    assert ok and text.splitlines()[-1] == "parity result: PASS", text
+    runner, _ = fake_runner({"tok": 2})
+    text, ok = mtp.parity_impl(8, ["f32"], 4, download=lambda: "/w",
+                               runner=runner)
+    assert not ok and text.splitlines()[-1] == (
+        "parity result: FAIL (tokenizer-only check exit 2; model checks "
+        "skipped (f32))"), text
+
+    def broken():
+        raise OSError("no network")
+    text, ok = mtp.parity_impl(8, ["f32"], 4, download=broken, runner=runner)
+    assert not ok and "OSError: no network" in text, text
+    assert text.endswith("parity result: FAIL (weight download failed)"), text
+
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as d:
+        with contextlib.redirect_stdout(io.StringIO()):
+            path = mtp.finish("all good\nparity result: PASS", True,
+                              results_dir=d)
+        assert path.read_text().endswith("PASS"), path
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mtp.finish(text, False, results_dir=Path(d) / "f")
+        except SystemExit as e:
+            msg = str(e)
+            assert msg.startswith("parity result: FAIL (weight download "
+                                  "failed) (log: "), msg
+            assert "\n" not in msg, msg
+        else:
+            raise AssertionError("finish() did not exit on failure")
+        logs = list((Path(d) / "f").glob("text_parity_*.log"))
+        assert len(logs) == 1 and logs[0].read_text() == text, logs
+    print("    modal_text_parity: exit codes aggregated, tokenizer failure "
+          "skips model checks, download failure reported, log written "
+          "before exit 1")
 
 
 # === add new @case functions above this line ===============================
