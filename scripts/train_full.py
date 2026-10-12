@@ -9,6 +9,18 @@ across the devices exactly like the base params (nothing but scalars is
 replicated); the forward runs in bfloat16 from a per-step cast of the master
 weights.
 
+Data (scripts/cache_latents.py, format krea2-latents-v1; see
+krea2_jax/data.py::BucketDataset): aspect-bucketed VAE latents plus the raw
+long/medium/short captions (and artist names) of metadata.parquet. Captions
+are drawn per epoch (--caption-probs, --artist-prob), tokenized by the
+loader, and encoded ONLINE inside the jitted step by the JAX Qwen3-VL text
+tower (krea2_jax/qwen3_text.py; bf16, replicated on every device, no
+gradient). Every sample occupies a static --img-tokens image rows (its
+h_tok x w_tok grid first, zero padding after); padded rows are masked out of
+attention and of the loss, which is the per-sample mean squared error over
+the valid image tokens, averaged over the batch. The timestep shift mu is
+derived per sample from its image-token count (or --timestep-mu for all).
+
 Outputs under --output-dir:
     ckpt/<step>/                   orbax train state (params, opt_state, ema)
     model_stepNNNNNN.safetensors   bf16 official-layout export (--export-every)
@@ -19,13 +31,16 @@ usable with scripts/sample.py --base-ckpt, the official code and ComfyUI.
 Usage:
     python scripts/train_full.py \
         --base-ckpt /path/to/raw.safetensors \
-        --cache-dir ./cache --output-dir ./full_out \
-        --steps 20000 --batch-size 32 --lr 1e-5
+        --data-dir /scratch/krea2-data \
+        --text-encoder Qwen/Qwen3-VL-4B-Instruct \
+        --output-dir ./full_out --steps 20000 --batch-size 32 --lr 1e-5
 """
 
 import argparse
 import dataclasses
 import json
+import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -34,8 +49,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from jax.sharding import NamedSharding, PartitionSpec as P
+
+from safetensors import safe_open
 
 from krea2_jax import fullft_ckpt
 from krea2_jax.checkpoint import (
@@ -46,9 +64,19 @@ from krea2_jax.checkpoint import (
     save_krea2_params,
 )
 from krea2_jax.config import KREA2_CONFIG
-from krea2_jax.data import BatchLoader, CachedDataset
-from krea2_jax.model import build_positions_and_mask, dit_forward, patchify
+from krea2_jax.data import BucketBatchLoader, BucketDataset
+from krea2_jax.model import build_positions_and_mask_bucketed, dit_forward
+from krea2_jax.qwen3_text import (
+    from_hf_config,
+    load_qwen3_text_params,
+    load_tokenizer,
+    param_count as text_param_count,
+    resolve_text_encoder,
+    text_encoder_identity,
+    text_states,
+)
 from krea2_jax.sampling import shift_time
+from krea2_jax.text_template import CaptionTemplate
 
 
 # ---------------------------------------------------------------------------
@@ -145,19 +173,26 @@ def check_opt_state_sharding(opt_state, params):
 # Changing any of these mid-run silently changes the data order, the RNG
 # stream, the training objective or the train-state shape: hard error.
 RESUME_HARD_KEYS = (
-    "seed", "batch_size", "txt_len", "resolution", "n_samples",
-    "dataset_fingerprint", "base_ckpt", "model_config", "timestep_mu",
-    "logit_mean", "logit_std",
+    "seed", "batch_size", "text_rows", "img_tokens", "caption_probs",
+    "artist_prob", "n_samples", "dataset_fingerprint", "lat_channels",
+    "base_ckpt", "model_config", "text_model_config", "position_mode",
+    "timestep_mu", "logit_mean", "logit_std", "text_encoder_id",
 )
 # Changing these is legitimate (e.g. extending a run) but changes the
 # optimizer / LR schedule from the resumed step on: warning.
+# text_encoder is only the --text-encoder name (a local dir's basename or
+# the HF id as given), so the same weights under another name must not be
+# fatal; what the encoder IS (tokenizer.json bytes, resolved text config,
+# sha256 of the loaded weight files' contents) is the hard key text_encoder_id
+# (qwen3_text.text_encoder_identity, path independent).
 RESUME_SOFT_KEYS = (
     "steps", "lr", "warmup_steps", "cosine_decay", "min_lr", "weight_decay",
     "beta1", "beta2", "eps", "grad_clip", "ema_decay", "act_sharding", "attn",
+    "text_encoder",
 )
-# Soft keys that only change how the step is computed (same math up to
-# kernel rounding), not the optimizer or LR schedule.
-_COMPUTE_SOFT_KEYS = ("act_sharding", "attn")
+# Soft keys that do not touch the optimizer or LR schedule (same math up to
+# kernel rounding, or a name only).
+_COMPUTE_SOFT_KEYS = ("act_sharding", "attn", "text_encoder")
 
 
 def check_resume_config(saved, current, step):
@@ -257,44 +292,94 @@ def act_sharding_for(hp, mesh):
     return batch_sharding(mesh) if hp.act_sharding == "on" else None
 
 
-def make_train_step(cfg, hp, mesh, tx, mu, h_tok, w_tok, use_ema, pshard,
-                    opt_shard):
-    """The jitted full fine-tuning step.
+def per_sample_mu(cfg, n_img, mu_override=None):
+    """(B,) f32 timestep-shift mu: cfg.mu_for_seq_len of each sample's image
+    token count n_img (B,) (it is linear in the count, so it vectorizes), or
+    mu_override for every sample."""
+    if mu_override is not None:
+        return jnp.full(n_img.shape, mu_override, dtype=jnp.float32)
+    return jnp.asarray(cfg.mu_for_seq_len(n_img.astype(jnp.float32)),
+                       dtype=jnp.float32)
 
-    Returns train_step(params, opt_state, ema, lat, txt, mask, key) ->
-    (params, opt_state, ema, {"loss", "grad_norm"}); params/opt_state/ema
-    are donated and come back with shardings pshard/opt_shard/pshard (ema
-    is None when use_ema is False). hp is the argparse namespace; fields
-    used: logit_mean, logit_std, qchunk, attn, attn_block, remat_policy,
-    ema_decay, act_sharding. Shared by train_full.main, scripts/
-    aot_analysis.py (abstract shapes) and scripts/bench_step.py.
+
+def masked_flow_loss(v, target, n_img):
+    """Flow-matching loss over bucketed image rows.
+
+    v, target: (B, img_tokens, feat); n_img: (B,) valid rows per sample.
+    loss = mean_b [ sum_{i < n_img[b], f} (v - target)[b, i, f]^2
+                    / (n_img[b] * feat) ],
+    i.e. a per-sample mean over its valid tokens and all features, then a
+    batch mean (each sample weighs the same whatever its bucket). Rows
+    i >= n_img[b] are selected away (jnp.where) BEFORE squaring, so they
+    contribute neither to the loss nor to its gradient, even when they hold
+    inf/NaN (selecting after the square would send 0 * inf = NaN cotangents
+    back through the padded rows). Equals the plain mean of the squared
+    error when no sample is padded."""
+    valid = jnp.arange(v.shape[1])[None, :] < n_img[:, None]
+    err = jnp.where(valid[..., None], v.astype(jnp.float32) - target, 0.0)
+    se = jnp.sum(jnp.square(err), axis=-1)
+    denom = jnp.maximum(n_img, 1).astype(jnp.float32) * v.shape[-1]
+    return jnp.mean(jnp.sum(se, axis=1) / denom)
+
+
+def make_train_step(cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
+                    img_tokens, mu_override=None):
+    """The jitted full fine-tuning step (bucketed data, online text encoder).
+
+    Returns train_step(params, opt_state, ema, txt_params, img, hw, ids,
+    txt_len, key) -> (params, opt_state, ema, {"loss", "grad_norm"}) with
+    the batch of BucketBatchLoader: img (B, img_tokens, C*p*p) patchified
+    latent tokens (rows >= h*w are padding), hw (B, 2) (h_tok, w_tok), ids
+    (B, prefix_len + text_rows) and txt_len (B,) from CaptionTemplate.
+    txt_params is the text tower (qwen3_text, normally bf16 + replicated);
+    it is NOT donated and gets no gradient: text_states runs before the
+    loss, outside value_and_grad. params/opt_state/ema are donated and come
+    back with shardings pshard/opt_shard/pshard (ema is None when use_ema is
+    False). Timestep shift: per-sample mu from h*w (per_sample_mu) unless
+    mu_override. Loss: masked_flow_loss. hp is the argparse namespace;
+    fields used: logit_mean, logit_std, qchunk, attn, attn_block,
+    remat_policy, ema_decay, act_sharding. Shared by train_full.main,
+    scripts/aot_analysis.py (abstract shapes) and scripts/bench_step.py.
     """
     remat = REMAT_MODES[hp.remat_policy]
     decay = hp.ema_decay
     act = act_sharding_for(hp, mesh)
 
-    def step_fn(params, opt_state, ema, batch_lat, batch_txt, batch_mask, key):
-        B = batch_lat.shape[0]
+    def step_fn(params, opt_state, ema, txt_params, img, hw, ids, txt_len,
+                key):
+        B = img.shape[0]
+        if img.shape[1] != img_tokens:
+            raise ValueError(f"img has {img.shape[1]} rows, expected "
+                             f"img_tokens {img_tokens}")
         k_t, k_noise = jax.random.split(key)
 
-        x0 = patchify(batch_lat, cfg.patch).astype(jnp.float32)
+        # online text encoder: frozen, no gradient (outside loss_fn)
+        context, txt_mask = text_states(txt_params, txt_cfg, ids, txt_len)
+        context = context.astype(jnp.bfloat16)
+        if act is not None:
+            context = jax.lax.with_sharding_constraint(context, act)
+
+        hw = hw.astype(jnp.int32)
+        n_img = hw[:, 0] * hw[:, 1]
+        mu = per_sample_mu(cfg, n_img, mu_override)
+        x0 = img.astype(jnp.float32)  # already patchified on the host
         u = hp.logit_mean + hp.logit_std * jax.random.normal(k_t, (B,))
         t = shift_time(jax.nn.sigmoid(u), mu)
         noise = jax.random.normal(k_noise, x0.shape, dtype=jnp.float32)
         tt = t[:, None, None]
         xt = ((1.0 - tt) * x0 + tt * noise).astype(jnp.bfloat16)
         target = noise - x0
-        pos, mask = build_positions_and_mask(batch_mask, h_tok, w_tok)
+        pos, mask = build_positions_and_mask_bucketed(txt_mask, hw, img_tokens)
 
         def loss_fn(params):
             p16 = jax.tree.map(lambda a: a.astype(jnp.bfloat16), params)
             v = dit_forward(
-                p16, cfg, xt, batch_txt.astype(jnp.bfloat16), t, pos, mask,
+                p16, cfg, xt, context, t, pos, mask,
                 lora=None, qchunk=hp.qchunk, remat=remat,
                 attn_impl=hp.attn, attn_mesh=mesh, attn_block=hp.attn_block,
                 act_sharding=act,
             )
-            return jnp.mean((v.astype(jnp.float32) - target) ** 2)
+            return masked_flow_loss(v, target, n_img)
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
         grad_norm = optax.global_norm(grads)
@@ -314,8 +399,31 @@ def make_train_step(cfg, hp, mesh, tx, mu, h_tok, w_tok, use_ema, pshard,
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base-ckpt", required=True, help="raw.safetensors path")
-    ap.add_argument("--cache-dir", required=True,
-                    help="cache written by scripts/cache_dataset.py")
+    ap.add_argument("--data-dir", required=True,
+                    help="krea2-latents-v1 dataset dir written by "
+                         "scripts/cache_latents.py (metadata.parquet + "
+                         "latents/)")
+    ap.add_argument("--text-encoder", required=True,
+                    help="Qwen3-VL text encoder: a local HF model dir or an "
+                         "HF repo id (e.g. Qwen/Qwen3-VL-4B-Instruct; only "
+                         "config, tokenizer and safetensors are fetched). "
+                         "Runs online in the train step, bf16, replicated")
+    ap.add_argument("--text-rows", type=int, default=256,
+                    help="caption + suffix rows handed to the DiT (captions "
+                         "are truncated to text_rows - 5 tokens)")
+    ap.add_argument("--img-tokens", type=int, default=4096,
+                    help="static image-token rows per sample; every bucket's "
+                         "h_tok * w_tok must fit (rest is masked padding)")
+    ap.add_argument("--caption-probs", default="0.5,0.3,0.2",
+                    help="probabilities of the long,medium,short caption, "
+                         "drawn per sample per epoch")
+    ap.add_argument("--artist-prob", type=float, default=0.5,
+                    help="probability of appending ', drawn by <artist>' "
+                         "(never for an empty artist_name)")
+    ap.add_argument("--text-model-config", default=None,
+                    help="JSON object of Qwen3TextConfig overrides applied on "
+                         "top of the encoder's config.json (tests / tiny "
+                         "models, e.g. '{\"select_layers\": [0, 1, 2]}')")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--steps", type=int, default=10000)
     ap.add_argument("--batch-size", type=int, default=8,
@@ -334,12 +442,16 @@ def parse_args(argv=None):
     ap.add_argument("--ema-decay", type=float, default=0.999,
                     help="EMA of the fp32 weights (exported instead of the "
                          "raw params); 0 disables it and saves 4 B/param")
-    ap.add_argument("--txt-len", default="auto", help='"auto" or an int (<=512)')
     ap.add_argument("--timestep-mu", type=float, default=None,
-                    help="override the resolution-derived timestep shift")
+                    help="use this timestep shift for every sample instead of "
+                         "the per-sample one derived from its image-token "
+                         "count")
     ap.add_argument("--logit-mean", type=float, default=0.0)
     ap.add_argument("--logit-std", type=float, default=1.0)
-    ap.add_argument("--qchunk", type=int, default=512)
+    ap.add_argument("--qchunk", type=int, default=256,
+                    help="ref attention query chunk; must divide the padded "
+                         "sequence (4096 + 256 = 4352 = 17 x 256), else ref "
+                         "falls back to dense attention")
     ap.add_argument("--attn", choices=["ref", "splash", "aiter", "cudnn"],
                     default="ref",
                     help="exact fp32-softmax reference attention, the fused "
@@ -374,13 +486,25 @@ def parse_args(argv=None):
     ap.add_argument("--resume", action="store_true",
                     help="continue from the newest checkpoint in "
                          "--output-dir/ckpt (starts fresh if there is none)")
+    ap.add_argument("--resume-step", type=int, default=None,
+                    help="resume from this checkpoint step instead of the "
+                         "newest; implies --resume. Newer step directories "
+                         "are renamed to <step>.superseded so they no longer "
+                         "shadow the resumed run")
     ap.add_argument("--export-every", type=int, default=0,
                     help="also write model_stepNNNNNN.safetensors every N "
                          "steps (0: export only at the end)")
+    ap.add_argument("--verify-latents", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="re-hash every latent shard at startup and refuse "
+                         "the run if any differs from its manifest digest "
+                         "(rebuilt or transfer-corrupted cache); reads the "
+                         "whole cache once. --no-verify-latents trusts the "
+                         "manifest")
     ap.add_argument("--prefetch", type=int, default=4,
                     help="batches buffered by the background loader")
     ap.add_argument("--loader-workers", type=int, default=4,
-                    help="threads reading cache files")
+                    help="threads reading + patchifying latents")
     ap.add_argument("--model-config", default=None,
                     help="JSON object of Krea2Config field overrides (tests / "
                          "debugging with tiny models; default: the real "
@@ -388,8 +512,78 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+CMD_BUFFER_FLAG = "--xla_gpu_enable_command_buffer="
+
+
+def _command_buffer_flag(xla_flags):
+    """Value of the last --xla_gpu_enable_command_buffer= token in an
+    XLA_FLAGS string (XLA lets the last occurrence win), or None if absent."""
+    vals = [t[len(CMD_BUFFER_FLAG):] for t in (xla_flags or "").split()
+            if t.startswith(CMD_BUFFER_FLAG)]
+    return vals[-1] if vals else None
+
+
+def command_buffers_disabled(xla_flags):
+    """True iff XLA_FLAGS disables every HIP/CUDA command buffer type, i.e.
+    its last --xla_gpu_enable_command_buffer= token has an empty value."""
+    return _command_buffer_flag(xla_flags) == ""
+
+
+def _export_metadata(path):
+    """The safetensors __metadata__ dict of an export ({} when it has none);
+    raises if the file is unreadable."""
+    with safe_open(str(path), framework="numpy") as f:
+        return f.metadata() or {}
+
+
+def parse_caption_probs(text):
+    """'0.5,0.3,0.2' -> (0.5, 0.3, 0.2) (long, medium, short); BucketDataset
+    validates the values."""
+    try:
+        probs = tuple(float(x) for x in str(text).split(","))
+    except ValueError:
+        probs = ()
+    if len(probs) != 3:
+        raise SystemExit(f"--caption-probs must be three comma-separated "
+                         f"numbers (long,medium,short), got {text!r}")
+    return probs
+
+
+def resolution_metadata(config, img_tokens=None):
+    """The resolution fields of an export's metadata: bucketed runs record
+    {"resolution": "bucketed", "img_tokens": N}; a run config from the older
+    fixed-resolution path keeps its "resolution"; none known -> "unknown"."""
+    config = config or {}
+    if config.get("img_tokens") is not None:
+        img_tokens = config["img_tokens"]
+    elif config.get("resolution") is not None:
+        return {"resolution": str(config["resolution"])}
+    if img_tokens is None:
+        return {"resolution": "unknown"}
+    return {"resolution": "bucketed", "img_tokens": str(int(img_tokens))}
+
+
+def _unreadable_step(step, ckpt_dir, e):
+    return SystemExit(
+        f"checkpoint step {step} in {ckpt_dir} is incomplete or unreadable "
+        f"({e!r}); pass --resume-step <older step> "
+        f"(available: {fullft_ckpt.all_steps(str(ckpt_dir))})"
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
+    xla_flags = os.environ.get("XLA_FLAGS", "")
+    if (args.attn == "aiter" and jax.default_backend() in ("gpu", "rocm")
+            and not command_buffers_disabled(xla_flags)):
+        val = _command_buffer_flag(xla_flags)
+        raise SystemExit(
+            "--attn aiter needs XLA_FLAGS=--xla_gpu_enable_command_buffer= "
+            "(HIP command buffers break the aiter FFI kernels: "
+            "HIP_ERROR_StreamCaptureInvalidated); set it before launching"
+            + (f" (XLA_FLAGS has {CMD_BUFFER_FLAG}{val})" if val is not None
+               else "")
+        )
 
     cfg = KREA2_CONFIG
     if args.model_config:
@@ -402,7 +596,46 @@ def main(argv=None):
         raise SystemExit("--ema-decay must be in [0, 1)")
 
     resume_step = None
-    if ckpt_dir.exists():
+    saved_meta = None  # meta of resume_step, read once it is known
+    renames = []  # --resume-step: (src, dst) pairs, performed after validation
+    if args.resume_step is not None:
+        args.resume = True
+        steps = fullft_ckpt.all_steps(str(ckpt_dir))
+        if args.resume_step not in steps:
+            raise SystemExit(
+                f"--resume-step {args.resume_step}: no such checkpoint in "
+                f"{ckpt_dir} (available: {steps})"
+            )
+        resume_step = args.resume_step
+        # validate everything before renaming anything: the selected step
+        # must be readable and no rename target may exist
+        try:
+            saved_meta = fullft_ckpt.read_meta_at(str(ckpt_dir), resume_step)
+        except Exception as e:
+            raise _unreadable_step(resume_step, ckpt_dir, e) from e
+        renames = [(ckpt_dir / str(s), ckpt_dir / f"{s}.superseded")
+                   for s in steps if s > resume_step]
+        # a final export newer than the resumed step (or of unknown step)
+        # would otherwise pass for this run's result
+        final = out_dir / "model.safetensors"
+        if final.exists():
+            try:
+                exp_step = int(_export_metadata(final)["step"])
+            except Exception:
+                exp_step = None
+            if exp_step is None or exp_step > resume_step:
+                renames.append((final, out_dir / "model.safetensors.superseded"))
+        clash = [str(dst) for _, dst in renames if os.path.lexists(dst)]
+        if clash:
+            raise SystemExit(
+                f"--resume-step {resume_step}: cannot set the newer "
+                "checkpoints aside, these rename targets already exist: "
+                + ", ".join(clash) + "; move them out of the way first "
+                "(nothing was renamed)"
+            )
+        # nothing is renamed yet: that happens once the run configuration
+        # has been checked against the checkpoint (do_renames below)
+    elif ckpt_dir.exists():
         resume_step = fullft_ckpt.latest_step(str(ckpt_dir))
     if resume_step is not None and not args.resume:
         raise SystemExit(
@@ -411,10 +644,81 @@ def main(argv=None):
         )
     if args.resume and resume_step is None:
         print(f"no checkpoint in {ckpt_dir}; starting fresh")
+
+    def do_renames():
+        # before make_manager opens the dir: orbax enumerates steps at open
+        for src, dst in renames:
+            os.rename(src, dst)
+            print(f"--resume-step {resume_step}: renamed newer "
+                  f"{'checkpoint' if src.parent == ckpt_dir else 'export'} "
+                  f"{src} -> {dst}", flush=True)
     if resume_step is not None and resume_step >= args.steps:
-        raise SystemExit(
-            f"checkpoint step {resume_step} >= --steps {args.steps}; nothing to do"
+        # no run-config check here (it needs the dataset and changes nothing
+        # in the exported weights): set newer steps aside and export
+        do_renames()
+        final = out_dir / "model.safetensors"
+        source = "ema" if use_ema else "params"
+        if final.exists():
+            try:
+                emeta = _export_metadata(final)
+                exported_step = emeta.get("step")
+                exported_src = emeta.get("source")
+                why = (f"it is from step {exported_step}" if exported_step
+                       and exported_step != str(resume_step) else
+                       "it records no step" if not exported_step else
+                       f"it is the {exported_src} export, {source} requested"
+                       if exported_src != source else None)
+            except Exception as e:
+                why = f"it is unreadable ({e!r})"
+            if why is None:
+                print(f"checkpoint step {resume_step} >= --steps {args.steps}; "
+                      "nothing to do")
+                return
+            print(f"checkpoint step {resume_step} >= --steps; training is "
+                  f"complete but {final} is stale ({why}): re-exporting "
+                  f"step {resume_step}", flush=True)
+        else:
+            # the run finished training but died before/while exporting
+            print(f"checkpoint step {resume_step} >= --steps; training is "
+                  "complete but model.safetensors is missing: exporting it "
+                  "now", flush=True)
+        # export the checkpoint on the host (no mesh, no base load) and stop;
+        # provenance comes from the checkpoint's own run config
+        meta = saved_meta
+        if meta is None:
+            try:
+                meta = fullft_ckpt.read_meta_at(str(ckpt_dir), resume_step)
+            except Exception as e:
+                raise _unreadable_step(resume_step, ckpt_dir, e) from e
+        if use_ema and not meta.get("has_ema", False):
+            raise SystemExit(
+                f"checkpoint step {resume_step} has no EMA weights (saved with "
+                "EMA disabled) but the restore target expects one; rerun "
+                "with --ema-decay 0 to export its params"
+            )
+        # needs neither the dataset nor the text encoder: provenance comes
+        # from the checkpoint's own run config
+        config = meta.get("config") or {}
+        base_name = config.get("base_ckpt") or Path(args.base_ckpt).name
+        t_exp = time.time()
+        try:
+            tree, _ = fullft_ckpt.restore_tree_on_host(
+                str(ckpt_dir), step=resume_step, item=source
+            )
+        except Exception as e:
+            raise _unreadable_step(resume_step, ckpt_dir, e) from e
+        save_krea2_params(
+            str(final), tree, dtype=jnp.bfloat16,
+            metadata={
+                "step": str(resume_step),
+                "base": base_name,
+                **resolution_metadata(config),
+                "source": source,
+            },
         )
+        print(f"exported {final} ({source}, bf16) "
+              f"in {time.time() - t_exp:.0f}s")
+        return
 
     mesh = make_mesh()
     n_dev = mesh.size
@@ -422,23 +726,68 @@ def main(argv=None):
     if args.batch_size % n_dev != 0:
         raise SystemExit(f"--batch-size must be divisible by {n_dev} devices")
 
+    # --- text encoder config + tokenizer (the weights load further down) ---
+    te_dir = resolve_text_encoder(args.text_encoder)
+    te_name = (Path(args.text_encoder).resolve().name
+               if Path(args.text_encoder).is_dir() else args.text_encoder)
+    txt_overrides = (json.loads(args.text_model_config)
+                     if args.text_model_config else {})
+    txt_cfg = from_hf_config(te_dir, **txt_overrides)
+    t_id, te_stats = time.time(), {}
+    te_id = text_encoder_identity(te_dir, txt_cfg, stats=te_stats)
+    print(f"text encoder identity {te_id[:12]} (hashed "
+          f"{te_stats['bytes'] / 2**30:.2f} GiB in {time.time() - t_id:.1f} s)")
+    template = CaptionTemplate(load_tokenizer(te_dir), text_rows=args.text_rows)
+    problems = []
+    if txt_cfg.prefix_len != template.prefix_len:
+        problems.append(f"prefix_len {txt_cfg.prefix_len} != the tokenizer's "
+                        f"template prefix {template.prefix_len}")
+    if txt_cfg.hidden_size != cfg.txtdim:
+        problems.append(f"hidden_size {txt_cfg.hidden_size} != DiT txtdim "
+                        f"{cfg.txtdim}")
+    if len(txt_cfg.select_layers) != cfg.txtlayers:
+        problems.append(f"{len(txt_cfg.select_layers)} select_layers != DiT "
+                        f"txtlayers {cfg.txtlayers}")
+    if problems:
+        raise SystemExit(f"--text-encoder {args.text_encoder} does not fit "
+                         "the model: " + "; ".join(problems))
+
     # --- data ---
-    txt_len = args.txt_len if args.txt_len == "auto" else int(args.txt_len)
-    dataset = CachedDataset(args.cache_dir, txt_len)
-    lat_h, lat_w = dataset.lat_hw
-    lat_c = dataset[0][0].shape[0]
-    if lat_c != cfg.channels:
-        raise SystemExit(f"cache latents have {lat_c} channels, model expects "
-                         f"{cfg.channels}")
+    caption_probs = parse_caption_probs(args.caption_probs)
+    try:
+        dataset = BucketDataset(
+            args.data_dir, template, img_tokens=args.img_tokens,
+            patch=cfg.patch, caption_probs=caption_probs,
+            artist_prob=args.artist_prob, verify_digests=args.verify_latents,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        raise SystemExit(f"--data-dir {args.data_dir}: {e}") from e
+    if args.verify_latents:
+        print(f"latents verified: {dataset.verified_shards} shards, "
+              f"{dataset.verified_bytes / 2**30:.2f} GiB in "
+              f"{dataset.verify_seconds:.1f} s")
+    else:
+        print("latents NOT verified (--no-verify-latents): trusting the "
+              "manifest digests")
+    if dataset.lat_channels != cfg.channels:
+        raise SystemExit(f"dataset latents have {dataset.lat_channels} "
+                         f"channels, model expects {cfg.channels}")
     if dataset.n < args.batch_size:
         raise SystemExit(f"{dataset.n} samples < --batch-size {args.batch_size}")
-    h_tok, w_tok = lat_h // cfg.patch, lat_w // cfg.patch
-    img_seq = h_tok * w_tok
-    mu = args.timestep_mu if args.timestep_mu is not None else cfg.mu_for_seq_len(img_seq)
-    res = dataset.resolution
+    n_img = dataset.hw[:, 0].astype(np.int64) * dataset.hw[:, 1]
+    if args.timestep_mu is not None:
+        mu_desc = f"mu {args.timestep_mu:.4f} (--timestep-mu, all samples)"
+    else:
+        mu_desc = (f"mu {cfg.mu_for_seq_len(int(n_img.min())):.4f}.."
+                   f"{cfg.mu_for_seq_len(int(n_img.max())):.4f} (per sample)")
+    buckets = dataset.buckets()
+    top = sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
     print(
-        f"dataset: {dataset.n} samples @ {res}px (latent {lat_h}x{lat_w}, "
-        f"{img_seq} tokens, txt_len {dataset.txt_len}, mu {mu:.4f})"
+        f"dataset: {dataset.n} samples in {len(buckets)} buckets (top: "
+        + ", ".join(f"{w}x{h} x{c}" for (w, h), c in top)
+        + f"); img tokens {int(n_img.min())}..{int(n_img.max())} padded to "
+        f"{args.img_tokens}; text_rows {args.text_rows} (prefix "
+        f"{template.prefix_len}); {mu_desc}"
     )
 
     # --- run configuration (stored with every checkpoint, checked on resume) ---
@@ -456,23 +805,37 @@ def main(argv=None):
         "eps": args.eps,
         "grad_clip": args.grad_clip,
         "ema_decay": args.ema_decay,
-        "txt_len": int(dataset.txt_len),
-        "resolution": res,
+        "text_rows": int(args.text_rows),
+        "img_tokens": int(args.img_tokens),
+        "caption_probs": list(dataset.caption_probs),
+        "artist_prob": float(dataset.artist_prob),
         "n_samples": int(dataset.n),
         "dataset_fingerprint": dataset.fingerprint(),
+        "lat_channels": int(dataset.lat_channels),
         "base_ckpt": Path(args.base_ckpt).name,
         "model_config": json.loads(args.model_config) if args.model_config else None,
-        "timestep_mu": float(mu),
+        "text_encoder": te_name,
+        "text_encoder_id": te_id,
+        "text_model_config": txt_overrides or None,
+        "position_mode": txt_cfg.position_mode,
+        "timestep_mu": (float(args.timestep_mu)
+                        if args.timestep_mu is not None else None),
         "logit_mean": args.logit_mean,
         "logit_std": args.logit_std,
         "act_sharding": args.act_sharding,
         "attn": args.attn,
     }
-    manager = fullft_ckpt.make_manager(str(ckpt_dir), max_to_keep=args.keep)
     if resume_step is not None:
-        # before the (slow) base load: fail fast on an incompatible resume
-        saved_meta = fullft_ckpt.read_meta(manager, resume_step)
+        # before the (slow) base load and before --resume-step renames
+        # anything: fail fast on an incompatible resume
+        if saved_meta is None:
+            try:
+                saved_meta = fullft_ckpt.read_meta_at(str(ckpt_dir), resume_step)
+            except Exception as e:
+                raise _unreadable_step(resume_step, ckpt_dir, e) from e
         check_resume_config(saved_meta.get("config"), run_config, resume_step)
+        do_renames()
+    manager = fullft_ckpt.make_manager(str(ckpt_dir), max_to_keep=args.keep)
 
     # --- model: fp32 master weights, FSDP-sharded ---
     print("loading base checkpoint as fp32 (this can take a few minutes)...")
@@ -532,9 +895,21 @@ def main(argv=None):
     n_checked = check_opt_state_sharding(opt_state, params)
     print(f"optimizer state: {n_checked} non-scalar leaves sharded like params")
 
+    # --- text encoder weights: bf16, replicated, frozen ---
+    print(f"loading text encoder {te_name} (bf16, replicated)...")
+    t0 = time.time()
+    txt_params = load_qwen3_text_params(te_dir, jnp.bfloat16, mesh=mesh,
+                                        cfg=txt_cfg)
+    n_txt = text_param_count(txt_params)
+    print(f"text encoder loaded in {time.time() - t0:.0f}s: {n_txt / 1e9:.3f}B "
+          f"params ({txt_cfg.n_run_layers}/{txt_cfg.num_layers} layers, "
+          f"select_layers {list(txt_cfg.select_layers)}, position_mode "
+          f"{txt_cfg.position_mode}), {n_txt * 2 / 2**30:.2f} GiB/device")
+
     data_sharding = batch_sharding(mesh)
     train_step = make_train_step(
-        cfg, args, mesh, tx, mu, h_tok, w_tok, use_ema, pshard, opt_shard
+        cfg, args, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
+        args.img_tokens, mu_override=args.timestep_mu,
     )
 
     last_saved = start_step if resume_step is not None else None
@@ -560,7 +935,7 @@ def main(argv=None):
             metadata={
                 "step": str(step),
                 "base": Path(args.base_ckpt).name,
-                "resolution": str(res),
+                **resolution_metadata(None, args.img_tokens),
                 "source": source,
             },
         )
@@ -569,23 +944,51 @@ def main(argv=None):
 
     # --- loop ---
     rng = jax.random.PRNGKey(args.seed)
-    loader = BatchLoader(
+    loader = BucketBatchLoader(
         dataset, args.batch_size, args.seed, start_step=start_step,
         prefetch=args.prefetch, workers=args.loader_workers,
     )
     batches = iter(loader)
     ema_loss, t_log, n_log = None, time.time(), 0
     t_train, last_step = time.time(), start_step
+
+    # SIGTERM (preemption notice) / SIGINT: finish the current step, then
+    # save + export + exit 0 like --max-hours; a second signal aborts hard
+    # (the operator sees "<SIG> received; stopping at step N" within a step)
+    stop = {"sig": None}
+
+    def on_signal(signum, frame):
+        if stop["sig"] is not None:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        # flag only: no I/O in the handler (a print here can raise a
+        # reentrant-call or broken-pipe error into the main thread); the
+        # loop acknowledges the signal within one step
+        stop["sig"] = signal.Signals(signum).name
+
+    def log(msg):
+        # best effort: a broken stdout must never skip save(last_step)
+        try:
+            print(msg, flush=True)
+        except (OSError, ValueError):
+            pass
+
+    prev_handlers = {
+        sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)
+    }
     try:
         for step in range(start_step + 1, args.steps + 1):
-            lat_np, txt_np, mask_np = next(batches)
-            batch_lat = jax.device_put(lat_np, data_sharding)
-            batch_txt = jax.device_put(txt_np, data_sharding)
-            batch_mask = jax.device_put(mask_np, data_sharding)
+            img_np, hw_np, ids_np, tl_np = next(batches)
+            b_img = jax.device_put(img_np, data_sharding)
+            b_hw = jax.device_put(hw_np, data_sharding)
+            b_ids = jax.device_put(ids_np, data_sharding)
+            b_tl = jax.device_put(tl_np, data_sharding)
             key = jax.random.fold_in(rng, step)
 
             params, opt_state, ema, metrics = train_step(
-                params, opt_state, ema, batch_lat, batch_txt, batch_mask, key
+                params, opt_state, ema, txt_params, b_img, b_hw, b_ids, b_tl,
+                key,
             )
             n_log += 1
             last_step = step
@@ -595,27 +998,41 @@ def main(argv=None):
                 gnorm = float(metrics["grad_norm"])
                 ema_loss = loss if ema_loss is None else 0.9 * ema_loss + 0.1 * loss
                 dt = time.time() - t_log
-                print(
+                log(
                     f"step {step:6d}/{args.steps}  loss {loss:.6f}  "
                     f"ema_loss {ema_loss:.6f}  gnorm {gnorm:.4f}  "
-                    f"lr {float(sched(step - 1)):.2e}  {dt / n_log:.2f}s/it",
-                    flush=True,
+                    f"lr {float(sched(step - 1)):.2e}  {dt / n_log:.2f}s/it"
                 )
                 t_log, n_log = time.time(), 0
+            # before the periodic save/export: the final save -> wait ->
+            # export below must run even if a periodic export would fail
+            if stop["sig"] is not None:
+                log(f"{stop['sig']} received; stopping at step {last_step} "
+                    "(resume with --resume)")
+                break
             if args.save_every and step % args.save_every == 0 and step < args.steps:
                 save(step)
             if args.export_every and step % args.export_every == 0 and step < args.steps:
                 export(step)
             if args.max_hours and time.time() - t_train > args.max_hours * 3600:
-                print(f"--max-hours {args.max_hours} reached; "
-                      f"stopping at step {last_step}")
+                log(f"--max-hours {args.max_hours} reached; "
+                    f"stopping at step {last_step}")
                 break
+
+        save(last_step)
+        # resumable state is on disk before the export can fail (ENOSPC etc.)
+        fullft_ckpt.wait(manager)
+        export(last_step, final=True)
     finally:
         loader.close()
-
-    save(last_step)
-    export(last_step, final=True)
-    fullft_ckpt.wait(manager)
+        try:
+            # a pending async save is dropped if the interpreter exits first
+            fullft_ckpt.wait(manager)
+        except Exception as e:  # never mask the original exception
+            print(f"WARNING: waiting for pending checkpoint writes failed: "
+                  f"{e!r}", file=sys.stderr, flush=True)
+        for sig, h in prev_handlers.items():
+            signal.signal(sig, h)
     print("done.")
 
 
