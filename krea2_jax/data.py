@@ -299,11 +299,15 @@ class BucketDataset:
     str(id)). Samples are ordered by `id` ascending; sample index i refers to
     `self.ids[i]`. Only safetensors headers are read at construction; every
     parquet id must have exactly one latent of the bucket's shape (and vice
-    versa), else ValueError listing every problem with counts.
+    versa), else ValueError listing every problem with counts. The manifest
+    must carry `digests` ({shard file: sha256}, written by
+    scripts/cache_latents.py --write-manifest) for every shard; they enter
+    `fingerprint()` (the shard bytes themselves are never hashed here).
 
     template: a text_template.CaptionTemplate (tokenizes captions per batch).
     img_tokens: static image-token rows per sample (h_tok * w_tok <= it).
-    caption_probs: probabilities of the long / medium / short caption.
+    caption_probs: probabilities of the long / medium / short caption
+    (must sum to 1 within 1e-6; stored normalized, p / sum).
     artist_prob: probability of appending ", drawn by {artist_name}" (never
     for an empty artist_name).
     """
@@ -323,7 +327,7 @@ class BucketDataset:
                 f"caption_probs must be {len(CAPTION_FIELDS)} non-negative "
                 f"probabilities (long, medium, short) summing to 1, got "
                 f"{caption_probs}")
-        self.caption_probs = tuple(float(x) for x in probs)
+        self.caption_probs = tuple(float(x) for x in probs / probs.sum())
         self.artist_prob = float(artist_prob)
         if not 0.0 <= self.artist_prob <= 1.0:
             raise ValueError(f"artist_prob must be in [0, 1], got {artist_prob}")
@@ -375,6 +379,15 @@ class BucketDataset:
                              f"{LATENT_FORMAT!r}")
         self.vae = self.manifest.get("vae")
         self.shards = [str(x) for x in self.manifest.get("shards", [])]
+        digests = self.manifest.get("digests")
+        if not isinstance(digests, dict):
+            raise ValueError(
+                f"{man_path} has no shard \"digests\" (older manifest): "
+                "rerun scripts/cache_latents.py --out <data-dir> "
+                "--write-manifest to record the sha256 of every shard")
+        self.digests = {name: str(digests[name]) for name in self.shards
+                        if name in digests}
+        no_digest = [name for name in self.shards if name not in digests]
         index = {int(x): j for j, x in enumerate(self.ids.tolist())}
         shard_of = np.full((self.n,), -1, dtype=np.int32)
         lat_shape = np.zeros((self.n, 3), dtype=np.int64)
@@ -410,6 +423,10 @@ class BucketDataset:
                     lat_shape[j] = shape
 
         problems = []
+        if no_digest:
+            problems.append(f"{len(no_digest)} manifest shards have no digest "
+                            f"({_examples(no_digest)}); rerun "
+                            "scripts/cache_latents.py --write-manifest")
         if missing_files:
             problems.append(f"{len(missing_files)} manifest shards missing "
                             f"on disk ({_examples(missing_files)})")
@@ -479,11 +496,13 @@ class BucketDataset:
 
     def fingerprint(self):
         """Hex sha256 of the sample manifest (ordered [id, bucket_w,
-        bucket_h, shard]), every caption field used (long, medium, short,
-        artist_name; hashed separately and included as `captions_sha256`)
-        and the preprocessing identity (format, vae, img_tokens, patch,
-        tokenizer template ids, text_rows, caption_probs, artist_prob).
-        Reads no latent; deterministic."""
+        bucket_h, shard]), the shard content digests from manifest.json
+        (sha256 of each shard file, so a rebuilt latent cache changes it),
+        every caption field used (long, medium, short, artist_name; hashed
+        separately and included as `captions_sha256`) and the preprocessing
+        identity (format, vae, img_tokens, patch, tokenizer template ids,
+        text_rows, normalized caption_probs, artist_prob). Reads no latent;
+        deterministic."""
         if self._fingerprint is not None:
             return self._fingerprint
         h = hashlib.sha256()
@@ -508,6 +527,7 @@ class BucketDataset:
                 self.ids.tolist(), self.bucket_wh.tolist(),
                 self.shard_of.tolist())],
             "captions_sha256": h.hexdigest(),
+            "shard_digests": {name: self.digests[name] for name in self.shards},
         }
         blob = json.dumps(ident, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=True)

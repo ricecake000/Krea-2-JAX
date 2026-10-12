@@ -5,6 +5,7 @@ offline, with the script's StubEncoder in place of the VAE.
 """
 
 import faulthandler
+import hashlib
 import io
 import json
 import shutil
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
+sys.path.insert(0, str(REPO / "tests"))
 
 import ml_dtypes  # noqa: E402,F401 - numpy-framework bf16 reads need it
 import numpy as np  # noqa: E402
@@ -259,6 +261,10 @@ def test_process_shard(src, out_dir):
           "truncated-file rewrite OK")
 
 
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def test_main_and_manifest(src, out):
     args = ["--tar-dir", str(src), "--out", str(out), "--vae-stub",
             "--device", "cpu", "--num-workers", "2", "--batch", "2",
@@ -277,10 +283,13 @@ def test_main_and_manifest(src, out):
     quiet(cl.main, ["--tar-dir", str(src), "--out", str(out),
                     "--write-manifest"])
     manifest = json.loads((lat / "manifest.json").read_text())
+    digests = manifest.pop("digests")
     assert manifest == {"format": "krea2-latents-v1", "vae": "stub",
                         "n": len(SAMPLES), "shards": [
                             "train-0000.safetensors",
                             "train-0001.safetensors"]}, manifest
+    assert digests == {name: sha256(lat / name)
+                       for name in manifest["shards"]}, digests
     assert ((out / "metadata.parquet").read_bytes()
             == (src / "metadata.parquet").read_bytes())
     ids = set()
@@ -328,6 +337,73 @@ def test_manifest_errors(src, out, tmp):
     assert not (broken / "latents/manifest.json").exists()
     print("  --write-manifest: missing id, extra latent, wrong shape, "
           "missing shard, duplicates all rejected OK")
+
+
+def test_manifest_digests(src, out, tmp):
+    """--write-manifest records shard sha256 digests; a rerun verifies them
+    (default when digests exist) and refuses changed shards unless
+    --no-verify-digests; BucketDataset's fingerprint follows the digests."""
+    from safetensors.numpy import load_file, save_file as np_save_file
+
+    from krea2_jax.data import BucketDataset
+    from krea2_jax.text_template import CaptionTemplate
+    from test_qwen3_text import make_tiny_tokenizer
+
+    d = tmp / "digests"
+    shutil.copytree(out, d)
+    lat = d / "latents"
+    mpath = lat / "manifest.json"
+    man0 = json.loads(mpath.read_text())
+
+    def run(*extra):
+        return cl.main(["--tar-dir", str(src), "--out", str(d),
+                        "--write-manifest", *extra])
+
+    _, log = quiet(run)  # unchanged shards: verified, same manifest
+    assert "digests verified: 2 shards match" in log, log
+    assert json.loads(mpath.read_text()) == man0
+    tmpl = CaptionTemplate(make_tiny_tokenizer(tmp / "tok"), text_rows=16)
+    fp0 = BucketDataset(d, tmpl).fingerprint()
+
+    # one latent value changed (as a rebuild with another VAE sample would)
+    shard = lat / "train-0000.safetensors"
+    meta, _ = read_shard(shard)
+    tensors = load_file(str(shard))
+    key = sorted(tensors)[0]
+    tensors[key] = tensors[key].copy()
+    tensors[key][0, 0, 0] = tensors[key][0, 0, 0] + BF16(1.0)
+    np_save_file(tensors, str(shard), metadata=meta)
+    expect_exit(run, "digest verification FAILED: 1 shards differ",
+                "train-0000.safetensors", "--no-verify-digests")
+    assert json.loads(mpath.read_text()) == man0  # left untouched
+    assert BucketDataset(d, tmpl).fingerprint() == fp0  # stale manifest
+    _, log = quiet(run, "--no-verify-digests")
+    assert "replaced without comparison" in log, log
+    man1 = json.loads(mpath.read_text())
+    assert man1["digests"]["train-0000.safetensors"] == sha256(shard)
+    assert man1["digests"]["train-0000.safetensors"] != man0["digests"][
+        "train-0000.safetensors"]
+    assert man1["digests"]["train-0001.safetensors"] == man0["digests"][
+        "train-0001.safetensors"]
+    assert BucketDataset(d, tmpl).fingerprint() != fp0
+    _, log = quiet(run)  # the new digests now verify
+    assert "digests verified: 2 shards match" in log, log
+
+    # an older manifest without digests: nothing to verify, digests added;
+    # --verify-digests with no manifest at all is fine too
+    m = dict(man1)
+    del m["digests"]
+    mpath.write_text(json.dumps(m))
+    _, log = quiet(run)
+    assert "digests verified" not in log, log
+    assert json.loads(mpath.read_text()) == man1
+    mpath.unlink()
+    _, log = quiet(run, "--verify-digests")
+    assert "nothing to verify" in log, log
+    assert json.loads(mpath.read_text()) == man1
+    print("  --write-manifest digests: recorded == sha256(file), verified on "
+          "rerun, changed shard refused (--no-verify-digests accepts), "
+          "fingerprint follows OK")
 
 
 def test_repo_download(src, tmp):
@@ -389,6 +465,7 @@ def main():
         test_process_shard(src, tmp / "direct")
         test_main_and_manifest(src, out)
         test_manifest_errors(src, out, tmp)
+        test_manifest_digests(src, out, tmp)
         test_repo_download(src, tmp)
     faulthandler.cancel_dump_traceback_later()
     print(f"ALL CACHE_LATENTS TESTS PASSED ({time.time() - t0:.1f}s)")

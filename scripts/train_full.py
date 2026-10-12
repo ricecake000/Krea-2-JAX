@@ -72,6 +72,7 @@ from krea2_jax.qwen3_text import (
     load_tokenizer,
     param_count as text_param_count,
     resolve_text_encoder,
+    text_encoder_identity,
     text_states,
 )
 from krea2_jax.sampling import shift_time
@@ -175,13 +176,15 @@ RESUME_HARD_KEYS = (
     "seed", "batch_size", "text_rows", "img_tokens", "caption_probs",
     "artist_prob", "n_samples", "dataset_fingerprint", "lat_channels",
     "base_ckpt", "model_config", "text_model_config", "position_mode",
-    "timestep_mu", "logit_mean", "logit_std",
+    "timestep_mu", "logit_mean", "logit_std", "text_encoder_id",
 )
 # Changing these is legitimate (e.g. extending a run) but changes the
 # optimizer / LR schedule from the resumed step on: warning.
 # text_encoder is only the --text-encoder name (a local dir's basename or
 # the HF id as given), so the same weights under another name must not be
-# fatal; its tokenizer is covered by dataset_fingerprint (template ids).
+# fatal; what the encoder IS (tokenizer.json bytes, resolved text config,
+# weight headers) is the hard key text_encoder_id
+# (qwen3_text.text_encoder_identity, path independent).
 RESUME_SOFT_KEYS = (
     "steps", "lr", "warmup_steps", "cosine_decay", "min_lr", "weight_decay",
     "beta1", "beta2", "eps", "grad_clip", "ema_decay", "act_sharding", "attn",
@@ -307,12 +310,14 @@ def masked_flow_loss(v, target, n_img):
                     / (n_img[b] * feat) ],
     i.e. a per-sample mean over its valid tokens and all features, then a
     batch mean (each sample weighs the same whatever its bucket). Rows
-    i >= n_img[b] are selected away (jnp.where), so they contribute neither
-    to the loss nor to its gradient. Equals the plain mean of the squared
+    i >= n_img[b] are selected away (jnp.where) BEFORE squaring, so they
+    contribute neither to the loss nor to its gradient, even when they hold
+    inf/NaN (selecting after the square would send 0 * inf = NaN cotangents
+    back through the padded rows). Equals the plain mean of the squared
     error when no sample is padded."""
     valid = jnp.arange(v.shape[1])[None, :] < n_img[:, None]
-    se = jnp.sum(jnp.square(v.astype(jnp.float32) - target), axis=-1)
-    se = jnp.where(valid, se, 0.0)
+    err = jnp.where(valid[..., None], v.astype(jnp.float32) - target, 0.0)
+    se = jnp.sum(jnp.square(err), axis=-1)
     denom = jnp.maximum(n_img, 1).astype(jnp.float32) * v.shape[-1]
     return jnp.mean(jnp.sum(se, axis=1) / denom)
 
@@ -718,6 +723,7 @@ def main(argv=None):
     txt_overrides = (json.loads(args.text_model_config)
                      if args.text_model_config else {})
     txt_cfg = from_hf_config(te_dir, **txt_overrides)
+    te_id = text_encoder_identity(te_dir, txt_cfg)
     template = CaptionTemplate(load_tokenizer(te_dir), text_rows=args.text_rows)
     problems = []
     if txt_cfg.prefix_len != template.prefix_len:
@@ -789,6 +795,7 @@ def main(argv=None):
         "base_ckpt": Path(args.base_ckpt).name,
         "model_config": json.loads(args.model_config) if args.model_config else None,
         "text_encoder": te_name,
+        "text_encoder_id": te_id,
         "text_model_config": txt_overrides or None,
         "position_mode": txt_cfg.position_mode,
         "timestep_mu": (float(args.timestep_mu)

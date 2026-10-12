@@ -15,8 +15,10 @@ carry padded image rows):
   d. the optimizer-state sharding guard accepts the sharded state and fires
      on a replicated one,
   e. --resume validates the run configuration: a different --seed or
-     --batch-size, or an edited caption in metadata.parquet (dataset
-     fingerprint), is a hard error, a different --lr warns and continues,
+     --batch-size, an edited caption in metadata.parquet (dataset
+     fingerprint), or a text encoder with different tokenizer.json bytes
+     (text_encoder_id) is a hard error; the same encoder copied to another
+     path resumes cleanly; a different --lr warns and continues,
   f. SIGTERM / SIGINT stop the run gracefully (checkpoint + export, exit 0)
      and --resume continues it exactly,
   g. --resume-step N resumes an older step and sets newer ones aside,
@@ -34,7 +36,8 @@ carry padded image rows):
   m. a padded sample's loss and gradients do not depend on the values in
      its padded image rows (direct make_train_step call: loss, grad norm,
      updated params and AdamW moments bitwise equal), while a valid row
-     does change them; masked_flow_loss matches its numpy formula,
+     does change them; masked_flow_loss matches its numpy formula and
+     keeps inf/NaN in padded rows out of the loss and its gradient,
   n. per-sample mu (from h*w) and a --timestep-mu override both train
      (unit + a short CLI run), and the run config records the new keys.
 
@@ -197,7 +200,17 @@ def check_step_padding_and_mu(cfg, mesh, params, pshard, tx, opt_state,
     assert mu.dtype == np.float32 and np.allclose(mu, ref, rtol=1e-6), (mu, ref)
     assert np.array_equal(np.asarray(train_full.per_sample_mu(cfg, n, 0.8)),
                           np.full(3, 0.8, np.float32))
-    print(f"m/n. masked_flow_loss == numpy formula; per_sample_mu {mu.round(4)} "
+    # padded rows holding inf / NaN: select-before-square keeps the loss and
+    # its gradient finite (loss 4 = 2^2 over the single valid row)
+    lg = jax.jit(jax.value_and_grad(
+        lambda v_: train_full.masked_flow_loss(v_, jnp.zeros_like(v_),
+                                               jnp.asarray([1], jnp.int32))))
+    for bad in (np.inf, np.nan):
+        lv, gv = lg(jnp.asarray([[[2.0], [bad]]], jnp.float32))
+        assert float(lv) == 4.0, (bad, lv)
+        assert np.array_equal(np.asarray(gv), [[[4.0], [0.0]]]), (bad, gv)
+    print(f"m/n. masked_flow_loss == numpy formula, inf/NaN padded rows give "
+          f"loss 4.0 and grad [4, 0]; per_sample_mu {mu.round(4)} "
           "== mu_for_seq_len per sample, override constant: ok")
 
     te = Path(TEXT_ENCODER)
@@ -383,6 +396,9 @@ def main():
         assert rc.get(k, "<missing>") == val, (k, rc.get(k, "<missing>"))
     assert "txt_len" not in rc and "resolution" not in rc, rc
     assert len(rc["dataset_fingerprint"]) == 64, rc
+    from krea2_jax.qwen3_text import from_hf_config, text_encoder_identity
+    assert rc["text_encoder_id"] == text_encoder_identity(
+        TEXT_ENCODER, from_hf_config(TEXT_ENCODER, **TEXT_OVERRIDES)), rc
     print("a. full fine-tuning lowers the loss; run config records the "
           "bucketed/text-encoder keys: ok")
 
@@ -536,6 +552,34 @@ def main():
     assert "resumed train state" not in proc.stdout
     print("  resume with one caption edited in metadata.parquet: refused "
           "(dataset_fingerprint mismatch)")
+    # text encoder identity: a tokenizer.json with other bytes (same tokens,
+    # so the dataset fingerprint is unchanged) is refused; the same encoder
+    # copied to another path (same basename) resumes without a warning
+    te_mod = shutil.copytree(TEXT_ENCODER, tmp / "te_modified" / "te")
+    tj = json.loads((te_mod / "tokenizer.json").read_text())
+    (te_mod / "tokenizer.json").write_text(json.dumps(tj, indent=1))
+    d = fresh_copy("badtokenizer")
+    proc = subprocess.run(
+        train_cmd(base, cache, d, ("--resume", "--text-encoder", str(te_mod))),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    err = proc.stderr
+    assert proc.returncode != 0, "resume with another tokenizer.json ran"
+    assert "different run configuration" in err, err[-2000:]
+    assert "text_encoder_id: checkpoint" in err, err[-2000:]
+    assert "dataset_fingerprint" not in err, err[-2000:]
+    assert "resumed train state" not in proc.stdout
+    print("  resume with a modified tokenizer.json: refused (text_encoder_id "
+          "mismatch)")
+    te_copy = shutil.copytree(TEXT_ENCODER, tmp / "te_elsewhere" / "te")
+    d = fresh_copy("copiedte")
+    stepsT, logT = run_train(base, cache, d,
+                             extra=("--resume", "--text-encoder", str(te_copy)))
+    assert "resumed train state" in logT and sorted(stepsT) == list(range(7, 13))
+    assert "WARNING" not in logT, logT
+    tdiffs = [abs(stepsT[k][0] - steps1[k][0]) for k in range(7, 13)]
+    assert max(tdiffs) <= 1e-5, tdiffs  # same encoder -> same run
+    print("  resume with the same encoder copied to another path: accepted")
     d = fresh_copy("newlr")
     steps3, log3 = run_train(base, cache, d, extra=("--resume", "--lr", "2e-3"))
     assert "WARNING: resuming step 6 with changed optimizer/schedule" in log3, log3

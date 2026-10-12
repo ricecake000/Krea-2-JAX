@@ -18,8 +18,16 @@ like-for-like; the other mode only changes the 5 suffix rows.
 Tokenizer checks (always; --tokenizer-only skips the models): prefix_len ==
 34, len(suffix_ids) == 5, pad = <|endoftext|>, and for EVERY caption variant
 in the parquet (long/medium/short, each with and without
-", drawn by {artist}") encode(PREFIX + cap) == prefix_ids + encode(cap)
-(the property CaptionTemplate relies on to match the conditioner).
+", drawn by {artist}") CaptionTemplate.encode_captions equals the
+conditioner's construction (encode(PREFIX + cap) truncated to prefix_len +
+max_caption_tokens, + suffix ids, + padding; txt_len = rows after the
+prefix). The "concat property" encode(PREFIX + cap) == prefix_ids +
+encode(cap) is only counted (informational): it fails where the caption's
+leading newline merges with the prefix's trailing one, which encode_captions
+handles by tokenizing the concatenation like the conditioner.
+
+Any non-finite value (reference state, JAX state on a valid row, or error
+metric) is a FAIL (exit 1) before the tolerance check.
 
     python scripts/text_encoder_parity.py --tokenizer-only \
         --text-encoder Qwen/Qwen3-VL-4B-Instruct --parquet metadata.parquet
@@ -89,22 +97,35 @@ def tokenizer_checks(model_dir, parquet, text_rows):
         return ok, t
     t0 = time.time()
     caps, tags = read_captions(parquet)
-    mism, lens = [], np.empty(len(caps), np.int64)
+    merged, mism, lens = [], [], np.empty(len(caps), np.int64)
+    pl, keep = t.prefix_len, t.prefix_len + t.max_caption_tokens
     chunk = 8192  # Encoding objects are heavy: bound host memory
     for s0 in range(0, len(caps), chunk):
         part = caps[s0:s0 + chunk]
         plain = tok.encode_batch(part)
         joined = tok.encode_batch([PREFIX + c for c in part])
-        for i, (a, b) in enumerate(zip(joined, plain), start=s0):
-            lens[i] = len(b.ids)
-            if a.ids != t.prefix_ids + b.ids:
-                mism.append(tags[i])
-        del plain, joined
+        ids, txt_len = t.encode_captions(part)
+        for i, (a, b) in enumerate(zip(joined, plain)):
+            full = list(a.ids)
+            lens[s0 + i] = len(full) - pl
+            if full != t.prefix_ids + list(b.ids):
+                merged.append(tags[s0 + i])
+            # the conditioner's layout, built independently
+            row = full[:keep] + t.suffix_ids
+            want = np.full((t.total_len,), t.pad_id, np.int32)
+            want[:len(row)] = row
+            if (not np.array_equal(ids[i], want)
+                    or int(txt_len[i]) != len(row) - pl):
+                mism.append(tags[s0 + i])
+        del plain, joined, ids, txt_len
     trunc = int((lens > t.max_caption_tokens).sum())
-    print(f"concat property: {len(mism)} mismatches over {len(caps)} caption "
-          f"variants ({time.time() - t0:.0f}s); tokens max {lens.max()}, "
-          f"mean {lens.mean():.1f}; {trunc} exceed max_caption_tokens "
-          f"{t.max_caption_tokens} (truncated)")
+    print(f"concat property (informational): {len(merged)} of {len(caps)} "
+          f"caption variants tokenize differently after PREFIX (boundary "
+          f"merge){': e.g. ' + ', '.join(merged[:5]) if merged else ''}")
+    print(f"encode_captions == conditioner layout: {len(mism)} mismatches "
+          f"over {len(caps)} caption variants ({time.time() - t0:.0f}s); "
+          f"caption tokens max {lens.max()}, mean {lens.mean():.1f}; {trunc} "
+          f"exceed max_caption_tokens {t.max_caption_tokens} (truncated)")
     if mism:
         print(f"FAIL: first mismatches: {mism[:10]}")
         ok = False
@@ -178,7 +199,7 @@ def run_reference(args, model_dir, tmpl, captions, select_layers, tmp):
     return out_path
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--text-encoder", default="Qwen/Qwen3-VL-4B-Instruct",
                     help="local dir or HF repo id")
@@ -206,7 +227,7 @@ def main():
     ap.add_argument("--tokenizer-only", action="store_true")
     ap.add_argument("--torch-phase-in", help=argparse.SUPPRESS)
     ap.add_argument("--torch-phase-out", help=argparse.SUPPRESS)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.torch_phase_in:
         torch_phase(args)
@@ -245,6 +266,12 @@ def main():
             tf_version = (f.metadata() or {}).get("transformers", "?")
             refs = [(f.get_tensor(f"h{b}"), f.get_tensor(f"m{b}").astype(bool))
                     for b in range(len(captions))]
+        bad_ref = [b for b, (h, _) in enumerate(refs)
+                   if not np.isfinite(h.astype(np.float32)).all()]
+        if bad_ref:
+            print(f"FAIL: non-finite reference states for captions "
+                  f"{bad_ref[:10]}")
+            sys.exit(1)
         tf5 = int(tf_version.split(".")[0]) >= 5 if tf_version != "?" else True
         mode = args.position_mode
         if mode == "auto":
@@ -267,6 +294,7 @@ def main():
         se = np.zeros((S, 2))
         sr = np.zeros((S, 2))
         worst = []
+        nonfinite = []
         t0 = time.time()
         for s0 in range(0, len(captions), args.batch):
             sl_b = slice(s0, s0 + args.batch)
@@ -286,6 +314,8 @@ def main():
                                      f"{int(hm.sum())}, jax {int(m[j].sum())},"
                                      f" txt_len {n})")
                 a, r = st[j, :n], h.astype(np.float32)
+                if not np.isfinite(a).all():
+                    nonfinite.append(b)
                 d = a - r
                 for k, rows in ((0, slice(0, n - sl)), (1, slice(n - sl, n))):
                     dk, rk = d[rows], r[rows]
@@ -295,6 +325,10 @@ def main():
                         sr[:, k] += (rk.astype(np.float64) ** 2).sum(axis=(0, 2))
                 worst.append((float(np.linalg.norm(d) / np.linalg.norm(r)), b))
         print(f"[jax] forward {time.time() - t0:.0f}s")
+        if nonfinite:
+            print(f"FAIL: non-finite JAX states on valid rows for captions "
+                  f"{nonfinite[:10]}")
+            sys.exit(1)
         rel = np.sqrt(se / np.maximum(sr, 1e-30))
         rel_all = np.sqrt(se.sum(1) / np.maximum(sr.sum(1), 1e-30))
         print(f"{'layer':>6} {'max_abs cap':>12} {'max_abs suf':>12} "
@@ -305,6 +339,10 @@ def main():
         for j, i in enumerate(select):
             print(f"{i:>6} {mx[j, 0]:>12.4g} {mx[j, 1]:>12.4g} {rel[j, 0]:>10.3e} "
                   f"{rel[j, 1]:>10.3e} {rel_all[j]:>10.3e} {rms[j]:>10.4g}")
+        if not all(np.isfinite(x).all() for x in (mx, rel, rel_all, rms)) \
+                or not all(np.isfinite(e) for e, _ in worst):
+            print("FAIL: non-finite error metrics")
+            sys.exit(1)
         worst.sort(reverse=True)
         print("worst captions (rel-norm, index): "
               + ", ".join(f"{e:.3e}@{b}" for e, b in worst[:5]))

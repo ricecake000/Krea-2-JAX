@@ -60,12 +60,12 @@ REAL_TEXT_CONFIG = {
 # ---------------------------------------------------------------------------
 
 
-def make_tiny_tokenizer(out_dir, vocab_size=600):
+def make_tiny_tokenizer(out_dir, vocab_size=600, extra_corpus=()):
     """Train a tiny byte-level BPE (Qwen pre-tokenizer, NFC) on a few strings
-    with the special tokens <|endoftext|> <|im_start|> <|im_end|>; writes
-    tokenizer.json + tokenizer_config.json (loadable by transformers'
-    AutoTokenizer, pad = <|endoftext|>) into out_dir. Returns the
-    `tokenizers.Tokenizer`. Deterministic."""
+    (plus `extra_corpus`) with the special tokens <|endoftext|> <|im_start|>
+    <|im_end|>; writes tokenizer.json + tokenizer_config.json (loadable by
+    transformers' AutoTokenizer, pad = <|endoftext|>) into out_dir. Returns
+    the `tokenizers.Tokenizer`. Deterministic."""
     from tokenizers import Regex, Tokenizer, decoders, models, normalizers
     from tokenizers import pre_tokenizers, trainers
 
@@ -82,7 +82,7 @@ def make_tiny_tokenizer(out_dir, vocab_size=600):
         vocab_size=vocab_size, special_tokens=SPECIAL_TOKENS,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=False)
-    corpus = [PREFIX, SUFFIX] + TINY_CAPTIONS[:-1] * 3
+    corpus = [PREFIX, SUFFIX] + TINY_CAPTIONS[:-1] * 3 + list(extra_corpus)
     tok.train_from_iterator(corpus, trainer=trainer)
     tok.save(str(out_dir / "tokenizer.json"))
     (out_dir / "tokenizer_config.json").write_text(json.dumps({
@@ -250,7 +250,8 @@ def test_tiny_dir_and_loader(tmp):
     assert cfg.num_layers == 2 and cfg.hidden_size == 64
     assert cfg.n_run_layers == 2 and cfg.needs_final_norm
     tok = tmpl.tokenizer
-    # the tiny tokenizer has the concat property the template relies on
+    # no boundary merge for these captions (encode_captions does not rely on
+    # it: it tokenizes PREFIX + caption like the conditioner)
     for c in TINY_CAPTIONS:
         assert tok.encode(PREFIX + c).ids == tmpl.prefix_ids + tok.encode(c).ids
     raw = load_file(str(d / "model.safetensors"))
@@ -277,6 +278,160 @@ def test_tiny_dir_and_loader(tmp):
     print(f"  tiny dir + loader OK (vocab {cfg.vocab_size}, prefix "
           f"{cfg.prefix_len}, suffix {cfg.suffix_len})")
     return d, cfg
+
+
+def test_text_encoder_identity(d, cfg, tmp):
+    """text_encoder_identity: path independent; changes with a weight's
+    header dtype/shape, tokenizer.json bytes or the resolved config; ignores
+    weight files the loader does not read (vision tower)."""
+    import dataclasses
+    import shutil
+
+    from safetensors.numpy import load_file, save_file
+
+    from krea2_jax.qwen3_text import from_hf_config, text_encoder_identity
+
+    tmp = Path(tmp) / "ident"
+    ident = text_encoder_identity(d, cfg)
+    assert isinstance(ident, str) and len(ident) == 64
+    assert text_encoder_identity(d, cfg) == ident
+    # the same encoder copied elsewhere under another name: same identity
+    other = shutil.copytree(d, tmp / "elsewhere" / "another_name")
+    ocfg = from_hf_config(other, select_layers=cfg.select_layers,
+                          position_mode=cfg.position_mode)
+    assert ocfg == cfg
+    assert text_encoder_identity(other, ocfg) == ident
+
+    def variant(name, edit):
+        v = shutil.copytree(d, tmp / name)
+        edit(v)
+        return text_encoder_identity(v, cfg)
+
+    q = "model.language_model.layers.0.self_attn.q_norm.weight"
+
+    def retype(v):  # one used tensor stored as f16 instead of f32
+        w = load_file(str(v / "model.safetensors"))
+        w[q] = w[q].astype(np.float16)
+        save_file(w, str(v / "model.safetensors"), metadata={"format": "pt"})
+
+    def reshape(v):  # same bytes, another shape
+        w = load_file(str(v / "model.safetensors"))
+        w[q] = w[q].reshape(1, -1)
+        save_file(w, str(v / "model.safetensors"), metadata={"format": "pt"})
+
+    def retok(v):  # same tokens, different tokenizer.json bytes
+        j = json.loads((v / "tokenizer.json").read_text())
+        (v / "tokenizer.json").write_text(json.dumps(j, indent=1))
+
+    def vision(v):  # a weight file holding only unused (vision) tensors
+        save_file({"model.visual.patch_embed.proj.weight":
+                   np.ones((4, 3), np.float32)},
+                  str(v / "model-visual.safetensors"))
+
+    changed = {
+        "dtype": variant("dtype", retype),
+        "shape": variant("shape", reshape),
+        "tokenizer.json": variant("tok", retok),
+        "select_layers": text_encoder_identity(
+            d, dataclasses.replace(cfg, select_layers=(0, 1))),
+        "position_mode": text_encoder_identity(
+            d, dataclasses.replace(cfg, position_mode="padded")),
+    }
+    for what, x in changed.items():
+        assert x != ident, f"{what} did not change the identity"
+    assert len(set(changed.values())) == len(changed)
+    assert variant("vision", vision) == ident
+    print("  text_encoder_identity: path independent; dtype/shape/tokenizer/"
+          "select_layers/position_mode change it; unused weight files do "
+          "not")
+
+
+def _parity_main(d, cfg, tmp, mutate_ref=False, mutate_jax=False):
+    """Run scripts/text_encoder_parity.py main() on the tiny encoder with
+    mocked I/O: captions instead of a parquet, and the reference phase
+    replaced by the JAX text tower itself (so an unmutated run is exact).
+    Returns (exit code, stdout)."""
+    import contextlib
+    import io
+
+    import jax
+    import jax.numpy as jnp
+    from safetensors.numpy import save_file
+
+    import krea2_jax.qwen3_text as q
+
+    sys.path.insert(0, str(REPO / "scripts"))
+    import text_encoder_parity as par
+
+    real_ts = q.text_states
+
+    def fake_reference(args, model_dir, tmpl, captions, select_layers, tdir):
+        c = q.from_hf_config(model_dir, select_layers=select_layers,
+                             prefix_len=tmpl.prefix_len,
+                             suffix_len=len(tmpl.suffix_ids),
+                             position_mode="padded", normed_last_hidden=True)
+        params = q.load_qwen3_text_params(model_dir, jnp.float32, cfg=c)
+        ids, tl = tmpl.encode_captions(captions)
+        st, m = jax.jit(real_ts, static_argnums=1)(params, c, ids, tl)
+        st, m = np.asarray(st), np.asarray(m)
+        out = {}
+        for b in range(len(captions)):
+            h = st[b][m[b]]
+            if mutate_ref and b == 1:
+                h = h.copy()
+                h[0, 0, 0] = np.nan
+            out[f"h{b}"], out[f"m{b}"] = h, m[b].astype(np.uint8)
+        path = Path(tdir) / "ref.safetensors"
+        save_file(out, str(path), metadata={"transformers": "5.0.0"})
+        return path
+
+    def nan_states(params, c, ids, txt_len):
+        st, m = real_ts(params, c, ids, txt_len)
+        return jnp.full_like(st, jnp.nan), m
+
+    tags = [f"tiny:{i}" for i in range(len(TINY_CAPTIONS))]
+    patches = [
+        (par, "run_reference", fake_reference),
+        (par, "pick_captions", lambda parquet, n, seed: TINY_CAPTIONS[:n]),
+        (par, "read_captions", lambda parquet: (list(TINY_CAPTIONS), tags)),
+        (par, "QWEN3_PREFIX_LEN", cfg.prefix_len),
+        (par, "QWEN3_SUFFIX_LEN", cfg.suffix_len),
+    ]
+    if mutate_jax:
+        patches.append((q, "text_states", nan_states))
+    saved = [(m, k, getattr(m, k)) for m, k, _ in patches]
+    buf = io.StringIO()
+    code = 0
+    try:
+        for m, k, v in patches:
+            setattr(m, k, v)
+        with contextlib.redirect_stdout(buf):
+            try:
+                par.main(["--text-encoder", str(d), "--parquet", "unused",
+                          "--n", str(len(TINY_CAPTIONS)), "--dtype", "f32",
+                          "--select-layers",
+                          ",".join(map(str, cfg.select_layers)),
+                          "--text-rows", "24", "--batch", "2"])
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 1
+    finally:
+        for m, k, v in saved:
+            setattr(m, k, v)
+    return code, buf.getvalue()
+
+
+def test_parity_script_nonfinite(d, cfg, tmp):
+    """text_encoder_parity.py fails on non-finite states instead of passing
+    a NaN rel-norm through the tolerance check."""
+    code, out = _parity_main(d, cfg, tmp)
+    assert code == 0 and "-> PASS" in out, out
+    assert "encode_captions == conditioner layout: 0 mismatches" in out, out
+    code, out = _parity_main(d, cfg, tmp, mutate_jax=True)
+    assert code != 0 and "FAIL: non-finite JAX states" in out, out
+    code, out = _parity_main(d, cfg, tmp, mutate_ref=True)
+    assert code != 0 and "FAIL: non-finite reference states" in out, out
+    print("  text_encoder_parity.py: exact tiny run PASS; NaN JAX states / "
+          "NaN reference -> exit 1")
 
 
 def test_padding_invariance(d, cfg):
@@ -563,6 +718,10 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         print("test_tiny_dir_and_loader")
         d, cfg = test_tiny_dir_and_loader(tmp)
+        print("test_text_encoder_identity")
+        test_text_encoder_identity(d, cfg, tmp)
+        print("test_parity_script_nonfinite")
+        test_parity_script_nonfinite(d, cfg, tmp)
         print("test_padding_invariance")
         test_padding_invariance(d, cfg)
         print("test_bf16_close")

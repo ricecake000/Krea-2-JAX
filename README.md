@@ -311,7 +311,7 @@ and `scripts/parity_full.py --attn aiter` before training with it.
 <data-dir>/
   metadata.parquet              # verbatim copy of the dataset's parquet: id, long/medium/short
                                 # captions, artist_name, bucket_w/bucket_h, tar, ...
-  latents/manifest.json         # {"format": "krea2-latents-v1", "vae", "n", "shards"}
+  latents/manifest.json         # {"format": "krea2-latents-v1", "vae", "n", "shards", "digests"}
   latents/train-XXXX.safetensors  # one per source tar: "<id>" -> (16, bucket_h/8, bucket_w/8) bf16,
                                   # VAE-normalized like cache_dataset.py
 ```
@@ -322,8 +322,14 @@ tar of the HF dataset (private: set `HF_TOKEN`; `--repo` defaults to
 `ricecake/danbooru-curated-v2`, `--tar-dir` reads local tars instead),
 VAE-encodes it per bucket, writes the shard atomically and deletes the tar
 (`--keep-tars` keeps it). One process per GPU over interleaved shards, then
-a manifest pass that copies the parquet and checks every id has exactly one
-latent of its bucket's shape:
+a manifest pass that copies the parquet, checks every id has exactly one
+latent of its bucket's shape and records the sha256 of every shard file in
+`manifest.json` (`"digests"`; this reads all ~49 GB once). The trainer
+requires the digests (an older manifest without them is refused with a
+pointer to `--write-manifest`) and folds them into the dataset fingerprint.
+Rerunning the manifest pass over a manifest that already has digests
+re-hashes and fails if any shard changed; `--no-verify-digests` accepts the
+new content:
 
 ```bash
 OUT=/scratch/krea2-data
@@ -518,8 +524,10 @@ Stopping, time budget and resuming:
 Node-local disk is wiped between leases, so copy `ckpt/<step>` off the node
 after each finalized save and copy it back before `--resume`. Build the
 latent cache once and transfer it rather than rebuilding it per lease: the
-VAE posterior sample is unseeded, so a rebuild changes the latents while
-keeping the same fingerprint. A rerun that only needs the final export
+VAE posterior sample is unseeded, so a rebuild changes the latents, its
+manifest pass records different shard digests, and `--resume` refuses it
+(dataset fingerprint mismatch) unless the digests match the original
+cache's. A rerun that only needs the final export
 (checkpoint step >= `--steps`) reads neither the dataset nor the text
 encoder.
 
@@ -548,10 +556,13 @@ size `--keep` to your disk.
 Every checkpoint records the run configuration, and `--resume` validates it
 against the current flags. Changing `--seed`, `--batch-size`,
 `--text-rows`, `--img-tokens`, `--caption-probs`, `--artist-prob`, the
-dataset (fingerprint over ids, buckets, shards, every caption and artist
-name, the VAE id and the tokenizer's template ids; sample count; latent
-channels), the base checkpoint name, `--model-config`,
-`--text-model-config`, the text encoder's position mode, `--timestep-mu`,
+dataset (fingerprint over ids, buckets, shards and their sha256 digests,
+every caption and artist name, the VAE id, the tokenizer's template ids and
+the normalized caption probabilities; sample count; latent channels), the
+base checkpoint name, `--model-config`, `--text-model-config`, the text
+encoder's identity (`text_encoder_id`: sha256 of tokenizer.json, the
+resolved text config and the safetensors headers of the loaded language-model
+weights; path independent) and position mode, `--timestep-mu`,
 `--logit-mean/--logit-std` or turning the EMA on/off is a hard error: those
 would silently change the data order, captions, RNG, objective or
 train-state shape. Changing `--steps`, `--lr`, `--warmup-steps`,

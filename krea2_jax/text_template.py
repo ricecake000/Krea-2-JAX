@@ -1,19 +1,27 @@
 """Qwen3-VL conditioner prompt template, shared by the data loader and the
 JAX text encoder (and matching scripts/cache_dataset.py's TextEncoder).
 
-The official Qwen3VLConditioner feeds the encoder
-    PREFIX + caption + SUFFIX
-and keeps the hidden states from the first caption token onward, i.e. rows
-[len(prefix_ids):] = caption tokens, then the SUFFIX tokens. Padding tokens
-are masked as keys and get no RoPE position (HF derives positions from the
-attention mask), so the valid rows do not depend on how much padding follows
-them; we therefore lay every sample out as
-    [prefix | caption (<= text_rows - len(suffix)) | suffix | pad ...]
+The official Qwen3VLConditioner tokenizes `PREFIX + caption` as ONE string
+(truncated to PREFIX_IDX + max caption tokens), appends the SUFFIX tokens
+after the padding, and keeps the hidden states from row PREFIX_IDX
+(= len(prefix_ids)) onward. Padding tokens are masked as keys and get no
+RoPE position (HF derives positions from the attention mask), so the valid
+rows do not depend on how much padding follows them; we therefore lay every
+sample out as
+    [encode(PREFIX + caption)[:prefix_len + max_caption_tokens] | suffix | pad ...]
 with a static total length len(prefix_ids) + text_rows.
 
-`encode_captions` truncates captions from the END (same as the tokenizer's
-`truncation=True` on PREFIX + caption in cache_dataset.py) so that caption +
-suffix fits in `text_rows` rows.
+`encode_captions` builds exactly that: the caption tokens are
+`encode(PREFIX + caption).ids[prefix_len:]`, the same slice the conditioner
+takes at PREFIX_IDX. This is NOT always `encode(caption)`: the byte-level
+pre-tokenizer can merge across the boundary (a caption starting with "\n",
+or whitespace then "\n", merges with the PREFIX's trailing "\n" into one
+token, e.g. "\n\n"), in which case the last of the first prefix_len ids
+differs from `prefix_ids` and the caption part loses its leading newline
+token. Tokenizing the concatenation reproduces the
+conditioner in that case too, so no "concat property" is assumed. Captions
+are truncated from the END (same as `truncation=True` in cache_dataset.py)
+so that caption + suffix fits in `text_rows` rows.
 """
 
 import numpy as np
@@ -71,17 +79,27 @@ class CaptionTemplate:
     def encode_captions(self, captions):
         """captions: list of str -> (ids (B, total_len) int32,
         txt_len (B,) int32 = caption tokens + suffix tokens, i.e. the number
-        of valid rows after the prefix). Captions longer than
-        max_caption_tokens are truncated from the end."""
-        encs = self.tokenizer.encode_batch(list(captions))
+        of valid rows after the prefix).
+
+        Tokenizes PREFIX + caption together (one encode_batch) and keeps the
+        first prefix_len + max_caption_tokens ids, i.e. the caption tokens
+        are the conditioner's slice `[prefix_len:]` truncated from the end;
+        then the suffix ids and padding (see the module docstring for the
+        boundary-merge case, where the prefix ids differ from prefix_ids)."""
+        encs = self.tokenizer.encode_batch([PREFIX + c for c in captions])
         B = len(encs)
+        pl, keep = self.prefix_len, self.prefix_len + self.max_caption_tokens
         ids = np.full((B, self.total_len), self.pad_id, dtype=np.int32)
         txt_len = np.zeros((B,), dtype=np.int32)
         for b, e in enumerate(encs):
-            cap = list(e.ids)[:self.max_caption_tokens]
-            row = self.prefix_ids + cap + self.suffix_ids
+            full = list(e.ids)
+            if len(full) < pl:
+                raise ValueError(
+                    f"caption {b}: PREFIX + caption tokenizes to {len(full)} "
+                    f"ids, fewer than the {pl} prefix ids")
+            row = full[:keep] + self.suffix_ids
             ids[b, :len(row)] = row
-            txt_len[b] = len(cap) + len(self.suffix_ids)
+            txt_len[b] = len(row) - pl
         return ids, txt_len
 
     def valid_mask(self, txt_len):

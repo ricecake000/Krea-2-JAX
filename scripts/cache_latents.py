@@ -10,7 +10,7 @@ exactly like cache_dataset.VaeEncoder) as bf16.
 
 Output (<out>):
     metadata.parquet                    verbatim copy (--write-manifest pass)
-    latents/manifest.json               {"format", "vae", "n", "shards"} (--write-manifest pass)
+    latents/manifest.json               {"format", "vae", "n", "shards", "digests"} (--write-manifest pass)
     latents/train-XXXX.safetensors      one per source tar; "<id>" -> (16, bucket_h/8, bucket_w/8)
                                         bf16; metadata {format, vae, source, count}
 
@@ -18,6 +18,14 @@ Shard files are written atomically (tmp + os.replace); a shard whose output
 already opens with the right format/vae/source/count is skipped, so any run
 can simply be restarted. Downloaded tars are deleted once their shard is
 written (node disks are small and ephemeral) unless --keep-tars.
+
+The --write-manifest pass also records the sha256 of every shard file
+("digests": {"train-0000.safetensors": "<hex>", ...}); the trainer's dataset
+fingerprint includes them, so a rebuilt cache (the VAE posterior sample is
+unseeded) is refused on --resume unless its bytes are identical. Cost: every
+shard is read once (~49 GB for the full dataset; streaming, 1 MB chunks).
+When the existing manifest already has digests, the pass re-hashes and fails
+on any mismatch (--no-verify-digests accepts the new content).
 
 Usage (one process per GPU, then one manifest pass):
     for i in $(seq 0 7); do
@@ -28,6 +36,7 @@ Usage (one process per GPU, then one manifest pass):
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -370,16 +379,86 @@ def verify_latents(cols, scan):
     return len(seen), vae
 
 
-def write_manifest(out_dir, parquet_src, log=print):
-    """Verify every shard against `parquet_src`, then copy the parquet to
-    out/metadata.parquet and write out/latents/manifest.json (atomic)."""
+def file_sha256(path, chunk=1 << 20):
+    """Hex sha256 of a file's bytes, streamed in `chunk`-byte reads."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def shard_digests(lat_dir, names, log=print):
+    """{name: sha256 of latents/<name>} (reads every shard once)."""
+    out, t0, nbytes = {}, time.time(), 0
+    for k, name in enumerate(names):
+        path = Path(lat_dir) / name
+        out[name] = file_sha256(path)
+        nbytes += path.stat().st_size
+        if (k + 1) % 10 == 0 or k + 1 == len(names):
+            dt = max(time.time() - t0, 1e-9)
+            log(f"hashed {k + 1}/{len(names)} shards ({nbytes / 1e9:.1f} GB, "
+                f"{nbytes / 1e6 / dt:.0f} MB/s)")
+    return out
+
+
+def check_digests(old, new):
+    """Raise SystemExit if a shard in both `old` and `new` has a different
+    digest. Returns (n_compared, added names, removed names)."""
+    changed = sorted(k for k in old.keys() & new.keys() if old[k] != new[k])
+    if changed:
+        raise SystemExit(
+            f"digest verification FAILED: {len(changed)} shards differ from "
+            f"the existing manifest, e.g. {changed[:5]} (rebuilt or corrupted "
+            "latents: a run resumed on them would see different data). Pass "
+            "--no-verify-digests to accept the new content.")
+    return (len(old.keys() & new.keys()), sorted(new.keys() - old.keys()),
+            sorted(old.keys() - new.keys()))
+
+
+def write_manifest(out_dir, parquet_src, log=print, verify_digests=None):
+    """Verify every shard against `parquet_src`, hash every shard file
+    (sha256), then copy the parquet to out/metadata.parquet and write
+    out/latents/manifest.json (atomic) with the digests.
+
+    verify_digests: None (default) = verify when the existing manifest has
+    digests; True = verify (an existing manifest without digests is only
+    reported); False = skip. Verification fails (SystemExit) when a shard's
+    new digest differs from the recorded one; the manifest is then left
+    untouched."""
     out_dir = Path(out_dir)
     lat_dir = out_dir / "latents"
+    mpath = lat_dir / "manifest.json"
     cols = read_metadata(parquet_src)
     names = sorted({shard_name(t) for t in cols["tar"]})
     t0 = time.time()
     scan = scan_shards(lat_dir, names)
     n, vae = verify_latents(cols, scan)
+    old_digests = None
+    if mpath.exists():
+        try:
+            old_digests = json.loads(mpath.read_text()).get("digests")
+        except (OSError, ValueError, AttributeError):
+            old_digests = None
+    digests = shard_digests(lat_dir, names, log=log)
+    if verify_digests is None:
+        verify_digests = isinstance(old_digests, dict)
+    if verify_digests:
+        if isinstance(old_digests, dict):
+            same, added, removed = check_digests(old_digests, digests)
+            log(f"digests verified: {same} shards match the existing "
+                f"manifest" + (f"; {len(added)} new ({added[:5]})"
+                               if added else "")
+                + (f"; {len(removed)} no longer listed ({removed[:5]})"
+                   if removed else ""))
+        else:
+            log("no digests in an existing manifest: nothing to verify")
+    elif isinstance(old_digests, dict):
+        log("WARNING: --no-verify-digests: existing digests are replaced "
+            "without comparison")
     stray = sorted(p.name for p in lat_dir.glob("*.safetensors")
                    if p.name not in set(names))
     if stray:
@@ -390,8 +469,8 @@ def write_manifest(out_dir, parquet_src, log=print):
         tmp = dst.with_name(dst.name + ".tmp")
         shutil.copyfile(parquet_src, tmp)
         os.replace(tmp, dst)
-    manifest = {"format": FORMAT, "vae": vae, "n": n, "shards": names}
-    mpath = lat_dir / "manifest.json"
+    manifest = {"format": FORMAT, "vae": vae, "n": n, "shards": names,
+                "digests": digests}
     tmp = mpath.with_name(mpath.name + ".tmp")
     tmp.write_text(json.dumps(manifest, indent=2))
     os.replace(tmp, mpath)
@@ -466,7 +545,13 @@ def build_parser():
     ap.add_argument("--write-manifest", action="store_true",
                     help="final pass (no encoder): verify all shards against "
                          "the parquet, copy metadata.parquet into --out, "
-                         "write latents/manifest.json")
+                         "write latents/manifest.json with the sha256 of "
+                         "every shard (reads all shards once, ~49 GB)")
+    ap.add_argument("--verify-digests", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="with --write-manifest: re-hash and fail if a shard "
+                         "differs from the digest in the existing manifest; "
+                         "default: on when the existing manifest has digests")
     ap.add_argument("--vae-stub", action="store_true",
                     help=argparse.SUPPRESS)  # tests: StubEncoder, vae "stub"
     return ap
@@ -496,7 +581,7 @@ def main(argv=None):
             raise SystemExit(f"{parquet} not found")
 
     if args.write_manifest:
-        write_manifest(out_dir, parquet)
+        write_manifest(out_dir, parquet, verify_digests=args.verify_digests)
         if remote and args.download_dir is None and not args.keep_tars:
             shutil.rmtree(dl_dir, ignore_errors=True)
         return

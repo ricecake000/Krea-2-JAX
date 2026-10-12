@@ -90,7 +90,9 @@ def make_fake_latent_cache(data_dir, rows, lat_channels=4, seed=0,
     defaults). metadata.parquet holds all S1 columns with rows in a "rank"
     order that differs from id order; latents/<tar stem>.safetensors hold
     bf16 (lat_channels, bucket_h // 8, bucket_w // 8) tensors keyed by
-    str(id) (values from default_rng([seed, id])), plus manifest.json.
+    str(id) (values from default_rng([seed, id])), plus manifest.json
+    with the sha256 "digests" of every shard file (as
+    scripts/cache_latents.py --write-manifest records them).
     Returns {id: latent}.
     """
     import pyarrow as pa
@@ -150,7 +152,24 @@ def make_fake_latent_cache(data_dir, rows, lat_channels=4, seed=0,
     (data_dir / "latents" / "manifest.json").write_text(json.dumps({
         "format": LATENT_SHARD_META, "vae": vae, "n": n,
         "shards": sorted(names)}))
+    refresh_digests(data_dir)
     return latents
+
+
+def file_sha256(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def refresh_digests(data_dir):
+    """Recompute manifest.json "digests" from the shard files on disk (what
+    a --write-manifest rerun records)."""
+    mpath = Path(data_dir) / "latents" / "manifest.json"
+    m = json.loads(mpath.read_text())
+    m["digests"] = {name: file_sha256(Path(data_dir) / "latents" / name)
+                    for name in m["shards"]}
+    mpath.write_text(json.dumps(m))
+    return m
 
 
 def loader_threads():
@@ -583,12 +602,32 @@ def test_bucket_validation(root, template):
     expect_error(root / "v_fmt", "manifest n=7 but the shards hold 6")
     m["n"], m["shards"] = 6, m["shards"] + ["train-0009.safetensors"]
     (root / "v_fmt/latents/manifest.json").write_text(json.dumps(m))
-    expect_error(root / "v_fmt", "1 manifest shards missing")
+    expect_error(root / "v_fmt", "1 manifest shards missing",
+                 "1 manifest shards have no digest (train-0009.safetensors)")
+    # an older manifest without digests is refused with a pointer
+    m = json.loads((base / "latents/manifest.json").read_text())
+    assert set(m["digests"]) == set(m["shards"]), m
+    for name, dg in m["digests"].items():
+        assert dg == file_sha256(base / "latents" / name), name
+    shutil.copytree(base, root / "v_nodig")
+    del m["digests"]
+    (root / "v_nodig/latents/manifest.json").write_text(json.dumps(m))
+    expect_error(root / "v_nodig", 'no shard "digests"', "--write-manifest")
     for bad in [dict(caption_probs=(0.5, 0.5)), dict(caption_probs=(1, 1, 1)),
                 dict(artist_prob=1.5)]:
         expect_error(base, "", **bad)
+    # caption_probs within 1e-6 of summing to 1 are accepted and normalized
+    ds = BucketDataset(base, template, img_tokens=IMG_TOKENS,
+                       caption_probs=(0.5000001, 0.3, 0.2))
+    assert abs(sum(ds.caption_probs) - 1.0) <= 1e-12, ds.caption_probs
+    assert all(type(x) is float for x in ds.caption_probs)
+    v, _ = ds.epoch_choices(0, 0)
+    assert v.shape == (ds.n,)
+    assert len(ds.fingerprint()) == 64
+    expect_error(base, "caption_probs", caption_probs=(0.500002, 0.3, 0.2))
     print("  bucket validation: missing/extra/duplicate/shape/patch/"
-          "img_tokens/manifest errors OK")
+          "img_tokens/manifest/digest errors OK; caption_probs normalized "
+          f"{ds.caption_probs}")
 
 
 def test_epoch_choices(root, template):
@@ -792,17 +831,85 @@ def test_bucket_fingerprint(ds, root):
         rows[a][key], rows[b][key] = rows[b][key], rows[a][key]
     make_fake_latent_cache(root / "bfp_bucket", rows)
     differ["swapped bucket"] = BucketDataset(root / "bfp_bucket", t, **kw)
+    # one latent value changed in a shard, manifest regenerated: new digest
+    import shutil
+    from safetensors import safe_open
+    from safetensors.numpy import load_file
+    lat_dir = shutil.copytree(ds.data_dir, root / "bfp_latent") / "latents"
+    shard = lat_dir / ds.shards[0]
+    with safe_open(str(shard), framework="numpy") as f:
+        meta = f.metadata()
+    tensors = load_file(str(shard))
+    key = sorted(tensors)[0]
+    tensors[key] = tensors[key].copy()
+    tensors[key][0, 0, 0] = tensors[key][0, 0, 0] + BF16(1.0)
+    save_file(tensors, str(shard), metadata=meta)
+    stale = BucketDataset(lat_dir.parent, t, **kw)
+    assert stale.fingerprint() == fp  # manifest only: no latent bytes read
+    refresh_digests(lat_dir.parent)
+    differ["latent value + manifest"] = BucketDataset(lat_dir.parent, t, **kw)
     for what, other in differ.items():
         assert other.fingerprint() != fp, f"{what} did not change it"
     print("  bucket fingerprint: stable across instances/loaders/row order; "
           "changed by caption, artist, bucket, probs, img_tokens, "
-          "text_rows OK")
+          "text_rows, latent value (regenerated digests) OK")
+
+
+def conditioner_layout(tmpl, captions):
+    """The official conditioner's encoder input (scripts/cache_dataset.py
+    TextEncoder): encode(PREFIX + cap) truncated to prefix_len +
+    max_caption_tokens, then the suffix ids, padded to total_len."""
+    from krea2_jax.text_template import PREFIX
+    pl = tmpl.prefix_len
+    ids = np.full((len(captions), tmpl.total_len), tmpl.pad_id, np.int32)
+    txt_len = np.zeros((len(captions),), np.int32)
+    for b, c in enumerate(captions):
+        full = tmpl.tokenizer.encode(PREFIX + c).ids
+        row = full[:pl + tmpl.max_caption_tokens] + tmpl.suffix_ids
+        ids[b, :len(row)] = row
+        txt_len[b] = len(row) - pl
+    return ids, txt_len
+
+
+def test_encode_captions_boundary(root):
+    """A caption starting with a newline merges with the prefix's trailing
+    newline: encode_captions must follow the conditioner (tokenize the
+    concatenation, slice at prefix_len), not prefix_ids + encode(caption)."""
+    from krea2_jax.text_template import PREFIX, CaptionTemplate
+    # a tokenizer that knows the "\n\n" merge (like the real Qwen one)
+    tok = make_tiny_tokenizer(root / "tok_nl", extra_corpus=["a\n\nb"] * 20)
+    for rows in (TEXT_ROWS, 8):
+        t = CaptionTemplate(tok, text_rows=rows)
+        merge_caps = ["\na girl", "\n\na girl with long silver hair",
+                      "\n" + "a girl " * 20]
+        normal = ["", "a girl", "two cats, drawn by someone",
+                  "a girl with long silver hair " * 10]
+        for c in merge_caps:  # the merge really happens
+            full = tok.encode(PREFIX + c).ids
+            assert full[:t.prefix_len] != t.prefix_ids, c
+        ids, tl = t.encode_captions(merge_caps + normal)
+        exp_ids, exp_tl = conditioner_layout(t, merge_caps + normal)
+        assert np.array_equal(ids, exp_ids) and np.array_equal(tl, exp_tl)
+        # the old construction (prefix_ids + encode(caption)) differs
+        old0 = t.prefix_ids + tok.encode(merge_caps[0]).ids + t.suffix_ids
+        assert ids[0, :len(old0)].tolist() != old0
+        assert tl[0] == len(old0) - t.prefix_len - 1  # one row shorter
+        # normal captions: unchanged = prefix_ids + encode(cap) (truncated)
+        for b, c in enumerate(normal, start=len(merge_caps)):
+            cap = tok.encode(c).ids[:t.max_caption_tokens]
+            row = t.prefix_ids + cap + t.suffix_ids
+            assert ids[b, :len(row)].tolist() == row, c
+            assert np.all(ids[b, len(row):] == t.pad_id)
+            assert tl[b] == len(cap) + len(t.suffix_ids)
+    print("  encode_captions: leading-newline captions == conditioner "
+          "layout (boundary merge), normal captions unchanged OK")
 
 
 def test_buckets(root):
     from krea2_jax.text_template import CaptionTemplate
     template = CaptionTemplate(make_tiny_tokenizer(root / "tok"),
                                text_rows=TEXT_ROWS)
+    test_encode_captions_boundary(root)
     ds = test_bucket_dataset(root, template)
     test_bucket_validation(root, template)
     test_epoch_choices(root, template)
