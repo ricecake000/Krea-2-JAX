@@ -195,9 +195,23 @@ pip install -r requirements-torch.txt
 ```
 
 (`requirements-rocm.txt` leaves `jax` unpinned: the `--attn splash` path is
-TPU-only and keeps the TPU pin in `requirements-tpu.txt`; full fine-tuning on
-GPU uses the default `--attn ref`, or `--attn aiter` with the pinned
-jax-aiter stack below.)
+TPU-only and keeps the TPU pin in `requirements-tpu.txt`. It pins `optax` and
+`orbax-checkpoint`, since a train state saved on one lease is restored on the
+next install. On MI355X train with `--attn aiter` and the pinned jax-aiter
+stack below — ~2.5x the throughput of `--attn ref` (stage 2: 2.2 vs 0.89
+samples/s/GPU); `ref` is only the portable default.)
+
+Required environment on the node:
+
+```bash
+# the base checkpoint loader and export_full use the CPU backend; with `rocm`
+# alone load_krea2_params fails at jax.devices("cpu")
+export JAX_PLATFORMS=rocm,cpu
+# HIP command buffers capture the aiter FFI kernels and the first train step
+# dies with HIP_ERROR_StreamCaptureInvalidated; train_full.py refuses to
+# start `--attn aiter` on a GPU backend without this
+export XLA_FLAGS=--xla_gpu_enable_command_buffer=
+```
 
 ### Activation sharding (`--act-sharding`, default `on`)
 
@@ -225,7 +239,7 @@ to JAX via XLA FFI; `--attn aiter` uses its fused `flash_attn_varlen`
 (forward + backward through `custom_vjp`, GQA native, bf16, head dim 128)
 instead of the reference attention, whose `[heads, qchunk, L]` fp32 logits
 dominate activation memory and bandwidth. It is **gfx950-only** and
-supported on exactly one stack (jax-aiter 0.1.0-alpha2):
+supported on exactly one stack (jax-aiter 0.1.0a2):
 
 | component | version |
 |---|---|
@@ -233,7 +247,7 @@ supported on exactly one stack (jax-aiter 0.1.0-alpha2):
 | Python | 3.12 |
 | `jax` / `jaxlib` | 0.11.0 |
 | `jax-rocm7-plugin` / `jax-rocm7-pjrt` | 0.11.0.post1 |
-| jax-aiter | `jax_aiter-0.1.0a2+full-...whl` from the [GitHub release](https://github.com/ROCm/jax-aiter/releases/tag/v0.1.0-alpha2) |
+| jax-aiter | `jax_aiter-0.1.0a2+full-...whl` (`nightly-wheel` CI artifact; no GitHub release) |
 
 ```bash
 pip install "jax==0.11.0" "jaxlib==0.11.0" \
@@ -242,9 +256,22 @@ pip install ./jax_aiter-0.1.0a2+full-cp312-cp312-manylinux_2_39_x86_64.whl
 python -c "from jax_aiter.mha import flash_attn_varlen; print('MHA ready')"
 ```
 
-(The plain `0.1.0a2` wheel omits the MHA libraries; run
-`jax-aiter-fetch-mha` after installing it.) jax-aiter is imported lazily,
-only when `--attn aiter` is used, so nothing else needs it.
+There is no GitHub release for this wheel. The `+full` wheel (MHA libraries
+bundled, ~511 MB) is the jax-aiter `nightly-wheel` GitHub Actions artifact
+(downloading it needs `gh auth`); our runs use a mirror on the public HF
+dataset `ricecake/krea2-ops-assets`. The lite `0.1.0a2` wheel omits the MHA
+libraries; after installing it run
+
+```bash
+jax-aiter-fetch-mha --tag jit-libs-85d614f12c412443
+python -c "from jax_aiter.mha import flash_attn_varlen; print('MHA ready')"
+```
+
+The `--tag` is required: the wheel's own `RELEASE_TAG` points at a manifest
+whose `aiter_sha` does not match the wheel, and the symptom is a
+`named symbol not found` at the first aiter call, after the base load and
+compile. jax-aiter is imported lazily, only when `--attn aiter` is used, so
+nothing else needs it.
 
 How it maps onto our masking: the DiT masks keys only (padded text tokens),
 and the padding sits in the *middle* of each sample's sequence
@@ -369,13 +396,18 @@ Run these before the first real training job; none needs the dataset cache.
 ### Train
 
 ```bash
+# --attn aiter: ~2.5x the throughput of `ref` on MI355X (stage 2: 2.2 vs
+# 0.89 samples/s/GPU); `ref` is only the portable default
 python scripts/train_full.py \
   --base-ckpt ./ckpt/raw.safetensors \
   --cache-dir ./cache --output-dir ./full_out \
   --steps 20000 --batch-size 32 --lr 1e-5 --warmup-steps 500 \
   --cosine-decay --min-lr 1e-6 --ema-decay 0.999 \
+  --attn aiter --act-sharding on \
   --save-every 1000 --keep 3 --export-every 5000 --resume
 ```
+
+Export `JAX_PLATFORMS` and `XLA_FLAGS` first (see the install section).
 
 Useful knobs:
 
@@ -386,16 +418,45 @@ Useful knobs:
 | `--weight-decay`, `--beta1/2`, `--eps` | 0.01, 0.9/0.999, 1e-8 | AdamW; `--grad-clip 1.0` (global norm) |
 | `--ema-decay` | 0.999 | EMA of the fp32 weights, exported instead of the raw params; `0` disables |
 | `--remat-policy` | dots | `full` saves the most HBM, `none` the least compute |
-| `--attn` | ref | `ref` (exact fp32 softmax), `aiter` (jax-aiter flash attention, MI355X), `splash` (TPU) |
+| `--attn` | ref | `ref` (exact fp32 softmax; portable default), `aiter` (jax-aiter flash attention; use it on MI355X, ~2.5x `ref`), `splash` (TPU) |
 | `--act-sharding` | on | constrain activations to batch sharding (see above); `off` only for A/B |
 | `--save-every` / `--keep` | 1000 / 3 | orbax checkpoints of params + optimizer + EMA |
 | `--export-every` | 0 | extra `model_stepNNNNNN.safetensors` exports (0 = only at the end) |
-| `--max-hours` | – | stop cleanly (checkpoint + export) after a wall-clock budget |
+| `--max-hours` | – | stop cleanly (checkpoint + export) after a wall-clock budget; counts only the train loop (see below) |
 | `--resume` | off | continue the newest checkpoint in `--output-dir/ckpt`; without it the script refuses to reuse a directory that already holds checkpoints |
+| `--resume-step N` | – | resume from an older step N; newer step dirs are renamed `<step>.superseded` |
 | `--prefetch` / `--loader-workers` | 4 / 4 | streaming loader queue depth / reader threads |
 
 The step log prints `loss`, a smoothed `ema_loss`, the pre-clip gradient
 norm (`gnorm`), the LR and `s/it`.
+
+Stopping, time budget and resuming:
+
+- **SIGTERM/SIGINT**: the first signal finishes the current step, then
+  checkpoints, exports `model.safetensors` and exits 0 (the same path as
+  `--max-hours`); a second signal aborts immediately. So handle the
+  10-minute preemption notice with `kill -TERM <pid>`. A hard `docker stop`
+  with its default 10 s grace cannot finish a 205 GB save: use
+  `docker stop -t <seconds>`, or send the signal well before the deadline.
+- **`--max-hours`** counts only the train loop: the base load, the resume
+  restore, the compile and the final save + export are outside it, so leave
+  margin (the final save of the 12.9B state is ~205 GB, plus a ~26 GB
+  export).
+- **`--resume-step N`** resumes from an older step; newer step dirs are
+  renamed `<step>.superseded`. Use it when the newest step dir is incomplete
+  (e.g. an interrupted copy-back), which a plain `--resume` now reports with
+  a hint to use it.
+- Rerunning the same command after the run reached `--steps` only writes
+  the missing `model.safetensors` (export-only) instead of refusing with
+  "nothing to do".
+- An interrupted save leaves `<step>.orbax-checkpoint-tmp`; the writing
+  checkpoint manager removes stale ones when it opens.
+
+Node-local disk is wiped between leases, so copy `ckpt/<step>` off the node
+after each finalized save and copy it back before `--resume`. Build the
+dataset cache once and transfer it rather than rebuilding it per lease: the
+VAE posterior sample is unseeded, so a rebuild changes the latents while
+keeping the same fingerprint.
 
 Memory (12.9B params, sharded over 8 devices; activations come on top and
 scale with batch size, resolution and `--remat-policy`):

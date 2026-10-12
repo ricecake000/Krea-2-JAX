@@ -13,7 +13,18 @@ and a tiny model:
      on a replicated one,
   e. --resume validates the run configuration: a different --seed or
      --batch-size, or a reordered cache (dataset fingerprint), is a hard
-     error, a different --lr warns and continues.
+     error, a different --lr warns and continues,
+  f. SIGTERM / SIGINT stop the run gracefully (checkpoint + export, exit 0)
+     and --resume continues it exactly,
+  g. --resume-step N resumes an older step and sets newer ones aside,
+  h. a run that reached --steps but lost its final export (or holds a stale
+     one from an earlier stop) re-exports it on --resume without training,
+  i. an incomplete newest step dir makes --resume fail with a pointer to
+     --resume-step, which then works,
+  j. stale <step>.orbax-checkpoint-tmp dirs are removed when the writing
+     checkpoint manager opens,
+  k. the --attn aiter XLA_FLAGS check parses the command-buffer flag
+     (last occurrence wins, value must be empty).
 
 Requires CPU PyTorch + einops (tiny reference checkpoint, parity check).
 """
@@ -26,10 +37,13 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 import json
+import math
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -264,6 +278,8 @@ def main():
     diffs = [abs(steps2[s][0] - steps1[s][0]) for s in range(7, 13)]
     print("resumed vs uninterrupted loss diffs (steps 7..12): "
           + ", ".join(f"{d:.1e}" for d in diffs))
+    assert all(math.isfinite(steps2[s][0]) for s in range(7, 13)), steps2
+    assert all(math.isfinite(d) for d in diffs), diffs
     assert max(diffs) <= 1e-5, diffs
     ft2 = load_file(str(out2 / "model.safetensors"))
     wdiff = max(float((ft2[k].float() - ft[k].float()).abs().max()) for k in sd)
@@ -345,6 +361,258 @@ def main():
     w = train_full.check_resume_config(saved, {**saved, "ema_decay": 0.99}, 6)
     assert any("ema_decay: checkpoint 0.9, now 0.99" in l for l in w), w
     print("e. --resume config validation (hard errors / warnings): ok")
+
+    def numeric_steps(ckpt):
+        return sorted(int(p.name) for p in ckpt.iterdir() if p.name.isdigit())
+
+    def check_losses(steps, lo, what, last=12):
+        """steps must be exactly lo..last; losses on the overlap with the
+        uninterrupted 12-step run (lo..12) must match it."""
+        assert sorted(steps) == list(range(lo, last + 1)), sorted(steps)
+        assert all(math.isfinite(steps[s][0]) for s in steps), steps
+        diffs = [abs(steps[s][0] - steps1[s][0]) for s in range(lo, 13)]
+        print(f"  {what} vs uninterrupted loss diffs (steps {lo}..12): "
+              + ", ".join(f"{d:.1e}" for d in diffs))
+        assert diffs and all(math.isfinite(d) for d in diffs), diffs
+        assert max(diffs) <= 1e-5, diffs
+
+    def run_and_signal(cmd, sig, at_step, timeout=300):
+        """Run cmd, send `sig` when the step-`at_step` line appears; returns
+        (returncode, output). Bounded: kills the process on timeout."""
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        lines, state = [], {"sent": False}
+
+        def reader():
+            for line in proc.stdout:
+                lines.append(line)
+                m = STEP_RE.match(line)
+                if not state["sent"] and m and int(m.group(1)) == at_step:
+                    proc.send_signal(sig)
+                    state["sent"] = True
+
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            th.join(timeout=10)
+            raise AssertionError(f"train_full.py did not exit within "
+                                 f"{timeout}s:\n{''.join(lines)}")
+        th.join(timeout=30)
+        text = "".join(lines)
+        assert state["sent"], (f"process exited (code {proc.returncode}) "
+                               f"before step {at_step} was seen:\n{text}")
+        return proc.returncode, text
+
+    # --- f. graceful stop on SIGTERM / SIGINT, then --resume ---
+    # --steps 40 (constant LR after warmup, so steps 1..12 are the same as
+    # run1's) leaves plenty of slack between the signal and the end of the run
+    long_run = ("--steps", "40", "--save-every", "100")
+    stop_re = re.compile(r"^(\w+) received; stopping at step (\d+) ", re.M)
+    resumed = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        name = sig.name
+        outS = tmp / f"run_{name.lower()}"
+        rc, text = run_and_signal(train_cmd(base, cache, outS, long_run), sig, 3)
+        assert rc == 0, f"exit {rc}:\n{text}"
+        m = stop_re.search(text)
+        assert m and m.group(1) == name, f"no '{name} received; stopping at " \
+            f"step' line:\n{text}"
+        stopped = int(m.group(2))
+        assert 3 <= stopped < 40, (stopped, text)
+        ckpt_steps = numeric_steps(outS / "ckpt")
+        assert ckpt_steps == [stopped], (ckpt_steps, stopped, text)
+        assert not list((outS / "ckpt").glob("*.orbax-checkpoint-tmp*")), \
+            sorted(os.listdir(outS / "ckpt"))
+        assert (outS / "model.safetensors").exists()
+        with safe_open(str(outS / "model.safetensors"), framework="numpy") as f:
+            assert f.metadata()["step"] == str(stopped), f.metadata()
+        stepsS, logS = run_train(base, cache, outS, (*long_run, "--resume"))
+        assert f"resumed train state from {outS / 'ckpt'}/{stopped}" in logS, logS
+        assert "WARNING" not in logS, logS
+        assert sorted(stepsS) == list(range(stopped + 1, 41)), sorted(stepsS)
+        assert all(math.isfinite(v[0]) for v in stepsS.values()), stepsS
+        if stopped < 12:
+            check_losses(stepsS, stopped + 1, f"{name} resume", last=40)
+        else:
+            print(f"  WARNING: signal landed at step {stopped} >= 12 on this "
+                  "machine; overlap comparison with the 12-step reference "
+                  "skipped")
+        resumed[name] = stepsS
+        print(f"f. {name}: stopped at step {stopped} with checkpoint + export, "
+              "exit 0; --resume continues: ok")
+    common = sorted(set(resumed["SIGTERM"]) & set(resumed["SIGINT"]))
+    assert common, "SIGTERM/SIGINT resumed runs share no logged step"
+    sdiffs = [abs(resumed["SIGTERM"][s][0] - resumed["SIGINT"][s][0])
+              for s in common]
+    assert all(math.isfinite(d) for d in sdiffs), sdiffs
+    assert max(sdiffs) <= 1e-5, sdiffs
+    print(f"f. SIGTERM vs SIGINT resumed runs agree on steps {common[0]}.."
+          f"{common[-1]} (max diff {max(sdiffs):.1e}): ok")
+
+    # --- g. --resume-step picks an older step, sets newer ones aside ---
+    outR = tmp / "run_resume_step"
+    (outR / "ckpt").mkdir(parents=True)
+    for st in ("6", "12"):
+        shutil.copytree(out1 / "ckpt" / st, outR / "ckpt" / st)
+    shutil.copy(out1 / "model.safetensors", outR / "model.safetensors")  # step 12
+    stepsR, logR = run_train(base, cache, outR, ("--resume-step", "6"))
+    assert (outR / "ckpt" / "12.superseded").is_dir()
+    assert "renamed newer checkpoint" in logR, logR
+    assert "renamed newer export" in logR, logR
+    with safe_open(str(outR / "model.safetensors.superseded"),
+                   framework="numpy") as f:
+        assert f.metadata()["step"] == "12", f.metadata()
+    assert f"resumed train state from {outR / 'ckpt'}/6" in logR, logR
+    check_losses(stepsR, 7, "--resume-step 6")
+    assert (outR / "ckpt" / "12").is_dir(), sorted(os.listdir(outR / "ckpt"))
+    assert (outR / "model.safetensors").exists()
+    print("g. --resume-step 6: newer step + step-12 export renamed to "
+          ".superseded, steps 7..12 rerun and re-saved: ok")
+    # again: 12.superseded now exists, so nothing may be renamed
+    before = sorted(os.listdir(outR / "ckpt"))
+    proc = subprocess.run(
+        train_cmd(base, cache, outR, ("--resume-step", "6")),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode != 0, "rename clash was not refused"
+    assert "12.superseded" in proc.stderr and "nothing was renamed" in proc.stderr, \
+        proc.stderr[-2000:]
+    assert sorted(os.listdir(outR / "ckpt")) == before, os.listdir(outR / "ckpt")
+    assert (outR / "model.safetensors").exists()
+    print("g. --resume-step with an existing .superseded target: refused, "
+          "nothing renamed: ok")
+    # an incompatible run config is refused before anything is renamed
+    outB = tmp / "run_resume_step_badseed"
+    (outB / "ckpt").mkdir(parents=True)
+    for st in ("6", "12"):
+        shutil.copytree(out1 / "ckpt" / st, outB / "ckpt" / st)
+    shutil.copy(out1 / "model.safetensors", outB / "model.safetensors")
+    proc = subprocess.run(
+        train_cmd(base, cache, outB, ("--resume-step", "6", "--seed", "1")),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode != 0, "--resume-step with a different seed ran"
+    assert "different run configuration" in proc.stderr, proc.stderr[-2000:]
+    assert (outB / "ckpt" / "12").is_dir() and (outB / "model.safetensors").exists()
+    assert not list(outB.rglob("*.superseded")), sorted(outB.rglob("*"))
+    print("g. --resume-step 6 --seed 1: config mismatch refused before any "
+          "rename: ok")
+
+    # --- h. export-only rerun when the final export is missing ---
+    outE = tmp / "run_export_only"
+    (outE / "ckpt").mkdir(parents=True)
+    shutil.copytree(out1 / "ckpt" / "12", outE / "ckpt" / "12")
+    proc = subprocess.run(
+        train_cmd(base, cache, outE, ("--resume",)),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+    assert "model.safetensors is missing: exporting" in proc.stdout, proc.stdout
+    assert "resumed train state" not in proc.stdout
+    assert not STEP_RE.search(proc.stdout), proc.stdout
+    ftE = load_file(str(outE / "model.safetensors"))
+    assert set(ftE) == set(ft)
+    assert all(torch.equal(ftE[k], ft[k]) for k in ft), "export-only != run1 export"
+    with safe_open(str(outE / "model.safetensors"), framework="numpy") as f:
+        assert f.metadata() == meta, (f.metadata(), meta)
+    # rerunning once the export exists is a clean no-op
+    proc = subprocess.run(
+        train_cmd(base, cache, outE, ("--resume",)),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode == 0 and "nothing to do" in proc.stdout, \
+        proc.stdout[-2000:] + proc.stderr[-2000:]
+    # a stale model.safetensors from an earlier stop (step 6) must not hide
+    # the missing step-12 export
+    outE2 = tmp / "run_export_stale"
+    (outE2 / "ckpt").mkdir(parents=True)
+    shutil.copytree(out1 / "ckpt" / "12", outE2 / "ckpt" / "12")
+    shutil.copy(out1 / "model_step000006.safetensors", outE2 / "model.safetensors")
+    proc = subprocess.run(
+        train_cmd(base, cache, outE2, ("--resume",)),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+    assert "is stale (it is from step 6): re-exporting step 12" in proc.stdout, \
+        proc.stdout
+    assert "nothing to do" not in proc.stdout and not STEP_RE.search(proc.stdout)
+    with safe_open(str(outE2 / "model.safetensors"), framework="numpy") as f:
+        assert f.metadata() == meta, (f.metadata(), meta)
+    ftE2 = load_file(str(outE2 / "model.safetensors"))
+    assert set(ftE2) == set(ft) and all(torch.equal(ftE2[k], ft[k]) for k in ft)
+    # an export of the wrong tree (ema export, --ema-decay 0 asks for params)
+    # is stale too: re-exported from the params
+    proc = subprocess.run(
+        train_cmd(base, cache, outE2, ("--resume", "--ema-decay", "0")),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+    assert "(it is the ema export, params requested)" in proc.stdout, proc.stdout
+    with safe_open(str(outE2 / "model.safetensors"), framework="numpy") as f:
+        assert f.metadata() == {**meta, "source": "params"}, f.metadata()
+    ftP = load_file(str(outE2 / "model.safetensors"))
+    assert all(torch.equal(ftP[k], raw[k]) for k in raw), "params re-export"
+    print("h. reached --steps without a current model.safetensors (missing, stale "
+          "step-6 file or wrong source): export-only rerun, bitwise equal to the "
+          "original export: ok")
+
+    # --- i. incomplete newest step dir ---
+    outI = tmp / "run_incomplete"
+    (outI / "ckpt").mkdir(parents=True)
+    shutil.copytree(out1 / "ckpt" / "6", outI / "ckpt" / "6")
+    (outI / "ckpt" / "18").mkdir()
+    proc = subprocess.run(
+        train_cmd(base, cache, outI, ("--resume",)),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode != 0, "resume from an empty newest step did not fail"
+    assert "--resume-step" in proc.stderr, proc.stderr[-2000:]
+    assert "incomplete or unreadable" in proc.stderr, proc.stderr[-2000:]
+    stepsI, logI = run_train(base, cache, outI, ("--resume-step", "6"))
+    assert "resumed train state" in logI, logI
+    assert (outI / "ckpt" / "18.superseded").is_dir()
+    assert not (outI / "ckpt" / "18").exists()
+    check_losses(stepsI, 7, "--resume-step past an incomplete step")
+    print("i. incomplete newest step: --resume refuses with a --resume-step "
+          "hint, --resume-step 6 proceeds: ok")
+
+    # --- j. stale orbax tmp dirs are cleaned when the manager opens (unit) ---
+    from krea2_jax import fullft_ckpt
+    d = tmp / "tmpclean"
+    tiny = {
+        "params": {"w": jnp.arange(16.0).reshape(4, 4)},
+        "opt_state": {"m": jnp.zeros((4, 4))},
+        "ema": None,
+    }
+    mgr = fullft_ckpt.make_manager(str(d))
+    fullft_ckpt.save_state(mgr, 1, {**tiny, "step": 1})
+    fullft_ckpt.wait(mgr)
+    mgr.close()
+    (d / "7.orbax-checkpoint-tmp").mkdir()
+    mgr = fullft_ckpt.make_manager(str(d))
+    fullft_ckpt.save_state(mgr, 2, {**tiny, "step": 2})
+    fullft_ckpt.wait(mgr)
+    mgr.close()
+    assert not (d / "7.orbax-checkpoint-tmp").exists(), sorted(os.listdir(d))
+    assert fullft_ckpt.all_steps(str(d)) == [1, 2], fullft_ckpt.all_steps(str(d))
+    print("j. stale .orbax-checkpoint-tmp removed on manager open: ok")
+
+    # --- k. XLA_FLAGS command-buffer check (unit) ---
+    cbd = train_full.command_buffers_disabled
+    flag = "--xla_gpu_enable_command_buffer="
+    assert not cbd("")
+    assert cbd(flag)
+    assert not cbd(flag + "FUSION")
+    assert cbd(f"--foo {flag}FUSION {flag}")
+    assert not cbd(f"--foo {flag} {flag}FUSION")
+    assert not cbd("--xla_force_host_platform_device_count=8 --foo=1")
+    print("k. command_buffers_disabled parses XLA_FLAGS (last token wins): ok")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("ALL TRAIN-FULL TESTS PASSED")
