@@ -43,6 +43,13 @@ carry padded image rows):
   o. a latent shard corrupted under an unchanged manifest is refused at
      startup (--verify-latents, default) before the base checkpoint load,
      with no ckpt dir created; --no-verify-latents proceeds.
+  p. --layer-loop unroll (blocks as a per-layer list): 2 steps match the
+     scan run's losses, --resume continues it for a 3rd, the export (and a
+     host-side re-export from the orbax checkpoint) has exactly the scan
+     export's keys and shapes; resuming a scan checkpoint with --layer-loop
+     unroll (or an older checkpoint that does not record layer_loop, or
+     records no run config at all) is a hard config error, raised before
+     any --resume-step rename.
 
 Requires CPU PyTorch + einops (tiny reference checkpoint, parity check).
 """
@@ -597,6 +604,7 @@ def main():
     saved = json.loads(json.dumps({k: 0 for k in train_full.RESUME_HARD_KEYS
                                    + train_full.RESUME_SOFT_KEYS}))
     saved["ema_decay"] = 0.9
+    saved["layer_loop"] = "scan"  # enforced even without a saved config
     w = train_full.check_resume_config(None, saved, 6)
     assert len(w) == 1 and "no saved run configuration" in w[0], w
     assert train_full.check_resume_config(saved, dict(saved), 6) == []
@@ -609,6 +617,103 @@ def main():
     w = train_full.check_resume_config(saved, {**saved, "ema_decay": 0.99}, 6)
     assert any("ema_decay: checkpoint 0.9, now 0.99" in l for l in w), w
     print("e. --resume config validation (hard errors / warnings): ok")
+
+    # --- p. --layer-loop unroll ---
+    outU = tmp / "unroll"
+    unroll = ("--layer-loop", "unroll", "--save-every", "2")
+    stepsU, logU = run_train(base, cache, outU, extra=(*unroll, "--steps", "2"))
+    assert "layer-loop unroll" in logU, logU
+    assert sorted(stepsU) == [1, 2], sorted(stepsU)
+    stepsU2, logU2 = run_train(base, cache, outU,
+                               extra=(*unroll, "--steps", "3", "--resume"))
+    # only the (expected) --steps 2 -> 3 soft warning
+    assert "resumed train state" in logU2 and "layer_loop" not in logU2, logU2
+    assert "steps: checkpoint 2, now 3" in logU2, logU2
+    assert sorted(stepsU2) == [3], sorted(stepsU2)
+    stepsU.update(stepsU2)
+    udiffs = [abs(stepsU[k][0] - steps1[k][0]) for k in (1, 2, 3)]
+    print("  unroll vs scan loss diffs (steps 1..3): "
+          + ", ".join(f"{d:.1e}" for d in udiffs))
+    assert max(udiffs) <= 1e-4, udiffs
+    assert _fc.read_meta_at(str(outU / "ckpt"), 3)["config"]["layer_loop"] == "unroll"
+    with safe_open(str(outU / "model.safetensors"), framework="numpy") as f:
+        assert f.metadata()["step"] == "3"
+        ukeys = {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
+    with safe_open(str(exported), framework="numpy") as f:
+        skeys = {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
+    assert ukeys == skeys, (sorted(set(ukeys) ^ set(skeys)))
+    u_bytes = (outU / "model.safetensors").read_bytes()
+    # export-only path (training complete, export missing): restores the
+    # list-structured EMA tree from the checkpoint metadata on the host
+    (outU / "model.safetensors").unlink()
+    proc = subprocess.run(
+        train_cmd(base, cache, outU, (*unroll, "--steps", "3", "--resume")),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
+    assert "exporting it now" in proc.stdout, proc.stdout[-2000:]
+    assert (outU / "model.safetensors").read_bytes() == u_bytes, (
+        "host re-export of the unroll checkpoint differs from its export")
+    # a scan checkpoint cannot be resumed with --layer-loop unroll
+    d = fresh_copy("scan2unroll")
+    proc = subprocess.run(
+        train_cmd(base, cache, d, ("--resume", "--layer-loop", "unroll")),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode != 0, "scan checkpoint resumed with --layer-loop unroll"
+    assert "different run configuration" in proc.stderr, proc.stderr[-2000:]
+    assert "layer_loop: checkpoint 'scan', now 'unroll'" in proc.stderr, (
+        proc.stderr[-2000:])
+    assert "resumed train state" not in proc.stdout
+    # a checkpoint with no saved run config at all (older format) still
+    # used "scan": --layer-loop unroll is the same hard error, raised before
+    # --resume-step renames anything or the base checkpoint loads
+    d = tmp / "noconfig2unroll"
+    (d / "ckpt").mkdir(parents=True)
+    for st in ("6", "12"):
+        shutil.copytree(out1 / "ckpt" / st, d / "ckpt" / st)
+        mpath = d / "ckpt" / st / "meta" / "metadata"
+        m = json.loads(mpath.read_text())
+        assert "config" in m, m
+        del m["config"]
+        mpath.write_text(json.dumps(m))
+        assert _fc.read_meta_at(str(d / "ckpt"), int(st))["config"] is None
+    shutil.copy(out1 / "model.safetensors", d / "model.safetensors")
+    before = sorted(os.listdir(d)), sorted(os.listdir(d / "ckpt"))
+    proc = subprocess.run(
+        train_cmd(base, cache, d, ("--resume-step", "6",
+                                   "--layer-loop", "unroll")),
+        env={**os.environ}, capture_output=True, text=True, timeout=900,
+    )
+    assert proc.returncode != 0, "config-less checkpoint resumed with unroll"
+    assert "different" in proc.stderr and "run configuration" in proc.stderr, (
+        proc.stderr[-2000:])
+    assert "layer_loop: checkpoint 'scan', now 'unroll'" in proc.stderr, (
+        proc.stderr[-2000:])
+    assert "renamed newer" not in proc.stdout, proc.stdout[-2000:]
+    assert "loading base checkpoint" not in proc.stdout, proc.stdout[-2000:]
+    assert (sorted(os.listdir(d)), sorted(os.listdir(d / "ckpt"))) == before, (
+        "a refused resume renamed files")
+    # unit: a checkpoint from before layer_loop existed counts as "scan"
+    old = {k: 0 for k in train_full.RESUME_HARD_KEYS + train_full.RESUME_SOFT_KEYS}
+    old["ema_decay"] = 0.9
+    del old["layer_loop"]
+    assert train_full.check_resume_config(
+        old, {**old, "layer_loop": "scan"}, 6) == []
+    try:
+        train_full.check_resume_config(old, {**old, "layer_loop": "unroll"}, 6)
+    except SystemExit as e:
+        assert "layer_loop: checkpoint 'scan', now 'unroll'" in str(e), e
+    else:
+        raise AssertionError("unroll resume of a pre-layer_loop checkpoint ran")
+    try:
+        train_full.check_resume_config(None, {**old, "layer_loop": "unroll"}, 6)
+    except SystemExit as e:
+        assert "layer_loop: checkpoint 'scan', now 'unroll'" in str(e), e
+    else:
+        raise AssertionError("unroll resume of a config-less checkpoint ran")
+    print("p. --layer-loop unroll trains like scan, resumes, exports the "
+          "official keys (also host-side); scan -> unroll resume refused: ok")
 
     def numeric_steps(ckpt):
         return sorted(int(p.name) for p in ckpt.iterdir() if p.name.isdigit())

@@ -5,6 +5,14 @@ state_dict of `SingleStreamDiT` in bfloat16. We keep torch's (out, in) Linear
 layout and the exact key names, but nest keys by "." and stack repeated blocks
 (`blocks.{i}.*`, `txtfusion.layerwise_blocks.{i}.*`,
 `txtfusion.refiner_blocks.{i}.*`) along a leading axis for `lax.scan`.
+
+Unstacked option: `load_krea2_params(unstack=("blocks",))` /
+`abstract_krea2_params(unstack=...)` keep the listed repeated-block subtrees
+as a Python LIST of per-layer trees instead (each leaf sharded on its own,
+with exactly the stacked spec minus the layer axis), for
+`model.dit_forward(layer_loop="unroll")`; `unstack_blocks` / `stack_blocks`
+convert between the two forms. Both forms export to the same official keys
+(`save_krea2_params`). LoRA trees are always stacked.
 """
 
 import math
@@ -74,7 +82,21 @@ def _nest(tree, path, leaf):
     node[path[-1]] = leaf
 
 
-def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp"):
+def _check_prefixes(prefixes):
+    """Normalize an unstack/stack prefix argument to a tuple of
+    STACKED_PREFIXES entries (a single string is one prefix)."""
+    if isinstance(prefixes, str):
+        prefixes = (prefixes,)
+    prefixes = tuple(prefixes)
+    bad = [p for p in prefixes if p not in STACKED_PREFIXES]
+    if bad:
+        raise ValueError(f"not repeated-block prefixes: {bad} (expected a "
+                         f"subset of {STACKED_PREFIXES})")
+    return prefixes
+
+
+def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp",
+                      unstack=()):
     """Load the official DiT safetensors into a (sharded) nested pytree.
 
     Tensors are read on host CPU, repeated blocks are stacked, and each leaf
@@ -83,9 +105,16 @@ def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp"):
     (frozen base + pure data parallelism: no weight all-gathers per step, at
     ~24 GiB HBM per device for the 12.9B model). With mesh=None the tree
     stays on the default device, replicated.
+
+    unstack: repeated-block prefixes (a subset of STACKED_PREFIXES, e.g.
+    ("blocks",)) to keep as a LIST of per-layer nested dicts (index order)
+    instead of stacking; every per-layer leaf is placed on its own (its
+    sharding is the stacked spec minus the layer axis). For
+    `dit_forward(layer_loop="unroll")`.
     """
     if sharding not in ("fsdp", "replicate"):
         raise ValueError(f"unknown base sharding: {sharding!r}")
+    unstack = _check_prefixes(unstack)
     cpu = jax.devices("cpu")[0]
     flat = {}
     stacked = {}  # prefix -> field -> {idx: array}
@@ -108,6 +137,22 @@ def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp"):
     for key, tensor in flat.items():
         _nest(params, key.split("."), _place(tensor, mesh, stacked=False, sharding=sharding))
     for prefix, fields in stacked.items():
+        if prefix in unstack:
+            n = max(max(by_idx) + 1 for by_idx in fields.values())
+            for rest, by_idx in fields.items():
+                if len(by_idx) != n:
+                    raise ValueError(f"{path}: {prefix}.{{i}}.{rest} has "
+                                     f"{len(by_idx)} of {n} block indices")
+            layers = [{} for _ in range(n)]
+            for rest, by_idx in fields.items():
+                for i in range(n):
+                    # pop as we place: like the stacked path, never hold a
+                    # host tensor past its device copy
+                    _nest(layers[i], rest.split("."),
+                          _place(by_idx.pop(i), mesh, stacked=False,
+                                 sharding=sharding))
+            _nest(params, prefix.split("."), layers)
+            continue
         for rest, by_idx in fields.items():
             n = max(by_idx) + 1
             assert len(by_idx) == n, f"missing block index under {prefix}.{rest}"
@@ -124,12 +169,13 @@ def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp"):
     return params
 
 
-def abstract_krea2_params(cfg, dtype=jnp.float32):
+def abstract_krea2_params(cfg, dtype=jnp.float32, unstack=()):
     """`jax.ShapeDtypeStruct` pytree of the DiT parameters (no weights, no
     torch), with exactly the nesting/stacking `load_krea2_params` produces:
     `blocks`, `txtfusion.layerwise_blocks` and `txtfusion.refiner_blocks`
-    stacked with the layer axis first. Unsharded (pair with
-    `param_shardings` for AOT compilation).
+    stacked with the layer axis first, except the prefixes in `unstack`,
+    which are lists of per-layer trees (as `load_krea2_params(unstack=)`).
+    Unsharded (pair with `param_shardings` for AOT compilation).
 
     Shapes follow the official `SingleStreamDiT` module: torch Linear
     (out, in) layout; `first`, `tmlp.*`, `txtmlp.1/3`, `tproj.1` and
@@ -171,7 +217,12 @@ def abstract_krea2_params(cfg, dtype=jnp.float32):
             "qknorm": {"qnorm": norm(hd), "knorm": norm(hd)},
         }
 
-    def stack(n, tree):
+    unstack = _check_prefixes(unstack)
+
+    def stack(n, tree, prefix):
+        if prefix in unstack:
+            # distinct (copied) dicts per layer
+            return [jax.tree.map(lambda s: s, tree) for _ in range(n)]
         return jax.tree.map(
             lambda s: jax.ShapeDtypeStruct((n,) + tuple(s.shape), s.dtype), tree
         )
@@ -192,12 +243,13 @@ def abstract_krea2_params(cfg, dtype=jnp.float32):
     }
     return {
         "first": lin(F, cfg.channels * cfg.patch ** 2, True),
-        "blocks": stack(cfg.layers, block),
+        "blocks": stack(cfg.layers, block, "blocks"),
         "tmlp": {"0": lin(F, cfg.tdim, True), "2": lin(F, F, True)},
         "txtfusion": {
-            "layerwise_blocks": stack(2, txt_block),
+            "layerwise_blocks": stack(2, txt_block,
+                                      "txtfusion.layerwise_blocks"),
             "projector": lin(1, cfg.txtlayers, False),
-            "refiner_blocks": stack(2, txt_block),
+            "refiner_blocks": stack(2, txt_block, "txtfusion.refiner_blocks"),
         },
         "txtmlp": {"0": norm(T), "1": lin(F, T, True), "3": lin(F, F, True)},
         "last": {
@@ -207,6 +259,113 @@ def abstract_krea2_params(cfg, dtype=jnp.float32):
         },
         "tproj": {"1": lin(6 * F, F, True)},
     }
+
+
+def _get_subtree(tree, keys):
+    node = tree
+    for k in keys:
+        if not isinstance(node, dict) or k not in node:
+            raise ValueError(f"params tree has no {'.'.join(keys)} subtree")
+        node = node[k]
+    return node
+
+
+def _replace_subtree(tree, keys, value):
+    """Shallow copy of `tree` with the subtree at `keys` replaced."""
+    if not keys:
+        return value
+    out = dict(tree)
+    out[keys[0]] = _replace_subtree(tree[keys[0]], keys[1:], value)
+    return out
+
+
+def _leading_dim(leaf):
+    shape = tuple(leaf.shape)
+    if not shape:
+        raise ValueError("a stacked leaf has no layer axis (scalar)")
+    return shape[0]
+
+
+def _index_leaf(leaf, i):
+    if isinstance(leaf, jax.ShapeDtypeStruct):
+        return jax.ShapeDtypeStruct(tuple(leaf.shape[1:]), leaf.dtype)
+    return leaf[i]
+
+
+def _stack_leaves(*leaves):
+    first = leaves[0]
+    if isinstance(first, jax.ShapeDtypeStruct):
+        if not all(isinstance(l, jax.ShapeDtypeStruct) for l in leaves):
+            raise ValueError("cannot stack ShapeDtypeStruct with array leaves")
+        shapes = {tuple(l.shape) for l in leaves}
+        dtypes = {np.dtype(l.dtype) for l in leaves}
+        if len(shapes) != 1 or len(dtypes) != 1:
+            raise ValueError(f"per-layer leaves differ: shapes {shapes}, "
+                             f"dtypes {dtypes}")
+        return jax.ShapeDtypeStruct((len(leaves),) + tuple(first.shape),
+                                    first.dtype)
+    if any(isinstance(l, jax.ShapeDtypeStruct) for l in leaves):
+        raise ValueError("cannot stack ShapeDtypeStruct with array leaves")
+    shapes = {tuple(l.shape) for l in leaves}
+    if len(shapes) != 1:
+        raise ValueError(f"per-layer leaves differ in shape: {shapes}")
+    if all(isinstance(l, np.ndarray) for l in leaves):
+        return np.stack(leaves, axis=0)
+    return jnp.stack(leaves, axis=0)
+
+
+def unstack_blocks(tree, prefixes=("blocks",)):
+    """Convert stacked repeated-block subtrees to lists of per-layer trees.
+
+    For each prefix (dotted, e.g. "blocks" or "txtfusion.refiner_blocks")
+    the stacked subtree (leaves with a leading layer axis) becomes a list of
+    n per-layer trees; a prefix that is already a list is left as is
+    (idempotent). Works on jax/numpy arrays (leaf[i]) and on
+    jax.ShapeDtypeStruct leaves (shape[1:], same dtype, no sharding).
+    Returns a new tree (shallow copies along the prefix paths); raises
+    ValueError for unknown/missing prefixes or leaves with differing
+    layer counts.
+    """
+    for prefix in _check_prefixes(prefixes):
+        keys = prefix.split(".")
+        node = _get_subtree(tree, keys)
+        if isinstance(node, (list, tuple)):
+            continue
+        leaves = jax.tree.leaves(node)
+        if not leaves:
+            raise ValueError(f"{prefix}: empty subtree")
+        ns = {_leading_dim(l) for l in leaves}
+        if len(ns) != 1:
+            raise ValueError(f"{prefix}: stacked leaves disagree on the "
+                             f"layer count: {sorted(ns)}")
+        n = ns.pop()
+        layers = [jax.tree.map(lambda l, i=i: _index_leaf(l, i), node)
+                  for i in range(n)]
+        tree = _replace_subtree(tree, keys, layers)
+    return tree
+
+
+def stack_blocks(tree, prefixes=("blocks",)):
+    """Inverse of `unstack_blocks`: lists of per-layer trees under the given
+    prefixes are stacked along a new leading axis (jnp.stack for jax arrays,
+    np.stack when every leaf is a numpy array, (n,) + shape for
+    jax.ShapeDtypeStruct). A prefix that is already stacked (a dict) is left
+    as is (idempotent). Raises ValueError for unknown/missing prefixes or
+    per-layer trees that differ in structure/shape/dtype."""
+    for prefix in _check_prefixes(prefixes):
+        keys = prefix.split(".")
+        node = _get_subtree(tree, keys)
+        if isinstance(node, dict):
+            continue
+        if not isinstance(node, (list, tuple)) or not node:
+            raise ValueError(f"{prefix}: expected a non-empty list of "
+                             f"per-layer trees, got {type(node).__name__}")
+        structs = {jax.tree.structure(layer) for layer in node}
+        if len(structs) != 1:
+            raise ValueError(f"{prefix}: per-layer trees differ in structure")
+        stacked = jax.tree.map(_stack_leaves, *node)
+        tree = _replace_subtree(tree, keys, stacked)
+    return tree
 
 
 def _place(arr, mesh, stacked, sharding="fsdp"):
@@ -219,22 +378,53 @@ def _place(arr, mesh, stacked, sharding="fsdp"):
     return jax.device_put(arr, NamedSharding(mesh, spec))
 
 
+def _stack_prefix(keys):
+    """The STACKED_PREFIXES entry whose stacked subtree holds this leaf path
+    (the leaf has a leading layer axis), or None.
+
+    A per-layer LIST under a prefix (unstack_blocks / load_krea2_params(
+    unstack=)) puts the layer index right after the prefix ("blocks", "3",
+    "attn", ...): such a leaf has NO layer axis, so it must not count as
+    stacked — otherwise param_partition_spec would skip axis 0 of e.g. a
+    per-layer [6144, 6144] weight and export would split it into rows.
+    """
+    for p in STACKED_PREFIXES:
+        pk = p.split(".")
+        n = len(pk)
+        if list(keys[:n]) == pk and len(keys) > n:
+            return None if keys[n].isdigit() else p
+    return None
+
+
 def _is_stacked_path(keys):
-    """True when a params-tree path lies under one of STACKED_PREFIXES."""
-    dotted = ".".join(keys)
-    return any(dotted.startswith(p + ".") for p in STACKED_PREFIXES)
+    """True when a params-tree path lies under one of STACKED_PREFIXES and
+    carries the stacked layer axis (False for per-layer list entries)."""
+    return _stack_prefix(keys) is not None
 
 
 def _path_keys(path):
-    return [str(getattr(k, "key", k)) for k in path]
+    """Path entries as strings: dict keys, list indices (as digits), attrs."""
+    out = []
+    for k in path:
+        if hasattr(k, "key"):
+            out.append(str(k.key))
+        elif hasattr(k, "idx"):
+            out.append(str(k.idx))
+        elif hasattr(k, "name"):
+            out.append(str(k.name))
+        else:
+            out.append(str(k))
+    return out
 
 
 def param_shardings(params, mesh, sharding="fsdp"):
     """NamedSharding pytree matching how `load_krea2_params` placed each leaf.
 
     Mirrors `_place`: sharding="fsdp" uses `param_partition_spec` (stacked
-    subtrees skip the leading block axis), "replicate" uses P(). Works on
-    real arrays or `jax.ShapeDtypeStruct` leaves (only `.shape` is read).
+    subtrees skip the leading block axis; per-layer list entries have none,
+    so they get the stacked spec minus that axis), "replicate" uses P().
+    Works on real arrays or `jax.ShapeDtypeStruct` leaves (only `.shape` is
+    read).
     """
     if sharding not in ("fsdp", "replicate"):
         raise ValueError(f"unknown base sharding: {sharding!r}")
@@ -265,8 +455,10 @@ def _official_entries(params):
     Returns (entries, leaves): entries is a list of (official key, leaf
     index, layer index or None, per-tensor shape) sorted by key, leaves the
     flattened leaves. Stacked subtrees (STACKED_PREFIXES) become per-layer
-    keys ('blocks.{i}.attn.wq.weight', ...); everything else is dotted
-    as-is. Only `.shape` of each leaf is read.
+    keys ('blocks.{i}.attn.wq.weight', ...); everything else — including
+    per-layer lists under a prefix, whose path already reads
+    'blocks.{i}.…' — is dotted as-is, so both forms give the same keys.
+    Only `.shape` of each leaf is read.
     """
     leaves_with_path = jax.tree_util.tree_flatten_with_path(params)[0]
     entries = []
@@ -276,9 +468,7 @@ def _official_entries(params):
         dotted = ".".join(keys)
         shape = tuple(int(d) for d in leaf.shape)
         leaves.append(leaf)
-        prefix = next(
-            (p for p in STACKED_PREFIXES if dotted.startswith(p + ".")), None
-        )
+        prefix = _stack_prefix(keys)
         if prefix is None:
             entries.append((dotted, li, None, shape))
         else:
@@ -307,7 +497,9 @@ def save_krea2_params(path, params, dtype=jnp.bfloat16, metadata=None):
 
     Inverse of `load_krea2_params`: stacked subtrees (STACKED_PREFIXES) are
     unstacked back to per-layer keys ('blocks.{i}.attn.wq.weight', ...),
-    everything else is dotted as-is, and every tensor is cast to `dtype`.
+    everything else is dotted as-is (a per-layer list under a prefix gives
+    the same keys and bytes as its stacked form), and every tensor is cast
+    to `dtype`.
     The file is streamed leaf by leaf (one host fetch per leaf, written
     straight to disk), so the host never holds more than one leaf; works for
     sharded or unsharded trees. Leaves are fetched from a temporary cast copy,
@@ -454,7 +646,12 @@ def init_lora(params, rng, rank=16, targets="attn", dtype=jnp.float32):
     recommended coverage). lora_A ~ U(±1/√fan_in) (kaiming_uniform with
     a=√5, matching the reference PEFT/kohya init), lora_B = 0, so the model
     starts exactly at the base checkpoint.
+
+    The params' repeated blocks must be stacked: per-layer lists
+    (load_krea2_params(unstack=) / unstack_blocks) are a ValueError — LoRA
+    training uses layer_loop="scan".
     """
+    _require_stacked(params, "init_lora")
     attn_t, mlp_t = _target_lists(targets)
 
     # Ordered (path, weight, stacked) entries; stacked weights carry a
@@ -504,6 +701,20 @@ def init_lora(params, rng, rank=16, targets="attn", dtype=jnp.float32):
     return lora
 
 
+def _require_stacked(params, what):
+    for prefix in STACKED_PREFIXES:
+        try:
+            node = _get_subtree(params, prefix.split("."))
+        except ValueError:
+            continue
+        if isinstance(node, (list, tuple)):
+            raise ValueError(
+                f"{what}: params[{prefix!r}] is a per-layer list (unstacked "
+                "blocks); LoRA supports only stacked blocks — load without "
+                "unstack= (or stack_blocks()) and use layer_loop='scan'"
+            )
+
+
 def replicate_tree(tree, mesh):
     sharding = replicated_sharding(mesh)
     return jax.tree.map(lambda a: jax.device_put(a, sharding), tree)
@@ -514,6 +725,11 @@ def _lora_leaves(tree, path=()):
     if isinstance(tree, dict) and "lora_A" in tree:
         yield path, tree
         return
+    if isinstance(tree, (list, tuple)):
+        raise ValueError(
+            f"LoRA subtree {'.'.join(path)} is a per-layer list; LoRA trees "
+            "must be stacked (unstacked blocks are unsupported for LoRA)"
+        )
     for k in sorted(tree):
         yield from _lora_leaves(tree[k], path + (k,))
 

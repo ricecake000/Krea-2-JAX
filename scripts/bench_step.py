@@ -108,6 +108,10 @@ def parse_args(argv=None):
                     default="ref")
     ap.add_argument("--attn-block", type=int, default=256)
     ap.add_argument("--act-sharding", choices=["on", "off"], default="on")
+    ap.add_argument("--layer-loop", choices=["scan", "unroll"], default="scan",
+                    help="as train_full.py --layer-loop: 'unroll' keeps the "
+                         "blocks as per-layer arrays (no per-layer slice/DUS "
+                         "copies, longer compile)")
     ap.add_argument("--base-sharding", choices=["fsdp", "replicate"],
                     default="fsdp",
                     help="weight placement (train mode always keeps the fp32 "
@@ -234,18 +238,20 @@ def main(argv=None):
           f"{args.img_tokens} img rows + {args.text_rows} text rows -> "
           f"{padded} tokens) | remat {args.remat_policy} | "
           f"attn {args.attn} | act-sharding {args.act_sharding} | "
-          f"base {args.base_sharding}")
+          f"layer-loop {args.layer_loop} | base {args.base_sharding}")
 
     # --- weights ---
     wdtype = jnp.float32 if args.mode == "train" else jnp.bfloat16
     t0 = time.time()
+    unstack = ("blocks",) if args.layer_loop == "unroll" else ()
     if args.random_weights:
-        abstract = abstract_krea2_params(cfg, dtype=wdtype)
+        abstract = abstract_krea2_params(cfg, dtype=wdtype, unstack=unstack)
         pshard = param_shardings(abstract, mesh, args.base_sharding)
         params = random_params(abstract, pshard, args.seed, wdtype)
     else:
         params = load_krea2_params(args.base_ckpt, mesh=mesh, dtype=wdtype,
-                                   sharding=args.base_sharding)
+                                   sharding=args.base_sharding,
+                                   unstack=unstack)
         pshard = param_shardings(params, mesh, args.base_sharding)
     n_params = sum(int(np.prod(x.shape)) for x in jax.tree.leaves(params))
     print(f"weights ({jnp.dtype(wdtype).name}, {args.base_sharding}): "
@@ -258,12 +264,14 @@ def main(argv=None):
         "--remat-policy", args.remat_policy, "--attn", args.attn,
         "--attn-block", str(args.attn_block), "--act-sharding", args.act_sharding,
         "--ema-decay", str(args.ema_decay), "--qchunk", str(args.qchunk),
+        "--layer-loop", args.layer_loop,
     ])
     remat = tf.REMAT_MODES[args.remat_policy]
     act = tf.act_sharding_for(hp, mesh)
     fwd_kw = dict(lora=None, qchunk=args.qchunk, remat=remat,
                   attn_impl=args.attn, attn_mesh=mesh,
-                  attn_block=args.attn_block, act_sharding=act)
+                  attn_block=args.attn_block, act_sharding=act,
+                  layer_loop=args.layer_loop)
 
     def make_inputs(img, hw, txt_mask, key):
         k_t, k_n = jax.random.split(key)

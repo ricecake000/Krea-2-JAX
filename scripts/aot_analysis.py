@@ -82,6 +82,10 @@ def parse_args(argv=None):
     ap.add_argument("--attn", choices=["ref", "splash", "aiter"], default="ref")
     ap.add_argument("--attn-block", type=int, default=256)
     ap.add_argument("--act-sharding", choices=["on", "off"], default="on")
+    ap.add_argument("--layer-loop", choices=["scan", "unroll"], default="scan",
+                    help="as train_full.py --layer-loop: 'unroll' keeps the "
+                         "blocks as per-layer arrays (no per-layer slice/DUS "
+                         "copies, longer compile)")
     ap.add_argument("--ema-decay", type=float, default=0.999,
                     help="0 drops the EMA tree from the step")
     ap.add_argument("--qchunk", type=int, default=256,
@@ -291,7 +295,9 @@ def main(argv=None):
     B = args.batch_size
 
     # --- abstract, sharded train state ---
-    abs_params = abstract_krea2_params(cfg, dtype=jnp.float32)
+    abs_params = abstract_krea2_params(
+        cfg, dtype=jnp.float32,
+        unstack=("blocks",) if args.layer_loop == "unroll" else ())
     pshard = param_shardings(abs_params, mesh)
     params = jax.tree.map(
         lambda s, sh: jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=sh),
@@ -321,6 +327,7 @@ def main(argv=None):
           f"{txt_len_total} tokens/sample (prefix {txt_cfg.prefix_len})")
     print(f"step: batch {B} ({B // n_dev}/device) | remat {args.remat_policy} | "
           f"attn {args.attn} | act-sharding {args.act_sharding} | "
+          f"layer-loop {args.layer_loop} | "
           f"qchunk {args.qchunk} | ema {args.ema_decay or 'off'}")
 
     hp = tf.parse_args([
@@ -329,6 +336,7 @@ def main(argv=None):
         "--remat-policy", args.remat_policy, "--attn", args.attn,
         "--attn-block", str(args.attn_block), "--act-sharding", args.act_sharding,
         "--ema-decay", str(args.ema_decay), "--qchunk", str(args.qchunk),
+        "--layer-loop", args.layer_loop,
     ])
     use_ema = hp.ema_decay > 0
     tx = tf.make_optimizer(hp, tf.make_schedule(hp))
@@ -391,9 +399,11 @@ def main(argv=None):
             by = float(ca.get("bytes accessed", float("nan")))
             print(f"cost_analysis (per device): flops {fl:.3e}, bytes accessed "
                   f"{by / GiB:.1f} GiB")
-            print("  note: XLA counts a while-loop (lax.scan) body ONCE, so the "
-                  f"{cfg.layers}-block scan is under-counted ~{cfg.layers}x; "
-                  "use bench_step.py's analytic TFLOP/s instead")
+            if args.layer_loop == "scan":
+                print("  note: XLA counts a while-loop (lax.scan) body ONCE, "
+                      f"so the {cfg.layers}-block scan is under-counted "
+                      f"~{cfg.layers}x; use bench_step.py's analytic TFLOP/s "
+                      "instead")
         analytic = 6 * n_params * padded * B / n_dev
         print(f"analytic model flops (6 * params * padded_tokens * batch / "
               f"devices): {analytic:.3e} per device per step (before remat)")
