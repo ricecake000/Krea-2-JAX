@@ -349,18 +349,20 @@ def text_encoder_identity(model_dir, cfg, stats=None):
     missing = [k for k in used if k not in wm]
     if missing:
         raise KeyError(f"missing weights {missing[:5]} in {model_dir}")
-    first_key = {}
-    for k in used:
-        fp = wm[k]
-        first_key[fp] = min(first_key.get(fp, k), k)
+    # hash every used file once, then bind each loaded key to the digest of
+    # the file that supplies it (so re-pointing a key at another file that
+    # holds a different copy of the same tensor changes the identity)
+    digest = {}
     nbytes = 0
-    h.update(b"weights\0")
-    for fp in sorted(first_key, key=first_key.get):
+    for fp in sorted({wm[k] for k in used}, key=str):
         fh = hashlib.sha256()
         nbytes += file_sha256(fp, h=fh)
-        h.update(fh.digest())
+        digest[fp] = fh.digest()
+    h.update(b"weights\0")
+    for k in sorted(used):
+        h.update(k.encode("utf-8") + b"\0" + digest[wm[k]])
     if stats is not None:
-        stats.update(files=len(first_key), bytes=nbytes)
+        stats.update(files=len(digest), bytes=nbytes)
     return h.hexdigest()
 
 
