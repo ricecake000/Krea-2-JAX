@@ -10,13 +10,15 @@ ema) without reading the optimizer state.
 
 Saves are asynchronous: the device->host copy finishes inside `save_state`,
 so the caller may donate/overwrite the arrays as soon as it returns; call
-`wait` before reading the files or exiting.
+`wait` before reading the files or exiting (a pending save is lost if the
+interpreter exits first). A save killed mid-write leaves a stale
+`<step>.orbax-checkpoint-tmp` dir; the writing manager (`make_manager`)
+removes such dirs when it opens the checkpoint dir.
 """
 
 import os
 
 import jax
-import numpy as np
 import orbax.checkpoint as ocp
 
 TREE_ITEMS = ("params", "opt_state", "ema")
@@ -37,6 +39,7 @@ def make_manager(ckpt_dir, max_to_keep=3, async_save=True):
         max_to_keep=max_to_keep,
         enable_async_checkpointing=async_save,
         create=True,
+        cleanup_tmp_directories=True,
     )
     return ocp.CheckpointManager(
         os.path.abspath(ckpt_dir), options=options, item_handlers=_handlers()
@@ -81,6 +84,23 @@ def latest_step(ckpt_dir):
         mgr.close()
 
 
+def all_steps(ckpt_dir):
+    """Sorted list of every step orbax sees under `ckpt_dir` ([] if the dir
+    is missing). Like `latest_step`, a step dir is listed even if its
+    contents are incomplete (e.g. an interrupted copy)."""
+    if not os.path.isdir(ckpt_dir):
+        return []
+    mgr = ocp.CheckpointManager(
+        os.path.abspath(ckpt_dir),
+        options=ocp.CheckpointManagerOptions(read_only=True, create=False),
+        item_handlers=_handlers(),
+    )
+    try:
+        return sorted(int(s) for s in mgr.all_steps())
+    finally:
+        mgr.close()
+
+
 def read_meta(manager, step):
     """The JSON meta item of `step`: {"step": int, "has_ema": bool,
     "config": dict or None} ("config" is None for checkpoints saved without
@@ -89,6 +109,21 @@ def read_meta(manager, step):
     meta = dict(out["meta"])
     meta.setdefault("config", None)
     return meta
+
+
+def read_meta_at(ckpt_dir, step):
+    """`read_meta` of `step` through a read-only manager over `ckpt_dir`
+    (nothing is created or cleaned up). Raises if the step is missing or its
+    meta item is incomplete/unreadable."""
+    mgr = ocp.CheckpointManager(
+        os.path.abspath(ckpt_dir),
+        options=ocp.CheckpointManagerOptions(read_only=True, create=False),
+        item_handlers=_handlers(),
+    )
+    try:
+        return read_meta(mgr, step)
+    finally:
+        mgr.close()
 
 
 def restore_state(manager, step, abstract_state):

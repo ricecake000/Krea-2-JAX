@@ -26,6 +26,8 @@ Usage:
 import argparse
 import dataclasses
 import json
+import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -36,6 +38,8 @@ import jax
 import jax.numpy as jnp
 import optax
 from jax.sharding import NamedSharding, PartitionSpec as P
+
+from safetensors import safe_open
 
 from krea2_jax import fullft_ckpt
 from krea2_jax.checkpoint import (
@@ -371,6 +375,11 @@ def parse_args(argv=None):
     ap.add_argument("--resume", action="store_true",
                     help="continue from the newest checkpoint in "
                          "--output-dir/ckpt (starts fresh if there is none)")
+    ap.add_argument("--resume-step", type=int, default=None,
+                    help="resume from this checkpoint step instead of the "
+                         "newest; implies --resume. Newer step directories "
+                         "are renamed to <step>.superseded so they no longer "
+                         "shadow the resumed run")
     ap.add_argument("--export-every", type=int, default=0,
                     help="also write model_stepNNNNNN.safetensors every N "
                          "steps (0: export only at the end)")
@@ -385,8 +394,51 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+CMD_BUFFER_FLAG = "--xla_gpu_enable_command_buffer="
+
+
+def _command_buffer_flag(xla_flags):
+    """Value of the last --xla_gpu_enable_command_buffer= token in an
+    XLA_FLAGS string (XLA lets the last occurrence win), or None if absent."""
+    vals = [t[len(CMD_BUFFER_FLAG):] for t in (xla_flags or "").split()
+            if t.startswith(CMD_BUFFER_FLAG)]
+    return vals[-1] if vals else None
+
+
+def command_buffers_disabled(xla_flags):
+    """True iff XLA_FLAGS disables every HIP/CUDA command buffer type, i.e.
+    its last --xla_gpu_enable_command_buffer= token has an empty value."""
+    return _command_buffer_flag(xla_flags) == ""
+
+
+def _export_metadata(path):
+    """The safetensors __metadata__ dict of an export ({} when it has none);
+    raises if the file is unreadable."""
+    with safe_open(str(path), framework="numpy") as f:
+        return f.metadata() or {}
+
+
+def _unreadable_step(step, ckpt_dir, e):
+    return SystemExit(
+        f"checkpoint step {step} in {ckpt_dir} is incomplete or unreadable "
+        f"({e!r}); pass --resume-step <older step> "
+        f"(available: {fullft_ckpt.all_steps(str(ckpt_dir))})"
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
+    xla_flags = os.environ.get("XLA_FLAGS", "")
+    if (args.attn == "aiter" and jax.default_backend() in ("gpu", "rocm")
+            and not command_buffers_disabled(xla_flags)):
+        val = _command_buffer_flag(xla_flags)
+        raise SystemExit(
+            "--attn aiter needs XLA_FLAGS=--xla_gpu_enable_command_buffer= "
+            "(HIP command buffers break the aiter FFI kernels: "
+            "HIP_ERROR_StreamCaptureInvalidated); set it before launching"
+            + (f" (XLA_FLAGS has {CMD_BUFFER_FLAG}{val})" if val is not None
+               else "")
+        )
 
     cfg = KREA2_CONFIG
     if args.model_config:
@@ -399,7 +451,46 @@ def main(argv=None):
         raise SystemExit("--ema-decay must be in [0, 1)")
 
     resume_step = None
-    if ckpt_dir.exists():
+    saved_meta = None  # meta of resume_step, read once it is known
+    renames = []  # --resume-step: (src, dst) pairs, performed after validation
+    if args.resume_step is not None:
+        args.resume = True
+        steps = fullft_ckpt.all_steps(str(ckpt_dir))
+        if args.resume_step not in steps:
+            raise SystemExit(
+                f"--resume-step {args.resume_step}: no such checkpoint in "
+                f"{ckpt_dir} (available: {steps})"
+            )
+        resume_step = args.resume_step
+        # validate everything before renaming anything: the selected step
+        # must be readable and no rename target may exist
+        try:
+            saved_meta = fullft_ckpt.read_meta_at(str(ckpt_dir), resume_step)
+        except Exception as e:
+            raise _unreadable_step(resume_step, ckpt_dir, e) from e
+        renames = [(ckpt_dir / str(s), ckpt_dir / f"{s}.superseded")
+                   for s in steps if s > resume_step]
+        # a final export newer than the resumed step (or of unknown step)
+        # would otherwise pass for this run's result
+        final = out_dir / "model.safetensors"
+        if final.exists():
+            try:
+                exp_step = int(_export_metadata(final)["step"])
+            except Exception:
+                exp_step = None
+            if exp_step is None or exp_step > resume_step:
+                renames.append((final, out_dir / "model.safetensors.superseded"))
+        clash = [str(dst) for _, dst in renames if os.path.lexists(dst)]
+        if clash:
+            raise SystemExit(
+                f"--resume-step {resume_step}: cannot set the newer "
+                "checkpoints aside, these rename targets already exist: "
+                + ", ".join(clash) + "; move them out of the way first "
+                "(nothing was renamed)"
+            )
+        # nothing is renamed yet: that happens once the run configuration
+        # has been checked against the checkpoint (do_renames below)
+    elif ckpt_dir.exists():
         resume_step = fullft_ckpt.latest_step(str(ckpt_dir))
     if resume_step is not None and not args.resume:
         raise SystemExit(
@@ -408,10 +499,83 @@ def main(argv=None):
         )
     if args.resume and resume_step is None:
         print(f"no checkpoint in {ckpt_dir}; starting fresh")
+
+    def do_renames():
+        # before make_manager opens the dir: orbax enumerates steps at open
+        for src, dst in renames:
+            os.rename(src, dst)
+            print(f"--resume-step {resume_step}: renamed newer "
+                  f"{'checkpoint' if src.parent == ckpt_dir else 'export'} "
+                  f"{src} -> {dst}", flush=True)
     if resume_step is not None and resume_step >= args.steps:
-        raise SystemExit(
-            f"checkpoint step {resume_step} >= --steps {args.steps}; nothing to do"
+        # no run-config check here (it needs the dataset and changes nothing
+        # in the exported weights): set newer steps aside and export
+        do_renames()
+        final = out_dir / "model.safetensors"
+        source = "ema" if use_ema else "params"
+        if final.exists():
+            try:
+                emeta = _export_metadata(final)
+                exported_step = emeta.get("step")
+                exported_src = emeta.get("source")
+                why = (f"it is from step {exported_step}" if exported_step
+                       and exported_step != str(resume_step) else
+                       "it records no step" if not exported_step else
+                       f"it is the {exported_src} export, {source} requested"
+                       if exported_src != source else None)
+            except Exception as e:
+                why = f"it is unreadable ({e!r})"
+            if why is None:
+                print(f"checkpoint step {resume_step} >= --steps {args.steps}; "
+                      "nothing to do")
+                return
+            print(f"checkpoint step {resume_step} >= --steps; training is "
+                  f"complete but {final} is stale ({why}): re-exporting "
+                  f"step {resume_step}", flush=True)
+        else:
+            # the run finished training but died before/while exporting
+            print(f"checkpoint step {resume_step} >= --steps; training is "
+                  "complete but model.safetensors is missing: exporting it "
+                  "now", flush=True)
+        # export the checkpoint on the host (no mesh, no base load) and stop;
+        # provenance comes from the checkpoint's own run config
+        meta = saved_meta
+        if meta is None:
+            try:
+                meta = fullft_ckpt.read_meta_at(str(ckpt_dir), resume_step)
+            except Exception as e:
+                raise _unreadable_step(resume_step, ckpt_dir, e) from e
+        if use_ema and not meta.get("has_ema", False):
+            raise SystemExit(
+                f"checkpoint step {resume_step} has no EMA weights (saved with "
+                "EMA disabled) but the restore target expects one; rerun "
+                "with --ema-decay 0 to export its params"
+            )
+        config = meta.get("config") or {}
+        res = config.get("resolution")
+        if res is None:  # older checkpoint without a run config
+            txt_len = args.txt_len if args.txt_len == "auto" else int(args.txt_len)
+            res = CachedDataset(args.cache_dir, txt_len).resolution
+        base_name = config.get("base_ckpt") or Path(args.base_ckpt).name
+        t_exp = time.time()
+        try:
+            tree, _ = fullft_ckpt.restore_tree_on_host(
+                str(ckpt_dir), step=resume_step, item=source
+            )
+        except Exception as e:
+            raise _unreadable_step(resume_step, ckpt_dir, e) from e
+        save_krea2_params(
+            str(final), tree, dtype=jnp.bfloat16,
+            metadata={
+                "step": str(resume_step),
+                "base": base_name,
+                "resolution": str(res),
+                "source": source,
+            },
         )
+        print(f"exported {final} ({source}, bf16) "
+              f"in {time.time() - t_exp:.0f}s")
+        return
 
     mesh = make_mesh()
     n_dev = mesh.size
@@ -465,11 +629,17 @@ def main(argv=None):
         "act_sharding": args.act_sharding,
         "attn": args.attn,
     }
-    manager = fullft_ckpt.make_manager(str(ckpt_dir), max_to_keep=args.keep)
     if resume_step is not None:
-        # before the (slow) base load: fail fast on an incompatible resume
-        saved_meta = fullft_ckpt.read_meta(manager, resume_step)
+        # before the (slow) base load and before --resume-step renames
+        # anything: fail fast on an incompatible resume
+        if saved_meta is None:
+            try:
+                saved_meta = fullft_ckpt.read_meta_at(str(ckpt_dir), resume_step)
+            except Exception as e:
+                raise _unreadable_step(resume_step, ckpt_dir, e) from e
         check_resume_config(saved_meta.get("config"), run_config, resume_step)
+        do_renames()
+    manager = fullft_ckpt.make_manager(str(ckpt_dir), max_to_keep=args.keep)
 
     # --- model: fp32 master weights, FSDP-sharded ---
     print("loading base checkpoint as fp32 (this can take a few minutes)...")
@@ -573,6 +743,32 @@ def main(argv=None):
     batches = iter(loader)
     ema_loss, t_log, n_log = None, time.time(), 0
     t_train, last_step = time.time(), start_step
+
+    # SIGTERM (preemption notice) / SIGINT: finish the current step, then
+    # save + export + exit 0 like --max-hours; a second signal aborts hard
+    # (the operator sees "<SIG> received; stopping at step N" within a step)
+    stop = {"sig": None}
+
+    def on_signal(signum, frame):
+        if stop["sig"] is not None:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        # flag only: no I/O in the handler (a print here can raise a
+        # reentrant-call or broken-pipe error into the main thread); the
+        # loop acknowledges the signal within one step
+        stop["sig"] = signal.Signals(signum).name
+
+    def log(msg):
+        # best effort: a broken stdout must never skip save(last_step)
+        try:
+            print(msg, flush=True)
+        except (OSError, ValueError):
+            pass
+
+    prev_handlers = {
+        sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)
+    }
     try:
         for step in range(start_step + 1, args.steps + 1):
             lat_np, txt_np, mask_np = next(batches)
@@ -592,27 +788,41 @@ def main(argv=None):
                 gnorm = float(metrics["grad_norm"])
                 ema_loss = loss if ema_loss is None else 0.9 * ema_loss + 0.1 * loss
                 dt = time.time() - t_log
-                print(
+                log(
                     f"step {step:6d}/{args.steps}  loss {loss:.6f}  "
                     f"ema_loss {ema_loss:.6f}  gnorm {gnorm:.4f}  "
-                    f"lr {float(sched(step - 1)):.2e}  {dt / n_log:.2f}s/it",
-                    flush=True,
+                    f"lr {float(sched(step - 1)):.2e}  {dt / n_log:.2f}s/it"
                 )
                 t_log, n_log = time.time(), 0
+            # before the periodic save/export: the final save -> wait ->
+            # export below must run even if a periodic export would fail
+            if stop["sig"] is not None:
+                log(f"{stop['sig']} received; stopping at step {last_step} "
+                    "(resume with --resume)")
+                break
             if args.save_every and step % args.save_every == 0 and step < args.steps:
                 save(step)
             if args.export_every and step % args.export_every == 0 and step < args.steps:
                 export(step)
             if args.max_hours and time.time() - t_train > args.max_hours * 3600:
-                print(f"--max-hours {args.max_hours} reached; "
-                      f"stopping at step {last_step}")
+                log(f"--max-hours {args.max_hours} reached; "
+                    f"stopping at step {last_step}")
                 break
+
+        save(last_step)
+        # resumable state is on disk before the export can fail (ENOSPC etc.)
+        fullft_ckpt.wait(manager)
+        export(last_step, final=True)
     finally:
         loader.close()
-
-    save(last_step)
-    export(last_step, final=True)
-    fullft_ckpt.wait(manager)
+        try:
+            # a pending async save is dropped if the interpreter exits first
+            fullft_ckpt.wait(manager)
+        except Exception as e:  # never mask the original exception
+            print(f"WARNING: waiting for pending checkpoint writes failed: "
+                  f"{e!r}", file=sys.stderr, flush=True)
+        for sig, h in prev_handlers.items():
+            signal.signal(sig, h)
     print("done.")
 
 
