@@ -12,6 +12,11 @@ text states), so full fine-tuning streams batches from disk instead:
   `batch_size` consecutive indices, the incomplete tail is dropped), but with
   per-epoch seeding so a resumed run can fast-forward to any step
   arithmetically and see exactly the batches of an uninterrupted run.
+
+Full fine-tuning on the curated aspect-bucketed dataset uses
+`BucketDataset` / `BucketBatchLoader` instead: VAE latents only (format
+`krea2-latents-v1`, written by scripts/cache_latents.py) plus raw captions
+from metadata.parquet, tokenized per batch for the online text encoder.
 """
 
 import collections
@@ -21,8 +26,11 @@ import json
 import threading
 from pathlib import Path
 
+import ml_dtypes
 import numpy as np
 from safetensors import safe_open
+
+BF16 = ml_dtypes.bfloat16
 
 
 class CachedDataset:
@@ -185,13 +193,16 @@ class BatchLoader:
         self.start_step = start_step
         self.prefetch = int(prefetch)
         self.steps_per_epoch = dataset.n // batch_size
-        lat_spec, txt_spec = dataset.sample_spec()
-        self._lat_shape, self._lat_dtype = lat_spec
-        self._txt_row, self._txt_dtype = txt_spec
+        self._init_spec()
         self._closed = False
         self._lock = threading.Lock()
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(workers), thread_name_prefix="BatchLoader")
+
+    def _init_spec(self):
+        lat_spec, txt_spec = self.dataset.sample_spec()
+        self._lat_shape, self._lat_dtype = lat_spec
+        self._txt_row, self._txt_dtype = txt_spec
 
     def permutation(self, epoch):
         return np.random.default_rng([self.seed, epoch]).permutation(
@@ -203,7 +214,7 @@ class BatchLoader:
         pos = k * self.batch_size
         return self.permutation(epoch)[pos:pos + self.batch_size]
 
-    def _schedule(self, idx):
+    def _schedule(self, idx, epoch):
         B, L = len(idx), self.dataset.txt_len
         lat = np.empty((B,) + tuple(self._lat_shape), dtype=self._lat_dtype)
         txt = np.empty((B, L) + tuple(self._txt_row), dtype=self._txt_dtype)
@@ -228,7 +239,8 @@ class BatchLoader:
                     if e != epoch:
                         epoch, perm = e, self.permutation(e)
                     pos = k * self.batch_size
-                    item = self._schedule(perm[pos:pos + self.batch_size])
+                    item = self._schedule(perm[pos:pos + self.batch_size],
+                                          epoch)
                     if item is None:  # closed (possibly from another thread)
                         return
                     inflight.append(item)
@@ -266,3 +278,326 @@ class BatchLoader:
             self.close(wait=False)
         except Exception:
             pass
+
+
+LATENT_FORMAT = "krea2-latents-v1"
+CAPTION_FIELDS = ("long", "medium", "short")
+ARTIST_SUFFIX = ", drawn by {}"
+
+
+def _examples(items, k=5):
+    items = list(items)
+    more = f", ... (+{len(items) - k})" if len(items) > k else ""
+    return ", ".join(str(x) for x in items[:k]) + more
+
+
+class BucketDataset:
+    """Aspect-bucketed latent cache (`krea2-latents-v1`) + raw captions.
+
+    data_dir holds metadata.parquet and latents/{manifest.json, *.safetensors}
+    (one bf16 tensor (C, bucket_h // 8, bucket_w // 8) per sample, keyed by
+    str(id)). Samples are ordered by `id` ascending; sample index i refers to
+    `self.ids[i]`. Only safetensors headers are read at construction; every
+    parquet id must have exactly one latent of the bucket's shape (and vice
+    versa), else ValueError listing every problem with counts.
+
+    template: a text_template.CaptionTemplate (tokenizes captions per batch).
+    img_tokens: static image-token rows per sample (h_tok * w_tok <= it).
+    caption_probs: probabilities of the long / medium / short caption.
+    artist_prob: probability of appending ", drawn by {artist_name}" (never
+    for an empty artist_name).
+    """
+
+    def __init__(self, data_dir, template, img_tokens=4096, patch=2,
+                 caption_probs=(0.5, 0.3, 0.2), artist_prob=0.5):
+        import pyarrow.parquet as pq
+
+        self.data_dir = Path(data_dir)
+        self.template = template
+        self.img_tokens = int(img_tokens)
+        self.patch = int(patch)
+        probs = np.asarray(caption_probs, dtype=np.float64)
+        if (probs.shape != (len(CAPTION_FIELDS),) or np.any(probs < 0)
+                or not abs(probs.sum() - 1.0) < 1e-6):
+            raise ValueError(
+                f"caption_probs must be {len(CAPTION_FIELDS)} non-negative "
+                f"probabilities (long, medium, short) summing to 1, got "
+                f"{caption_probs}")
+        self.caption_probs = tuple(float(x) for x in probs)
+        self.artist_prob = float(artist_prob)
+        if not 0.0 <= self.artist_prob <= 1.0:
+            raise ValueError(f"artist_prob must be in [0, 1], got {artist_prob}")
+        if self.patch < 1 or self.img_tokens < 1:
+            raise ValueError("patch and img_tokens must be >= 1")
+
+        # --- metadata.parquet, reordered by id ---
+        meta_path = self.data_dir / "metadata.parquet"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"{meta_path} not found")
+        cols = ("id", "bucket_w", "bucket_h") + CAPTION_FIELDS + (
+            "artist_name",)
+        table = pq.read_table(meta_path, columns=list(cols))
+        ids = table.column("id").to_numpy().astype(np.int64)
+        if len(ids) == 0:
+            raise ValueError(f"{meta_path} has no rows")
+        order = np.argsort(ids, kind="stable")
+        self.ids = ids[order]
+        dup = self.ids[1:][self.ids[1:] == self.ids[:-1]]
+        if len(dup):
+            raise ValueError(f"{meta_path}: {len(dup)} duplicate ids "
+                             f"({_examples(np.unique(dup))})")
+        self.ids.setflags(write=False)
+        self.n = len(self.ids)
+        self.bucket_wh = np.stack(
+            [table.column("bucket_w").to_numpy()[order],
+             table.column("bucket_h").to_numpy()[order]],
+            axis=1).astype(np.int64)
+        order_l = order.tolist()
+
+        def strings(name):
+            col = table.column(name).to_pylist()
+            return [col[j] or "" for j in order_l]  # null -> ""
+
+        self._captions = tuple(strings(c) for c in CAPTION_FIELDS)
+        self._artist = strings("artist_name")
+
+        # --- latents/manifest.json + shard headers ---
+        lat_dir = self.data_dir / "latents"
+        man_path = lat_dir / "manifest.json"
+        if not man_path.exists():
+            raise FileNotFoundError(
+                f"{man_path} not found — run scripts/cache_latents.py "
+                "--write-manifest")
+        self.manifest = json.loads(man_path.read_text())
+        if self.manifest.get("format") != LATENT_FORMAT:
+            raise ValueError(f"{man_path}: format "
+                             f"{self.manifest.get('format')!r}, expected "
+                             f"{LATENT_FORMAT!r}")
+        self.vae = self.manifest.get("vae")
+        self.shards = [str(x) for x in self.manifest.get("shards", [])]
+        index = {int(x): j for j, x in enumerate(self.ids.tolist())}
+        shard_of = np.full((self.n,), -1, dtype=np.int32)
+        lat_shape = np.zeros((self.n, 3), dtype=np.int64)
+        extra, dupes, bad_keys, bad_dtype, missing_files = [], [], [], [], []
+        n_latents = 0
+        for s_idx, name in enumerate(self.shards):
+            path = lat_dir / name
+            if not path.exists():
+                missing_files.append(name)
+                continue
+            with safe_open(str(path), framework="numpy") as f:
+                for key in f.keys():
+                    n_latents += 1
+                    try:
+                        sid = int(key)
+                    except ValueError:
+                        bad_keys.append(f"{name}:{key}")
+                        continue
+                    j = index.get(sid)
+                    if j is None:
+                        extra.append(sid)
+                        continue
+                    if shard_of[j] >= 0:
+                        dupes.append(sid)
+                        continue
+                    sl = f.get_slice(key)
+                    shape = tuple(sl.get_shape())
+                    if sl.get_dtype() != "BF16":
+                        bad_dtype.append(f"{sid}:{sl.get_dtype()}")
+                    if len(shape) != 3:
+                        shape = (-1, -1, -1)
+                    shard_of[j] = s_idx
+                    lat_shape[j] = shape
+
+        problems = []
+        if missing_files:
+            problems.append(f"{len(missing_files)} manifest shards missing "
+                            f"on disk ({_examples(missing_files)})")
+        missing = self.ids[shard_of < 0]
+        if len(missing):
+            problems.append(f"{len(missing)} parquet ids have no latent "
+                            f"({_examples(missing.tolist())})")
+        for what, items in (("latents have no parquet row", extra),
+                            ("ids appear in more than one shard", dupes),
+                            ("latent keys are not integer ids", bad_keys),
+                            ("latents are not bf16", bad_dtype)):
+            if items:
+                problems.append(f"{len(items)} {what} ({_examples(items)})")
+        have = shard_of >= 0
+        chans = np.unique(lat_shape[have, 0])
+        if len(chans) > 1:
+            problems.append(f"latents have mixed channel counts "
+                            f"{chans.tolist()}")
+        self.lat_channels = int(chans[0]) if len(chans) else 0
+        expect = np.concatenate(
+            [np.full((self.n, 1), self.lat_channels, np.int64),
+             self.bucket_wh[:, ::-1] // 8], axis=1)  # (C, h // 8, w // 8)
+        bad_shape = have & np.any(lat_shape != expect, axis=1)
+        if bad_shape.any():
+            ex = [f"{self.ids[j]}:{tuple(lat_shape[j].tolist())}!="
+                  f"{tuple(expect[j].tolist())}"
+                  for j in np.flatnonzero(bad_shape)]
+            problems.append(f"{len(ex)} latents do not match their bucket "
+                            f"(C, bucket_h//8, bucket_w//8) ({_examples(ex)})")
+        lat_hw = expect[:, 1:]
+        bad_patch = np.any(lat_hw % self.patch != 0, axis=1)
+        if bad_patch.any():
+            ex = [f"{self.ids[j]}:{tuple(lat_hw[j].tolist())}"
+                  for j in np.flatnonzero(bad_patch)]
+            problems.append(f"{len(ex)} latent grids are not divisible by "
+                            f"patch {self.patch} ({_examples(ex)})")
+        hw = lat_hw // self.patch
+        too_big = hw[:, 0] * hw[:, 1] > self.img_tokens
+        if too_big.any():
+            ex = [f"{self.ids[j]}:{hw[j, 0]}x{hw[j, 1]}"
+                  for j in np.flatnonzero(too_big)]
+            problems.append(f"{len(ex)} samples exceed img_tokens "
+                            f"{self.img_tokens} ({_examples(ex)})")
+        man_n = self.manifest.get("n")
+        if man_n is not None and int(man_n) != n_latents:
+            problems.append(f"manifest n={man_n} but the shards hold "
+                            f"{n_latents} latents")
+        if problems:
+            raise ValueError(f"{self.data_dir}: latent cache does not match "
+                             "metadata.parquet:\n  " + "\n  ".join(problems))
+
+        self.shard_of = shard_of
+        self.hw = hw.astype(np.int32)
+        self.hw.setflags(write=False)
+        self.feat = self.lat_channels * self.patch * self.patch
+        self._choice_lock = threading.Lock()
+        self._choices = None  # ((seed, epoch), (variant, use_artist))
+        self._fingerprint = None
+
+    def __len__(self):
+        return self.n
+
+    def buckets(self):
+        """{(bucket_w, bucket_h): sample count}."""
+        out = collections.Counter(map(tuple, self.bucket_wh.tolist()))
+        return dict(sorted(out.items()))
+
+    def fingerprint(self):
+        """Hex sha256 of the sample manifest (ordered [id, bucket_w,
+        bucket_h, shard]), every caption field used (long, medium, short,
+        artist_name; hashed separately and included as `captions_sha256`)
+        and the preprocessing identity (format, vae, img_tokens, patch,
+        tokenizer template ids, text_rows, caption_probs, artist_prob).
+        Reads no latent; deterministic."""
+        if self._fingerprint is not None:
+            return self._fingerprint
+        h = hashlib.sha256()
+        for j in range(self.n):
+            for field in self._captions + (self._artist,):
+                h.update(field[j].encode("utf-8"))
+                h.update(b"\x1f")
+            h.update(b"\x1e")
+        t = self.template
+        ident = {
+            "format": self.manifest.get("format"),
+            "vae": self.vae,
+            "img_tokens": self.img_tokens,
+            "patch": self.patch,
+            "text_rows": t.text_rows,
+            "prefix_ids": [int(x) for x in t.prefix_ids],
+            "suffix_ids": [int(x) for x in t.suffix_ids],
+            "pad_id": int(t.pad_id),
+            "caption_probs": list(self.caption_probs),
+            "artist_prob": self.artist_prob,
+            "samples": [[i, w, hh, self.shards[s]] for i, (w, hh), s in zip(
+                self.ids.tolist(), self.bucket_wh.tolist(),
+                self.shard_of.tolist())],
+            "captions_sha256": h.hexdigest(),
+        }
+        blob = json.dumps(ident, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True)
+        self._fingerprint = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return self._fingerprint
+
+    def epoch_choices(self, seed, epoch):
+        """(variant (n,) int8 in {0: long, 1: medium, 2: short}, use_artist
+        (n,) bool) for every sample of `epoch`, drawn from
+        default_rng([seed, epoch, 1]); memoized for the last (seed, epoch).
+        The arrays are read-only."""
+        key = (int(seed), int(epoch))
+        with self._choice_lock:
+            if self._choices is not None and self._choices[0] == key:
+                return self._choices[1]
+            rng = np.random.default_rng([key[0], key[1], 1])
+            variant = rng.choice(len(CAPTION_FIELDS), size=self.n,
+                                 p=self.caption_probs).astype(np.int8)
+            use_artist = rng.random(self.n) < self.artist_prob
+            variant.setflags(write=False)
+            use_artist.setflags(write=False)
+            self._choices = (key, (variant, use_artist))
+            return variant, use_artist
+
+    def caption(self, i, variant, use_artist):
+        """Caption text of sample i: long/medium/short (variant 0/1/2) plus
+        ", drawn by {artist_name}" if use_artist and the artist is known."""
+        text = self._captions[int(variant)][i]
+        artist = self._artist[i]
+        if use_artist and artist:
+            text += ARTIST_SUFFIX.format(artist)
+        return text
+
+    def captions(self, idx, seed, epoch):
+        """Caption texts of samples `idx` as seen in `epoch`."""
+        variant, use_artist = self.epoch_choices(seed, epoch)
+        return [self.caption(int(i), variant[i], use_artist[i]) for i in idx]
+
+    def latent_path(self, i):
+        return self.data_dir / "latents" / self.shards[self.shard_of[i]]
+
+    def read_latent(self, i):
+        """(C, h, w) bf16 latent of sample i, as stored."""
+        with safe_open(str(self.latent_path(i)), framework="numpy") as f:
+            return f.get_tensor(str(int(self.ids[i])))
+
+    def read_latent_into(self, i, out_row):
+        """Host-patchify sample i's latent into out_row (img_tokens, C*p*p):
+        rows [:h_tok*w_tok] in krea2_jax.model.patchify layout (token-major
+        (h_tok, w_tok), features (C, p, p)), the rest zeroed."""
+        lat = self.read_latent(i)
+        C, p = self.lat_channels, self.patch
+        h, w = (int(x) for x in self.hw[i])
+        if lat.shape != (C, h * p, w * p):
+            raise ValueError(
+                f"{self.latent_path(i)}: latent {self.ids[i]} has shape "
+                f"{lat.shape}, expected {(C, h * p, w * p)}")
+        n_img = h * w
+        out_row[:n_img].reshape(h, w, C, p, p)[...] = lat.reshape(
+            C, h, p, w, p).transpose(1, 3, 0, 2, 4)
+        out_row[n_img:] = 0
+
+
+class BucketBatchLoader(BatchLoader):
+    """Epoch-shuffled, prefetching batch iterator over a BucketDataset.
+
+    Same order / tail-drop / `start_step` fast-forward / threading / close
+    semantics as BatchLoader. Captions of epoch e use
+    dataset.epoch_choices(seed, e) and are tokenized once per batch (in the
+    iterating thread) with dataset.template.encode_captions; latents are read
+    and patchified by the worker threads into a preallocated batch array.
+
+    Yields numpy (img (B, img_tokens, C*p*p) bf16 — rows >= h_tok*w_tok are
+    zero, hw (B, 2) int32 (h_tok, w_tok), ids (B, template.total_len) int32,
+    txt_len (B,) int32).
+    """
+
+    def _init_spec(self):
+        pass
+
+    def _schedule(self, idx, epoch):
+        ds = self.dataset
+        B = len(idx)
+        img = np.empty((B, ds.img_tokens, ds.feat), dtype=BF16)
+        hw = np.ascontiguousarray(ds.hw[idx], dtype=np.int32)
+        ids, txt_len = ds.template.encode_captions(
+            ds.captions(idx, self.seed, epoch))
+        with self._lock:
+            if self._closed:
+                return None
+            futs = [self._pool.submit(ds.read_latent_into, int(i), img[j])
+                    for j, i in enumerate(idx)]
+        return futs, (img, hw, ids, txt_len)

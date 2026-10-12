@@ -35,6 +35,14 @@ TINY = dict(
     layers=2, patch=2, channels=4, txtheads=4, txtkvheads=4, txtlayers=3,
 )
 TINY_JSON = json.dumps(TINY)
+# Qwen3TextConfig overrides matching TINY (hidden 64 = txtdim, 3 select
+# layers = txtlayers); same shape as tests/test_qwen3_text.py's tiny encoder
+TINY_TEXT = dict(
+    vocab_size=600, hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+    head_dim=16, intermediate_size=96, mrope_section=[4, 2, 2],
+    select_layers=[0, 1, 2],
+)
+TINY_TEXT_JSON = json.dumps(TINY_TEXT)
 
 CASES = []
 
@@ -80,8 +88,9 @@ def run_script(script, *args, env=None, timeout=900, expect_ok=True):
 # ---------------------------------------------------------------------------
 
 AOT_ARGS = (
-    "--model-config", TINY_JSON, "--batch-size", 16, "--resolution", 256,
-    "--txt-len", 64, "--qchunk", 128, "--emulate-devices", 8,
+    "--model-config", TINY_JSON, "--text-model-config", TINY_TEXT_JSON,
+    "--batch-size", 16, "--img-tokens", 256, "--bucket", "192x320",
+    "--text-rows", 64, "--qchunk", 128, "--emulate-devices", 8,
     "--remat-policy", "dots", "--act-numel", 2e5,
 )
 VERDICT_RE = re.compile(r"^activation collectives: (NONE|FOUND (\d+))", re.M)
@@ -92,8 +101,10 @@ def aot_analysis_verdict():
     verdicts = {}
     for mode in ("on", "off"):
         _, out = run_script("aot_analysis.py", *AOT_ARGS, "--act-sharding", mode)
-        for needle in ("params: ", "sequence: ", "lowered in", "compiled (cpu",
-                       "memory_analysis", "cost_analysis", "collectives: ",
+        for needle in ("params: ", "sequence: bucket 192x320px -> 20x12 = 240 "
+                       "valid of 256 img rows", "text tower: ", "lowered in",
+                       "compiled (cpu", "memory_analysis", "cost_analysis",
+                       "analytic text-tower flops", "collectives: ",
                        "CPU backend caveats"):
             assert needle in out, f"--act-sharding {mode}: no {needle!r}\n{out}"
         m = VERDICT_RE.search(out)
@@ -107,10 +118,15 @@ def aot_analysis_verdict():
 @case
 def bench_step_modes():
     common = ("--random-weights", "--model-config", TINY_JSON,
-              "--batch-size", 8, "--width", 128, "--height", 128,
-              "--txt-len", 16, "--qchunk", 128, "--steps", 2, "--warmup", 1)
+              "--text-model-config", TINY_TEXT_JSON, "--batch-size", 8,
+              "--img-tokens", 64, "--bucket", "96x160", "--text-rows", 16,
+              "--qchunk", 128, "--steps", 2, "--warmup", 1)
     for mode in ("fwd", "fwdbwd", "train"):
         _, out = run_script("bench_step.py", *common, "--mode", mode)
+        assert "bucket 96x160px (60 of 64 img rows" in out, out
+        if mode == "train":
+            assert "text tower (random bf16, replicated)" in out, out
+            assert "+ text tower forward" in out, out
         m = re.search(r"step time: median ([\d.]+) ms over (\d+) steps", out)
         assert m and int(m.group(2)) == 2, out
         assert re.search(r"analytic [\d.]+ TFLOP/s per device", out), out

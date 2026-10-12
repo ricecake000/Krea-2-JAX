@@ -823,3 +823,32 @@ def build_positions_and_mask(txt_mask, h_tokens, w_tokens):
     imgmask = jnp.ones((B, h_tokens * w_tokens), dtype=bool)
     mask = jnp.concatenate([txt_mask, imgmask], axis=1)
     return pos, mask
+
+
+def build_positions_and_mask_bucketed(txt_mask, hw, img_tokens):
+    """Combined (pos, mask) for [text, image] sequences whose image part is
+    a static `img_tokens` rows holding a per-sample (h_b, w_b) token grid
+    (aspect-bucketed batches; rows >= h_b * w_b are padding).
+
+    txt_mask: (B, Ltxt) bool; hw: (B, 2) int (h_tokens, w_tokens) per sample
+    with h_b * w_b <= img_tokens. Returns pos (B, Ltxt+img_tokens, 3) f32 —
+    text rows (0, 0, 0), image token i of sample b at (0, i // w_b, i % w_b)
+    for i < h_b * w_b and (0, 0, 0) beyond — and mask (B, Ltxt+img_tokens)
+    bool = txt_mask ++ (i < h_b * w_b). Pure jnp (traceable under jit with
+    hw a traced array); equals `build_positions_and_mask(txt_mask, h, w)`
+    when every sample has (h_b, w_b) == (h, w) and h * w == img_tokens.
+    """
+    B, Ltxt = txt_mask.shape
+    hw = jnp.asarray(hw).astype(jnp.int32)
+    h, w = hw[:, 0:1], hw[:, 1:2]                            # (B, 1)
+    i = jnp.arange(img_tokens, dtype=jnp.int32)[None, :]     # (1, N)
+    valid = i < h * w                                        # (B, N)
+    w_safe = jnp.maximum(w, 1)
+    row = jnp.where(valid, i // w_safe, 0)
+    col = jnp.where(valid, i % w_safe, 0)
+    imgpos = jnp.stack([jnp.zeros_like(row), row, col], axis=-1)
+    imgpos = imgpos.astype(jnp.float32)
+    txtpos = jnp.zeros((B, Ltxt, 3), dtype=jnp.float32)
+    pos = jnp.concatenate([txtpos, imgpos], axis=1)
+    mask = jnp.concatenate([jnp.asarray(txt_mask).astype(bool), valid], axis=1)
+    return pos, mask

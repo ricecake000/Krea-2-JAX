@@ -77,7 +77,6 @@ class CaptionTemplate:
         B = len(encs)
         ids = np.full((B, self.total_len), self.pad_id, dtype=np.int32)
         txt_len = np.zeros((B,), dtype=np.int32)
-        p = len(self.prefix_ids)
         for b, e in enumerate(encs):
             cap = list(e.ids)[:self.max_caption_tokens]
             row = self.prefix_ids + cap + self.suffix_ids

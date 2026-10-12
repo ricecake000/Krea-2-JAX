@@ -1,8 +1,9 @@
 """Ahead-of-time analysis of the full fine-tuning step (no weights, no data).
 
 Lowers and compiles the exact `scripts/train_full.py` train step
-(`train_full.make_train_step`: fp32 master weights, AdamW, EMA, bf16
-forward/backward) for abstract FSDP-sharded shapes, then prints what XLA
+(`train_full.make_train_step`: online Qwen3-VL text tower (bf16, replicated,
+no gradient), fp32 master weights, AdamW, EMA, bf16 forward/backward over
+bucketed image rows) for abstract FSDP-sharded shapes, then prints what XLA
 decided: per-device memory, cost analysis and every SPMD collective it
 emitted, plus a verdict on whether full activations are being moved between
 devices (the failure mode `--act-sharding on` exists to prevent).
@@ -12,8 +13,13 @@ nor a dataset cache, and on a machine without accelerators it emulates N CPU
 devices so the SPMD partitioning (and its collectives) can be inspected
 anywhere.
 
-    python scripts/aot_analysis.py --batch-size 64 --resolution 1024 \
-        --txt-len 512 --remat-policy dots --act-sharding on
+    python scripts/aot_analysis.py --batch-size 64 --img-tokens 4096 \
+        --text-rows 256 --remat-policy dots --act-sharding on
+
+The text tower defaults to the real Qwen3-VL-4B config (Qwen3TextConfig()
+defaults; no files needed); --text-model-config overrides its fields (tiny
+configs for tests). Every sample uses the --bucket grid (default: the
+largest square that fits --img-tokens, 64x64 tokens = 1024x1024 px).
 
 Verdict rule: a collective whose result has shape[0] == global batch and at
 least --act-numel elements (default 1e7) is an activation collective.
@@ -60,13 +66,17 @@ def setup_emulation(n):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--batch-size", type=int, default=64, help="global batch")
-    ap.add_argument("--resolution", type=int, default=1024,
-                    help="square training resolution in pixels")
-    ap.add_argument("--width", type=int, default=None,
-                    help="pixel width (overrides --resolution)")
-    ap.add_argument("--height", type=int, default=None,
-                    help="pixel height (overrides --resolution)")
-    ap.add_argument("--txt-len", type=int, default=512)
+    ap.add_argument("--text-rows", type=int, default=256,
+                    help="caption + suffix rows handed to the DiT")
+    ap.add_argument("--img-tokens", type=int, default=4096,
+                    help="static image-token rows per sample")
+    ap.add_argument("--bucket", default=None,
+                    help="WxH pixel bucket of every sample, e.g. 832x1216 "
+                         "(default: the largest square grid that fits "
+                         "--img-tokens)")
+    ap.add_argument("--text-model-config", default=None,
+                    help="JSON object of Qwen3TextConfig field overrides "
+                         "(default: the real Qwen3-VL-4B text tower)")
     ap.add_argument("--remat-policy", choices=["full", "dots", "none"],
                     default="dots")
     ap.add_argument("--attn", choices=["ref", "splash", "aiter"], default="ref")
@@ -74,7 +84,10 @@ def parse_args(argv=None):
     ap.add_argument("--act-sharding", choices=["on", "off"], default="on")
     ap.add_argument("--ema-decay", type=float, default=0.999,
                     help="0 drops the EMA tree from the step")
-    ap.add_argument("--qchunk", type=int, default=512)
+    ap.add_argument("--qchunk", type=int, default=256,
+                    help="ref attention query chunk; must divide the padded "
+                         "sequence (4096 + 256 = 4352 = 17 x 256), else ref "
+                         "falls back to dense attention")
     ap.add_argument("--timestep-mu", type=float, default=None)
     ap.add_argument("--model-config", default=None,
                     help="JSON object of Krea2Config field overrides "
@@ -175,6 +188,44 @@ def print_collectives_table(colls, top=40):
 # ---------------------------------------------------------------------------
 
 
+def bucket_and_text_config(cfg, args):
+    """(Qwen3TextConfig, h_tok, w_tok) for --text-model-config / --bucket /
+    --img-tokens; checks the text tower fits the DiT (hidden == txtdim,
+    len(select_layers) == txtlayers) and the grid fits --img-tokens. Shared
+    with scripts/bench_step.py."""
+    import json
+    import math
+
+    from krea2_jax.qwen3_text import Qwen3TextConfig
+
+    txt_cfg = Qwen3TextConfig(**json.loads(args.text_model_config or "{}"))
+    if txt_cfg.hidden_size != cfg.txtdim:
+        raise SystemExit(f"text hidden_size {txt_cfg.hidden_size} != DiT "
+                         f"txtdim {cfg.txtdim}")
+    if len(txt_cfg.select_layers) != cfg.txtlayers:
+        raise SystemExit(f"{len(txt_cfg.select_layers)} text select_layers != "
+                         f"DiT txtlayers {cfg.txtlayers}")
+    if args.text_rows <= txt_cfg.suffix_len:
+        raise SystemExit(f"--text-rows must exceed the suffix length "
+                         f"{txt_cfg.suffix_len}")
+    if args.bucket:
+        try:
+            w_px, h_px = (int(x) for x in args.bucket.lower().split("x"))
+        except ValueError:
+            raise SystemExit(f"--bucket must be WxH pixels, got {args.bucket!r}")
+        unit = cfg.vae_compression * cfg.patch
+        if w_px % unit or h_px % unit or w_px <= 0 or h_px <= 0:
+            raise SystemExit(f"--bucket sides must be positive multiples of "
+                             f"{unit}")
+        h_tok, w_tok = h_px // unit, w_px // unit
+    else:
+        h_tok = w_tok = math.isqrt(args.img_tokens)
+    if not 0 < h_tok * w_tok <= args.img_tokens:
+        raise SystemExit(f"bucket {w_tok}x{h_tok} tokens does not fit "
+                         f"--img-tokens {args.img_tokens}")
+    return txt_cfg, h_tok, w_tok
+
+
 def main(argv=None):
     args = parse_args(argv)
     emulate = args.emulate_devices
@@ -194,11 +245,16 @@ def main(argv=None):
     import jax.numpy as jnp
     import numpy as np
 
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
     import train_full as tf
     from krea2_jax.checkpoint import (
         abstract_krea2_params, batch_sharding, make_mesh, param_shardings,
     )
     from krea2_jax.config import KREA2_CONFIG
+    from krea2_jax.qwen3_text import abstract_qwen3_text_params
+
+    GiB = 2**30
 
     cfg = KREA2_CONFIG
     if args.model_config:
@@ -225,15 +281,11 @@ def main(argv=None):
         raise SystemExit(f"--batch-size {args.batch_size} is not divisible by "
                          f"{n_dev} devices")
 
-    width = args.width or args.resolution
-    height = args.height or args.resolution
-    comp = cfg.vae_compression
-    if width % (comp * cfg.patch) or height % (comp * cfg.patch):
-        raise SystemExit(f"width/height must be multiples of {comp * cfg.patch}")
-    lat_h, lat_w = height // comp, width // comp
-    h_tok, w_tok = lat_h // cfg.patch, lat_w // cfg.patch
+    txt_cfg, h_tok, w_tok = bucket_and_text_config(cfg, args)
+    width = w_tok * cfg.vae_compression * cfg.patch
+    height = h_tok * cfg.vae_compression * cfg.patch
     img_seq = h_tok * w_tok
-    total = img_seq + args.txt_len
+    total = args.img_tokens + args.text_rows
     padded = -(-total // cfg.seq_pad_multiple) * cfg.seq_pad_multiple
     mu = args.timestep_mu if args.timestep_mu is not None else cfg.mu_for_seq_len(img_seq)
     B = args.batch_size
@@ -250,15 +302,30 @@ def main(argv=None):
     n_split = sum(not sh.is_fully_replicated for sh in jax.tree.leaves(pshard))
     print(f"params: {n_params / 1e9:.3f}B in {len(leaves)} leaves "
           f"({n_split} FSDP-sharded)")
-    print(f"sequence: {width}x{height}px -> latent {lat_h}x{lat_w}, "
-          f"{img_seq} img tokens + txt_len {args.txt_len} = {total} "
-          f"-> padded {padded}; mu {mu:.4f}")
+    print(f"sequence: bucket {width}x{height}px -> {h_tok}x{w_tok} = {img_seq} "
+          f"valid of {args.img_tokens} img rows + text_rows {args.text_rows} = "
+          f"{total} -> padded {padded}; mu {mu:.4f}"
+          + (" (--timestep-mu)" if args.timestep_mu is not None else
+             " (per sample)"))
+    abs_txt = abstract_qwen3_text_params(txt_cfg, jnp.bfloat16)
+    rep = NamedSharding(mesh, P())
+    txt_params = jax.tree.map(
+        lambda s: jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=rep), abs_txt)
+    n_txt = sum(int(np.prod(x.shape)) for x in jax.tree.leaves(abs_txt))
+    n_txt_dense = n_txt - int(np.prod(abs_txt["embed_tokens"].shape))
+    txt_len_total = txt_cfg.prefix_len + args.text_rows
+    print(f"text tower: {n_txt / 1e9:.3f}B params ({txt_cfg.n_run_layers}/"
+          f"{txt_cfg.num_layers} layers, hidden {txt_cfg.hidden_size}, "
+          f"select_layers {list(txt_cfg.select_layers)}), bf16 replicated: "
+          f"{n_txt * 2 / GiB:.2f} GiB/device of the arguments; "
+          f"{txt_len_total} tokens/sample (prefix {txt_cfg.prefix_len})")
     print(f"step: batch {B} ({B // n_dev}/device) | remat {args.remat_policy} | "
           f"attn {args.attn} | act-sharding {args.act_sharding} | "
           f"qchunk {args.qchunk} | ema {args.ema_decay or 'off'}")
 
     hp = tf.parse_args([
-        "--base-ckpt", "-", "--cache-dir", "-", "--output-dir", "-",
+        "--base-ckpt", "-", "--data-dir", "-", "--text-encoder", "-",
+        "--output-dir", "-",
         "--remat-policy", args.remat_policy, "--attn", args.attn,
         "--attn-block", str(args.attn_block), "--act-sharding", args.act_sharding,
         "--ema-decay", str(args.ema_decay), "--qchunk", str(args.qchunk),
@@ -274,21 +341,23 @@ def main(argv=None):
     ema = params if use_ema else None
 
     ds = batch_sharding(mesh)
-    b_lat = jax.ShapeDtypeStruct((B, cfg.channels, lat_h, lat_w), jnp.bfloat16,
+    feat = cfg.channels * cfg.patch * cfg.patch
+    b_img = jax.ShapeDtypeStruct((B, args.img_tokens, feat), jnp.bfloat16,
                                  sharding=ds)
-    b_txt = jax.ShapeDtypeStruct((B, args.txt_len, cfg.txtlayers, cfg.txtdim),
-                                 jnp.bfloat16, sharding=ds)
-    b_mask = jax.ShapeDtypeStruct((B, args.txt_len), jnp.bool_, sharding=ds)
+    b_hw = jax.ShapeDtypeStruct((B, 2), jnp.int32, sharding=ds)
+    b_ids = jax.ShapeDtypeStruct((B, txt_len_total), jnp.int32, sharding=ds)
+    b_tl = jax.ShapeDtypeStruct((B,), jnp.int32, sharding=ds)
     key = jax.eval_shape(lambda: jax.random.PRNGKey(0))
 
     train_step = tf.make_train_step(
-        cfg, hp, mesh, tx, mu, h_tok, w_tok, use_ema, pshard, opt_shard
+        cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
+        args.img_tokens, mu_override=args.timestep_mu,
     )
     t0 = time.time()
-    lowered = train_step.lower(params, opt_state, ema, b_lat, b_txt, b_mask, key)
+    lowered = train_step.lower(params, opt_state, ema, txt_params, b_img, b_hw,
+                               b_ids, b_tl, key)
     print(f"lowered in {time.time() - t0:.1f}s")
 
-    GiB = 2**30
     if args.no_compile:
         text = lowered.as_text()
         print("--no-compile: StableHLO before SPMD partitioning; collectives "
@@ -328,6 +397,11 @@ def main(argv=None):
         analytic = 6 * n_params * padded * B / n_dev
         print(f"analytic model flops (6 * params * padded_tokens * batch / "
               f"devices): {analytic:.3e} per device per step (before remat)")
+        txt_flops = 2 * n_txt_dense * txt_len_total * B / n_dev
+        print(f"analytic text-tower flops (forward only, 2 * non-embedding "
+              f"params * {txt_len_total} tokens * batch / devices): "
+              f"{txt_flops:.3e} per device per step "
+              f"({100 * txt_flops / max(analytic, 1):.1f}% of the DiT's)")
         text = compiled.as_text()
     if args.dump_hlo:
         Path(args.dump_hlo).write_text(text)

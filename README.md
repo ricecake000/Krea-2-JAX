@@ -165,16 +165,30 @@ inference repo or ComfyUI.
 
 `scripts/train_full.py` trains **every** DiT weight instead of a LoRA, on one
 host with 8 accelerators (developed for 8x AMD MI355X, 288 GB HBM each; any
-single-host JAX backend works). Same flow-matching objective, timestep
-sampling and data cache as the LoRA trainer; differences:
+single-host JAX backend works). Same flow-matching objective and
+logit-normal timestep sampling as the LoRA trainer; differences:
 
 - fp32 **master weights**, AdamW moments and an optional **EMA** copy, all
   FSDP-sharded across the 8 devices exactly like the base params (only
   scalars are replicated — the script asserts this at startup). The forward
   and backward run in bf16 from a per-step cast of the master weights.
-- The dataset is **streamed** from the cache (`krea2_jax/data.py`: a
-  background thread pool with a bounded prefetch queue), so ~100k samples
-  never have to fit in host RAM.
+- **Aspect-bucketed data**: the curated dataset (`ricecake/danbooru-curated-v2`,
+  96,848 images pre-cropped into 19 buckets of 3,840-4,096 image tokens)
+  is cached as **VAE latents only** (`scripts/cache_latents.py`); every
+  sample occupies a static `--img-tokens` (4096) rows — its own grid first,
+  masked padding after — and its timestep shift `mu` comes from its own
+  token count. The loss is a per-sample mean over the valid image tokens,
+  averaged over the batch (padded rows contribute nothing).
+- **Online text encoder**: captions are drawn per epoch (long / medium /
+  short with `--caption-probs`, `", drawn by <artist>"` with
+  `--artist-prob`), tokenized by the loader and encoded **inside the train
+  step** by a JAX port of the Qwen3-VL-4B text tower
+  (`krea2_jax/qwen3_text.py`; bf16, replicated, frozen, no gradient) —
+  caching 12 x 2560 hidden states per token for three caption variants would
+  be multi-TB.
+- The latents are **streamed** from disk (`krea2_jax/data.py`
+  `BucketBatchLoader`: a background thread pool with a bounded prefetch
+  queue), so ~100k samples never have to fit in host RAM.
 - Train state is checkpointed with **orbax** (async) under
   `<output-dir>/ckpt/<step>/`; `--resume` continues the newest step and
   reproduces the uninterrupted run (same data order, RNG and LR schedule).
@@ -288,29 +302,60 @@ runs inside `shard_map` over `P("fsdp")` (per-device segment offsets), like
 the Splash path. Check it on the node with `scripts/node_attention_parity.py`
 and `scripts/parity_full.py --attn aiter` before training with it.
 
-### Cache the dataset on all 8 GPUs
+### Dataset: cache the latents on all 8 GPUs
 
-Each shard is an independent process on one GPU; file numbering stays
-global, so shards never collide. A final unsharded pass reuses every entry
-(no model load) and writes `meta.json`:
+`train_full.py --data-dir` reads the `krea2-latents-v1` layout written by
+`scripts/cache_latents.py`:
 
-```bash
-for i in $(seq 0 7); do
-  HIP_VISIBLE_DEVICES=$i python scripts/cache_dataset.py \
-    --data-dir ./data --cache-dir ./cache --resolution 1024 \
-    --num-shards 8 --shard-index $i --device cuda &
-done
-wait
-python scripts/cache_dataset.py --data-dir ./data --cache-dir ./cache --resolution 1024
+```
+<data-dir>/
+  metadata.parquet              # verbatim copy of the dataset's parquet: id, long/medium/short
+                                # captions, artist_name, bucket_w/bucket_h, tar, ...
+  latents/manifest.json         # {"format": "krea2-latents-v1", "vae", "n", "shards"}
+  latents/train-XXXX.safetensors  # one per source tar: "<id>" -> (16, bucket_h/8, bucket_w/8) bf16,
+                                  # VAE-normalized like cache_dataset.py
 ```
 
-(ROCm PyTorch exposes the GPUs as `cuda`.) Budget disk for the cache: a
-1024px latent is 0.5 MB and the text states ~60 KB per caption token, so
-~100k samples with ~100-token captions are ~650 GB.
+Only the latents are cached; the captions stay text in `metadata.parquet`
+and go through the text encoder online. The cache builder downloads each
+tar of the HF dataset (private: set `HF_TOKEN`; `--repo` defaults to
+`ricecake/danbooru-curated-v2`, `--tar-dir` reads local tars instead),
+VAE-encodes it per bucket, writes the shard atomically and deletes the tar
+(`--keep-tars` keeps it). One process per GPU over interleaved shards, then
+a manifest pass that copies the parquet and checks every id has exactly one
+latent of its bucket's shape:
+
+```bash
+OUT=/scratch/krea2-data
+for i in $(seq 0 7); do
+  HIP_VISIBLE_DEVICES=$i PYTHONUNBUFFERED=1 python scripts/cache_latents.py \
+    --out $OUT --num-workers 8 --worker-index $i --batch 8 > cache_w$i.log 2>&1 &
+done
+wait
+python scripts/cache_latents.py --out $OUT --write-manifest
+```
+
+(ROCm PyTorch exposes the GPUs as `cuda`.) Finished shards are skipped, so
+an interrupted run is simply restarted. Disk: the latents are ~49 GB bf16
+(~480 MB per shard of ~950 images) plus one in-flight tar per worker; there
+is no text cache.
+
+The text encoder (`--text-encoder`, a local HF dir or a repo id such as
+`Qwen/Qwen3-VL-4B-Instruct`, ~8.8 GB; only config, tokenizer and
+safetensors are fetched) is loaded by the trainer itself. To check the JAX
+port against the production torch conditioner on real weights:
+
+```bash
+python scripts/text_encoder_parity.py --tokenizer-only \
+  --text-encoder Qwen/Qwen3-VL-4B-Instruct --parquet $OUT/metadata.parquet
+python scripts/text_encoder_parity.py --text-encoder Qwen/Qwen3-VL-4B-Instruct \
+  --parquet $OUT/metadata.parquet --n 32 --dtype bf16 --torch-device cuda
+```
 
 ### Bring-up on a new node
 
-Run these before the first real training job; none needs the dataset cache.
+Run these before the first real training job; none needs the dataset cache
+or the text-encoder weights (the text tower is abstract / random).
 
 1. **`scripts/aot_analysis.py`** — compiles the exact train step for
    abstract shapes (no weights, no torch) and prints parameter count,
@@ -324,30 +369,39 @@ Run these before the first real training job; none needs the dataset cache.
    bf16 collectives show as f32, temp sizes are not representative).
 
    ```bash
-   python scripts/aot_analysis.py --batch-size 64 --resolution 1024 \
-     --txt-len 512 --remat-policy dots --attn ref --act-sharding on
+   python scripts/aot_analysis.py --batch-size 64 --img-tokens 4096 \
+     --text-rows 256 --remat-policy dots --attn ref --act-sharding on
    ```
 
-   Other flags: `--width/--height`, `--ema-decay`, `--qchunk`,
+   The step includes the online text tower (default: the real Qwen3-VL-4B
+   config, abstract bf16 params replicated on every device — 3.92B params,
+   7.3 GiB/device of the arguments); its parameter count, bytes and analytic
+   forward flops are printed next to the DiT's. Other flags: `--bucket WxH`
+   (pixel bucket of every sample; default the largest square grid fitting
+   `--img-tokens`, i.e. 1024x1024), `--text-model-config JSON`
+   (Qwen3TextConfig overrides), `--timestep-mu`, `--ema-decay`, `--qchunk`,
    `--model-config JSON`, `--no-compile` (lower only), `--dump-hlo PATH`.
 
 2. **`scripts/bench_step.py`** — step-time benchmark on random inputs:
    `--mode fwd` (forward), `fwdbwd` (value_and_grad w.r.t. bf16 weights,
    grads cast to `--grad-dtype`) or `train` (the real `train_full` step:
-   fp32 master + AdamW + EMA). Weights come from `--base-ckpt` or
-   `--random-weights` (generated on device). Prints median step time,
-   samples/s, analytic TFLOP/s per device (6 x params x padded tokens x
-   batch; x4/3 for `--remat-policy full`, x1.1 for `dots`; 2x for `fwd`) and
-   peak HBM when the backend reports it.
+   fp32 master + AdamW + EMA + the online text tower with random bf16
+   weights, replicated). DiT weights come from `--base-ckpt` or
+   `--random-weights` (generated on device). Inputs are a bucketed batch
+   (`--img-tokens` rows, every sample on the `--bucket` grid, random caption
+   ids / text states). Prints median step time, samples/s, analytic TFLOP/s
+   per device (6 x params x padded tokens x batch; x4/3 for
+   `--remat-policy full`, x1.1 for `dots`; 2x for `fwd`; `train` adds the
+   text tower's forward) and peak HBM when the backend reports it.
 
    ```bash
    python scripts/bench_step.py --random-weights --mode train \
-     --batch-size 64 --width 1024 --height 1024 --remat-policy dots \
+     --batch-size 64 --img-tokens 4096 --text-rows 256 --remat-policy dots \
      --attn aiter --act-sharding on --steps 10 --warmup 2
    ```
 
-   Also `--base-sharding fsdp|replicate`, `--txt-len`, `--qchunk`,
-   `--model-config`, `--seed`.
+   Also `--bucket WxH`, `--text-model-config`, `--timestep-mu`,
+   `--base-sharding fsdp|replicate`, `--qchunk`, `--model-config`, `--seed`.
 
 3. **`scripts/node_attention_parity.py`** — kernel-level check of
    `aiter_attention` against the reference attention (padded query rows
@@ -400,7 +454,8 @@ Run these before the first real training job; none needs the dataset cache.
 # 0.89 samples/s/GPU); `ref` is only the portable default
 python scripts/train_full.py \
   --base-ckpt ./ckpt/raw.safetensors \
-  --cache-dir ./cache --output-dir ./full_out \
+  --data-dir /scratch/krea2-data --text-encoder Qwen/Qwen3-VL-4B-Instruct \
+  --output-dir ./full_out \
   --steps 20000 --batch-size 32 --lr 1e-5 --warmup-steps 500 \
   --cosine-decay --min-lr 1e-6 --ema-decay 0.999 \
   --attn aiter --act-sharding on \
@@ -413,6 +468,14 @@ Useful knobs:
 
 | flag | default | notes |
 |---|---|---|
+| `--data-dir` | – | `krea2-latents-v1` dir from `scripts/cache_latents.py` (required) |
+| `--text-encoder` | – | Qwen3-VL text encoder: local HF dir or repo id (required); bf16, replicated (~7.8 GB/GPU), frozen |
+| `--text-rows` | 256 | caption + 5 suffix rows handed to the DiT; captions are truncated to 251 tokens |
+| `--img-tokens` | 4096 | static image rows per sample; every bucket's `h_tok * w_tok` must fit (the rest is masked) |
+| `--caption-probs` | 0.5,0.3,0.2 | long,medium,short caption probabilities, drawn per sample per epoch |
+| `--artist-prob` | 0.5 | probability of appending `", drawn by <artist>"` (never for an empty artist) |
+| `--timestep-mu` | per sample | one shift for every sample instead of `mu` from each sample's token count |
+| `--qchunk` | 256 | `ref` attention query chunk; must divide the padded sequence (4096 + 256 = 4352 = 17 x 256) |
 | `--batch-size` | 8 | global; must be divisible by the device count |
 | `--lr` / `--warmup-steps` | 1e-5 / 500 | linear warmup, then constant or `--cosine-decay` to `--min-lr` |
 | `--weight-decay`, `--beta1/2`, `--eps` | 0.01, 0.9/0.999, 1e-8 | AdamW; `--grad-clip 1.0` (global norm) |
@@ -454,9 +517,11 @@ Stopping, time budget and resuming:
 
 Node-local disk is wiped between leases, so copy `ckpt/<step>` off the node
 after each finalized save and copy it back before `--resume`. Build the
-dataset cache once and transfer it rather than rebuilding it per lease: the
+latent cache once and transfer it rather than rebuilding it per lease: the
 VAE posterior sample is unseeded, so a rebuild changes the latents while
-keeping the same fingerprint.
+keeping the same fingerprint. A rerun that only needs the final export
+(checkpoint step >= `--steps`) reads neither the dataset nor the text
+encoder.
 
 Memory (12.9B params, sharded over 8 devices; activations come on top and
 scale with batch size, resolution and `--remat-policy`):
@@ -469,9 +534,11 @@ scale with batch size, resolution and `--remat-policy`):
 | **persistent train state** | | **206 GB** | **25.8 GB** |
 | gradients (transient) | fp32 | 51.6 GB | 6.5 GB |
 | bf16 compute copy (transient) | bf16 | 25.8 GB | 3.2 GB |
+| text encoder (3.92B, replicated, frozen) | bf16 | 7.8 GB x 8 | 7.8 GB |
 
-So roughly 30-36 GB/GPU of state, leaving most of the 288 GB HBM for
-activations. Host RAM: loading the base checkpoint peaks at about one fp32
+So roughly 38-44 GB/GPU of state, leaving most of the 288 GB HBM for
+activations (the text tower's own activations are small: 290 tokens per
+sample, no gradient). Host RAM: loading the base checkpoint peaks at about one fp32
 copy (~52 GB) plus the bf16 file. Orbax async saves stage the **whole train
 state in host RAM** before `save` returns (~206 GB with EMA, ~155 GB with
 `--ema-decay 0`), so host RAM must comfortably exceed that plus the ~52 GB
@@ -479,21 +546,29 @@ base-load peak. Checkpoints on disk are the same ~206 GB / ~155 GB each, so
 size `--keep` to your disk.
 
 Every checkpoint records the run configuration, and `--resume` validates it
-against the current flags. Changing `--seed`, `--batch-size`, the resolved
-text length, the cache (resolution, sample count), the base checkpoint name,
-`--model-config`, `--timestep-mu` (resolved), `--logit-mean/--logit-std` or
-turning the EMA on/off is a hard error: those would silently change the data
-order, RNG, objective or train-state shape. Changing `--steps`, `--lr`,
-`--warmup-steps`, `--cosine-decay`, `--min-lr`, `--weight-decay`,
-`--beta1/2`, `--eps`, `--grad-clip` or the `--ema-decay` value only prints a
-warning, since the LR schedule is rebuilt and evaluated at the resumed step
-(e.g. extending a cosine run with a larger `--steps` changes the next LR).
+against the current flags. Changing `--seed`, `--batch-size`,
+`--text-rows`, `--img-tokens`, `--caption-probs`, `--artist-prob`, the
+dataset (fingerprint over ids, buckets, shards, every caption and artist
+name, the VAE id and the tokenizer's template ids; sample count; latent
+channels), the base checkpoint name, `--model-config`,
+`--text-model-config`, the text encoder's position mode, `--timestep-mu`,
+`--logit-mean/--logit-std` or turning the EMA on/off is a hard error: those
+would silently change the data order, captions, RNG, objective or
+train-state shape. Changing `--steps`, `--lr`, `--warmup-steps`,
+`--cosine-decay`, `--min-lr`, `--weight-decay`, `--beta1/2`, `--eps`,
+`--grad-clip` or the `--ema-decay` value only prints a warning, since the LR
+schedule is rebuilt and evaluated at the resumed step (e.g. extending a
+cosine run with a larger `--steps` changes the next LR). `--attn`,
+`--act-sharding` and the `--text-encoder` name (a local dir's basename or
+the repo id as given, so a local copy of the same weights may be swapped in)
+also only warn.
 Older checkpoints without a recorded configuration resume with a warning.
 
 ### Export and sample
 
 The run writes `<output-dir>/model.safetensors` (EMA weights when enabled,
-else the raw params; bf16, official keys) at the end, plus
+else the raw params; bf16, official keys; metadata `step`, `base`, `source`,
+`resolution: bucketed`, `img_tokens`) at the end, plus
 `model_stepNNNNNN.safetensors` every `--export-every` steps. Any orbax step
 can also be exported afterwards, on CPU, next to a running job:
 
@@ -522,9 +597,12 @@ pip install einops optax
 python tests/test_parity.py        # forward parity (~4e-7, asserts <2e-4), LoRA == merged
 python tests/test_train_and_io.py  # train step, save/load, merge script
 python tests/test_sharding.py      # 8-device FSDP parity (emulated on CPU)
-python tests/test_train_full.py    # full fine-tuning: loss, export parity, resume
+python tests/test_train_full.py    # full fine-tuning: loss, export parity, resume,
+                                   # padded image rows inert, per-sample mu
 python tests/test_export.py        # official-layout export, param_shardings, orbax round trip
-python tests/test_data.py          # streaming cache loader (order, resume, threads)
+python tests/test_data.py          # streaming loaders: fixed-res cache + bucketed latents/captions
+python tests/test_qwen3_text.py    # JAX Qwen3-VL text tower (parity parts need transformers)
+python tests/test_cache_latents.py # krea2-latents-v1 cache builder (stub VAE)
 python tests/test_aiter_attention.py  # padded-group-mode emulation == reference attn;
                                       # dit_forward aiter == ref (outputs + grads);
                                       # act_sharding on == off
@@ -545,11 +623,15 @@ krea2_jax/
   config.py      # architecture + conditioning constants (single_mmdit_large_wide)
   model.py       # pure-JAX SingleStreamDiT (scan + remat, GQA, gated attention)
   checkpoint.py  # safetensors <-> sharded pytree, LoRA init/save/load, mesh/FSDP
-  data.py        # streaming cache loader (full fine-tuning)
+  data.py        # streaming loaders: fixed-res cache (LoRA) + bucketed latents (full FT)
+  qwen3_text.py  # JAX Qwen3-VL-4B text tower (online text encoder, full FT)
+  text_template.py  # Qwen3-VL conditioner prompt template / caption tokenization
   fullft_ckpt.py # orbax train-state checkpoints (full fine-tuning)
   sampling.py    # Euler flow sampler + resolution-shifted timestep schedule
 scripts/
-  cache_dataset.py  # torch: VAE latents + Qwen3-VL states -> cache
+  cache_dataset.py  # torch: VAE latents + Qwen3-VL states -> cache (LoRA)
+  cache_latents.py  # torch: bucketed VAE latents of the HF dataset (full FT)
+  text_encoder_parity.py  # torch conditioner vs JAX text tower (real weights)
   train_lora.py     # jax: TPU LoRA training
   train_full.py     # jax: full fine-tuning (fp32 master + AdamW + EMA, FSDP)
   export_full.py    # jax: orbax checkpoint -> official bf16 safetensors
@@ -567,7 +649,9 @@ tests/              # parity / training / sharding verification
 - Single-host TPU slices (≤8 devices visible to one process). Multi-host
   pods would need per-host data sharding and `jax.make_array_from_*` when
   loading — not implemented yet.
-- One fixed training resolution per run — square or rectangular via
-  `--width`/`--height` (no mixed-aspect-ratio bucketing yet).
+- LoRA training (`train_lora.py`): one fixed training resolution per run —
+  square or rectangular via `--width`/`--height` (no aspect bucketing).
+  Full fine-tuning (`train_full.py`) trains on aspect buckets with
+  per-sample positions, masks and timestep shift.
 - Krea 2 weights are distributed under the **Krea 2 Community License**;
   review it before commercial use.
