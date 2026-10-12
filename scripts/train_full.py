@@ -452,11 +452,14 @@ def parse_args(argv=None):
                     help="ref attention query chunk; must divide the padded "
                          "sequence (4096 + 256 = 4352 = 17 x 256), else ref "
                          "falls back to dense attention")
-    ap.add_argument("--attn", choices=["ref", "splash", "aiter"], default="ref",
+    ap.add_argument("--attn", choices=["ref", "splash", "aiter", "cudnn"],
+                    default="ref",
                     help="exact fp32-softmax reference attention, the fused "
-                         "Pallas Splash kernel (TPU only), or jax-aiter's "
+                         "Pallas Splash kernel (TPU only), jax-aiter's "
                          "flash_attn_varlen (ROCm gfx950 only; needs the "
-                         "jax-aiter package)")
+                         "jax-aiter package), or cuDNN flash attention via "
+                         "jax.nn.dot_product_attention (NVIDIA GPU; its "
+                         "'xla' path on other backends)")
     ap.add_argument("--attn-block", type=int, default=256,
                     help="splash attention tile size")
     ap.add_argument("--act-sharding", choices=["on", "off"], default="on",

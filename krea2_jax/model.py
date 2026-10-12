@@ -468,6 +468,60 @@ def aiter_attention(q, k, v, keymask=None, mesh=None, kernel=None):
     return packed(q, k, v, keymask)
 
 
+def cudnn_attention(q, k, v, keymask=None, mesh=None, implementation=None):
+    """Fused attention through `jax.nn.dot_product_attention` (cuDNN flash
+    attention on NVIDIA GPUs) for PREFIX key masks — the NVIDIA counterpart
+    of `aiter_attention`, with the same semantics.
+
+    q: (B, Hq, L, D); k, v: (B, Hk, L, D) (GQA when Hk < Hq); keymask: (B, L)
+    bool whose valid entries form a prefix of each row (dit_forward reorders
+    tokens so this holds); None = all valid. The per-sample valid count goes
+    to the kernel as query_seq_lengths AND key_value_seq_lengths (int32), so
+    valid queries attend over exactly the valid key set (same as the key-only
+    mask of `scaled_dot_product_attention`) and padded query rows come out as
+    zeros (also enforced explicitly here). Returns (B, L, Hq*D).
+
+    implementation: passed to dot_product_attention. None picks "cudnn" when
+    `jax.default_backend() == "gpu"` and "xla" otherwise — the XLA einsum
+    path with the same masking semantics (unchunked (B, H, L, L) fp32
+    logits), which is what CPU tests run. cuDNN itself needs bf16/fp16
+    inputs and head_dim <= 128 (<= 256 on Hopper+) and a multiple of 8; it
+    raises otherwise (and "cuDNN is not detected" on non-CUDA GPUs, e.g.
+    ROCm: use attn_impl="aiter" there).
+
+    mesh: when given and the batch divides the "fsdp" axis, q/k/v (BTNH) and
+    the lengths are constrained to batch sharding so the cuDNN call's
+    custom_partitioning sees consistently batch-sharded operands (it allows
+    batch/head sharding only). No shard_map is used.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    B, Hq, L, D = q.shape
+    if implementation is None:
+        implementation = "cudnn" if jax.default_backend() == "gpu" else "xla"
+    qt, kt, vt = (a.transpose(0, 2, 1, 3) for a in (q, k, v))  # BNTH -> BTNH
+    valid = None
+    if keymask is not None:
+        valid = keymask.astype(jnp.int32).sum(-1).astype(jnp.int32)  # (B,)
+    if mesh is not None and B % mesh.shape["fsdp"] == 0:
+        bsh = NamedSharding(mesh, P("fsdp"))
+        qt, kt, vt = (jax.lax.with_sharding_constraint(a, bsh)
+                      for a in (qt, kt, vt))
+        if valid is not None:
+            valid = jax.lax.with_sharding_constraint(valid, bsh)
+    lengths = {}
+    if valid is not None:
+        lengths = dict(query_seq_lengths=valid, key_value_seq_lengths=valid)
+    out = jax.nn.dot_product_attention(
+        qt, kt, vt, scale=1.0 / math.sqrt(D), is_causal=False,
+        implementation=implementation, **lengths,
+    )                                                    # (B, L, Hq, D)
+    if valid is not None:
+        qvalid = jnp.arange(L, dtype=jnp.int32)[None, :] < valid[:, None]
+        out = jnp.where(qvalid[:, :, None, None], out, jnp.zeros((), out.dtype))
+    return out.reshape(B, L, Hq * v.shape[-1])
+
+
 # ---------------------------------------------------------------------------
 # modules
 # ---------------------------------------------------------------------------
@@ -508,6 +562,8 @@ def attention_forward(
         out = aiter_attention(
             q, k, v, keymask=keymask, mesh=attn_mesh, kernel=attn_kernel
         )
+    elif attn_impl == "cudnn":
+        out = cudnn_attention(q, k, v, keymask=keymask, mesh=attn_mesh)
     elif attn_impl == "ref":
         out = scaled_dot_product_attention(q, k, v, keymask=keymask, qchunk=qchunk)
     else:
@@ -642,9 +698,12 @@ def dit_forward(
     lora_scale=1.0,
     qchunk=512,
     remat=True,
-    attn_impl="ref",     # "ref" (exact fp32 softmax), "splash" (fused TPU)
-                         # or "aiter" (jax-aiter varlen flash attn, ROCm)
-    attn_mesh=None,      # shard_map mesh for splash/aiter (see attn_shard)
+    attn_impl="ref",     # "ref" (exact fp32 softmax), "splash" (fused TPU),
+                         # "aiter" (jax-aiter varlen flash attn, ROCm) or
+                         # "cudnn" (jax.nn.dot_product_attention: cuDNN
+                         # flash attn on GPU, its "xla" path elsewhere)
+    attn_mesh=None,      # mesh for splash/aiter (shard_map) and cudnn
+                         # (batch sharding constraint); see attn_shard
     attn_block=256,      # splash tile size; must divide the padded seq len
     attn_interpret=False,  # run splash in Pallas interpret mode (CPU tests)
     attn_shard="batch",  # splash under attn_mesh: shard "batch" or "heads"
@@ -675,6 +734,13 @@ def dit_forward(
     acts on the combined sequence, so it is the same with `txt_tokens`.
     attn_shard only applies to splash; aiter under attn_mesh always shards
     the batch (it cannot head-shard a batch-1 sampler).
+
+    attn_impl="cudnn" uses the same reorder (the per-sample valid count is
+    passed as query/key sequence lengths, which also describe a prefix) and
+    `cudnn_attention`; on non-GPU backends it runs dot_product_attention's
+    "xla" implementation with identical semantics. Under attn_mesh it
+    constrains the batch to the "fsdp" axis when the batch divides it and
+    otherwise leaves sharding to the partitioner (no shard_map).
     """
     B, Limg, _ = img.shape
     Ltxt = (txt_tokens if txt_tokens is not None else context).shape[1]
@@ -714,8 +780,9 @@ def dit_forward(
         pos = jnp.pad(pos, ((0, 0), (0, padlen), (0, 0)))
 
     inv_perm = None
-    if attn_impl == "aiter":
-        # valid tokens first (stable): the varlen kernel's logical prefix
+    if attn_impl in ("aiter", "cudnn"):
+        # valid tokens first (stable): the varlen kernel's logical prefix /
+        # the cuDNN padding mask's sequence lengths
         perm = jnp.argsort((~mask).astype(jnp.int32), axis=1, stable=True)
         inv_perm = jnp.argsort(perm, axis=1)
         combined = jnp.take_along_axis(combined, perm[..., None], axis=1)

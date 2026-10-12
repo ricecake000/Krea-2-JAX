@@ -38,9 +38,15 @@ the backend reports it.
         "intermediate_size":96,"mrope_section":[4,2,2],
         "select_layers":[0,1,2]}' \
         --batch-size 8 --img-tokens 64 --text-rows 16 --steps 2
+
+--profile-dir DIR captures a jax.profiler trace (xplane.pb + perfetto
+trace.json.gz under DIR/plugins/profile/<run>/) of the first PROFILE_STEPS
+timed steps; those steps are excluded from the reported timing, so --steps
+must exceed PROFILE_STEPS.
 """
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -71,6 +77,7 @@ from krea2_jax.qwen3_text import init_qwen3_text_params, param_count
 from krea2_jax.sampling import shift_time
 
 REMAT_FLOP_FACTOR = {"full": 4.0 / 3.0, "dots": 1.1, "none": 1.0}
+PROFILE_STEPS = 2
 
 
 def parse_args(argv=None):
@@ -97,7 +104,8 @@ def parse_args(argv=None):
                          "its image-token count)")
     ap.add_argument("--remat-policy", choices=["full", "dots", "none"],
                     default="dots")
-    ap.add_argument("--attn", choices=["ref", "splash", "aiter"], default="ref")
+    ap.add_argument("--attn", choices=["ref", "splash", "aiter", "cudnn"],
+                    default="ref")
     ap.add_argument("--attn-block", type=int, default=256)
     ap.add_argument("--act-sharding", choices=["on", "off"], default="on")
     ap.add_argument("--base-sharding", choices=["fsdp", "replicate"],
@@ -118,7 +126,15 @@ def parse_args(argv=None):
     ap.add_argument("--model-config", default=None,
                     help="JSON object of Krea2Config field overrides")
     ap.add_argument("--seed", type=int, default=0)
-    return ap.parse_args(argv)
+    ap.add_argument("--profile-dir", default=None,
+                    help=f"profile the first {PROFILE_STEPS} timed steps into "
+                         "this directory (jax.profiler, perfetto trace); they "
+                         "are excluded from the reported timing")
+    args = ap.parse_args(argv)
+    if args.profile_dir is not None and args.steps <= PROFILE_STEPS:
+        ap.error(f"--profile-dir needs --steps > {PROFILE_STEPS} (the "
+                 f"{PROFILE_STEPS} profiled steps are not timed)")
+    return args
 
 
 def random_params(abstract, shardings, seed, dtype):
@@ -178,6 +194,24 @@ def peak_memory():
         if k in stats:
             return k, stats[k], stats.get("bytes_limit")
     return None
+
+
+def start_profile(log_dir):
+    """jax.profiler.start_trace with a perfetto trace.json.gz when this jax
+    supports create_perfetto_trace (falls back to the plain xplane/trace)."""
+    try:
+        jax.profiler.start_trace(log_dir, create_perfetto_trace=True)
+    except TypeError:
+        print("note: this jax has no create_perfetto_trace; writing the "
+              "default profiler output only")
+        jax.profiler.start_trace(log_dir)
+
+
+def profile_files(log_dir, since):
+    """Files the profiler wrote under log_dir (modified at/after `since`)."""
+    root = Path(log_dir)
+    return sorted(str(p) for p in root.rglob("*")
+                  if p.is_file() and p.stat().st_mtime >= since - 1.0)
 
 
 def main(argv=None):
@@ -308,14 +342,30 @@ def main(argv=None):
     state = params
     times = []
     total = 1 + args.warmup + args.steps
+    prof_first = 1 + args.warmup  # first timed step index
+    prof_last = prof_first + PROFILE_STEPS - 1
+    prof_t0 = None
     for i in range(total):
         key = jax.random.fold_in(base_key, i)
+        if args.profile_dir is not None and i == prof_first:
+            prof_t0 = time.time()
+            start_profile(args.profile_dir)
+        # profiled steps carry a StepTraceAnnotation so the trace analyzer can
+        # bound "the two steps" exactly (profiler start/stop overhead excluded)
+        ann = (jax.profiler.StepTraceAnnotation("bench_step", step_num=i)
+               if args.profile_dir is not None and prof_first <= i <= prof_last
+               else contextlib.nullcontext())
         t0 = time.perf_counter()
-        state, out = run(state, batch, key)
-        jax.block_until_ready(out)
-        if args.mode == "train":
-            jax.block_until_ready(state)
+        with ann:
+            state, out = run(state, batch, key)
+            jax.block_until_ready(out)
+            if args.mode == "train":
+                jax.block_until_ready(state)
         dt = time.perf_counter() - t0
+        if args.profile_dir is not None and prof_first <= i <= prof_last:
+            if i == prof_last:
+                jax.profiler.stop_trace()
+            continue
         if i == 0:
             print(f"first step (compile + run): {dt:.1f}s")
         elif i > args.warmup:
@@ -350,6 +400,11 @@ def main(argv=None):
               + (f" / limit {limit / 2**30:.1f} GiB" if limit else ""))
     else:
         print("device 0 memory: not reported by this backend")
+    if args.profile_dir is not None:
+        print(f"profile: {PROFILE_STEPS} profiled steps excluded from timing; "
+              f"files written under {args.profile_dir}:")
+        for f in profile_files(args.profile_dir, prof_t0):
+            print(f"  {f}")
     return 0
 
 

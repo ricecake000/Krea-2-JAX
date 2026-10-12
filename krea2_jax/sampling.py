@@ -106,7 +106,7 @@ def sample_latents(
     mu=None,
     seed=0,
     qchunk=512,
-    attn_impl="ref",   # "ref" or "splash" (fused TPU kernel)
+    attn_impl="ref",   # "ref", "splash" (fused TPU kernel) or "cudnn"
     attn_mesh=None,    # mesh to split splash heads over (multi-device)
     compact=True,      # drop padded text tokens before sampling
 ):
