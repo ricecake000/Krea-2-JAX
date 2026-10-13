@@ -261,6 +261,37 @@ def test_process_shard(src, out_dir):
           "truncated-file rewrite OK")
 
 
+def test_channels_last_encoder(src, out_dir):
+    """Regression (B200 build with --vae-impl 2d-compile): an encoder whose
+    latents come back channels_last (cudnn.benchmark / inductor layouts)
+    must still give a loadable shard, bit-identical to the contiguous one."""
+    tar0 = src / "data/train-0000.tar"
+    kw = dict(vae_id="stub", source="data/train-0000.tar", expected_count=3,
+              decode_threads=1, log=lambda m: None)
+    strided = []
+
+    def channels_last(imgs):
+        lat = cl.StubEncoder()(imgs).contiguous(
+            memory_format=torch.channels_last)
+        strided.append(not lat.is_contiguous())
+        return lat
+    out_cl = out_dir / "channels_last.safetensors"
+    out_ref = out_dir / "contiguous.safetensors"
+    cl.process_shard(tar0, out_cl, channels_last, 2, **kw)
+    cl.process_shard(tar0, out_ref, cl.StubEncoder(), 2, **kw)
+    assert any(strided), strided   # the encoder really returned strided data
+    meta, tensors = read_shard(out_cl)
+    ref_meta, ref = read_shard(out_ref)
+    assert meta == ref_meta and set(tensors) == set(ref) == {
+        "907", "12", "5531"}, (meta, set(tensors))
+    for k in ref:
+        assert tensors[k].shape == ref[k].shape, k
+        assert np.array_equal(tensors[k].view(np.uint16),
+                              ref[k].view(np.uint16)), k
+    print("  process_shard: channels_last encoder output -> loadable shard, "
+          "bit-identical to the contiguous one OK")
+
+
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -488,6 +519,7 @@ def main():
         test_check_digests_malformed()
         test_batched_vae(tmp)
         test_process_shard(src, tmp / "direct")
+        test_channels_last_encoder(src, tmp / "cl")
         test_main_and_manifest(src, out)
         test_manifest_errors(src, out, tmp)
         test_manifest_digests(src, out, tmp)

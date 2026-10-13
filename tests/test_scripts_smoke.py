@@ -11,6 +11,17 @@ tiny model config on 8 emulated devices:
   modal_text_parity_flow scripts/modal_text_parity.py control flow (exit
                          codes, skip-on-tokenizer-failure, exit 1) with a
                          mocked subprocess runner, no Modal SDK
+  modal_cache_latents_flow scripts/modal_cache_latents.py pure parts, no
+                         Modal SDK: cost model vs hand-computed numbers, GPU
+                         selection (5% tie -> higher img/s, failed GPUs and
+                         OOM/error ladder rows ignored), batch ladder (stub
+                         encoder), per-(gpu, VAE impl) rows + --vae-impl
+                         threading (bench -> build command -> worker ->
+                         cache_latents shard metadata), HF token write
+                         check, worker command + env + timeout, the
+                         commit-per-shard stream on a
+                         real stub cache_latents run, upload filter + remote
+                         content check (sha256 / git blob id)
 
 Structure: every case is a function registered with @case (name = function
 name); `main` runs them all, or only those named on the command line:
@@ -420,6 +431,650 @@ def modal_text_parity_flow():
     print("    modal_text_parity: exit codes aggregated, tokenizer failure "
           "skips model checks, download failure reported, log written "
           "before exit 1")
+
+
+@case
+def modal_cache_latents_flow():
+    """scripts/modal_cache_latents.py without Modal (the import is guarded):
+    pricing/cost math against hand-computed numbers, the selection rule,
+    the ladder's OOM handling, token parsing, the worker command, the
+    stream that commits the volume after every shard (real cache_latents
+    --vae-stub run on a tiny dataset), cache_latents --vae-impl metadata,
+    per-(gpu, impl) bench rows / selection / build command, the upload
+    filter and finalize with a fake HfApi (write check, privacy, content
+    check)."""
+    import contextlib
+    import hashlib
+    import io
+    import tempfile
+    from math import isclose
+    from types import SimpleNamespace
+
+    import torch
+
+    sys.path.insert(0, str(REPO / "scripts"))
+    import modal_cache_latents as mcl
+
+    def close(a, b):
+        return isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+
+    # GPU strings / prices
+    assert mcl.gpu_key("h100!") == "H100" and mcl.gpu_key("B200+") == "B200"
+    assert mcl.parse_gpus(" l4, A10 ,H100!,l4") == ["L4", "A10", "H100!"]
+    for bad in ("T4", "B200:2", "A10G"):
+        try:
+            mcl.gpu_key(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"gpu_key accepted {bad!r}")
+
+    # cores_needed = max(4, ceil(1.5 * img_s / decode) + 1)
+    assert mcl.cores_needed(2.0, 1.0) == 4        # ceil(3) + 1 = 4
+    assert mcl.cores_needed(1.0, 10.0) == 4       # floor of 4
+    assert mcl.cores_needed(10.0, 0.5) == 31      # ceil(30) + 1
+    assert mcl.cores_needed(3.1, 1.0) == 6        # ceil(4.65) + 1
+
+    # cost: L4 at 2 img/s, 1 img/s/thread decode -> 4 cores
+    # hourly = 0.80 + 4 * 0.0472 + 32 * 0.00799 = 1.24448 $/h
+    # $/1k = 1.24448 / 7200 * 1000 = 0.172844...; hours = 96848 / 7200
+    # 1 ctr: 1.24448 * (13.451111 + 0.05) = 16.8018627...
+    # 4 ctr: 1.24448 * (13.451111 + 0.2) = 16.9885347..., wall 3.4127777 h
+    res_l4 = {"gpu_requested": "L4", "device_name": "NVIDIA L4",
+              "decode_img_s_per_thread": 1.0,
+              "ladder": [{"batch": 4, "img_s": 1.5, "peak_gib": 6.0},
+                         {"batch": 8, "img_s": 2.0, "peak_gib": 11.0},
+                         {"batch": 16, "error": "OOM"}]}
+    best = mcl.best_of(res_l4["ladder"])
+    assert best == {"best_batch": 8, "best_img_s": 2.0,
+                    "best_peak_gib": 11.0}, best
+    res_l4.update(best)
+    r = mcl.cost_row(res_l4)
+    assert r["cores"] == 4 and r["batch"] == 8, r
+    assert close(r["usd_h"], 1.24448), r
+    assert close(r["usd_per_1k"], 0.17284444444444444), r
+    assert close(r["hours_1"], 13.45111111111111), r
+    assert close(r["proj"][1]["usd"], 16.801862755555558), r
+    assert close(r["proj"][4]["usd"], 16.988534755555555), r
+    assert close(r["proj"][4]["wall_h"], 3.4127777777777775), r
+    # worker timeout: ceil(1.5 * (13.451111 / 4 + 0.05) + 0.5) = ceil(5.619)
+    assert mcl.worker_timeout_h(r) == 6 and mcl.worker_timeout_h(r, 32) == 2
+    fast = dict(r, hours_1=0.1)                  # ceil(0.6125) -> min 1
+    assert mcl.worker_timeout_h(fast) == 1
+    # B200 at 10 img/s, 0.5 img/s/thread -> 31 cores:
+    # 6.25 + 31 * 0.0472 + 0.25568 = 7.96888 $/h -> 0.2213577.. $/1k
+    r = mcl.cost_row({"gpu_requested": "B200", "best_img_s": 10.0,
+                      "best_batch": 16, "decode_img_s_per_thread": 0.5})
+    assert r["cores"] == 31 and close(r["usd_h"], 7.96888), r
+    assert close(r["usd_per_1k"], 0.2213577777777778), r
+    # unusable results -> None (never selected)
+    assert mcl.cost_row({"gpu_requested": "L4", "error": "boom",
+                         "best_img_s": 99.0,
+                         "decode_img_s_per_thread": 1.0}) is None
+    all_oom = {"gpu_requested": "L4", "decode_img_s_per_thread": 1.0,
+               "ladder": [{"batch": 4, "error": "OOM"}]}
+    all_oom.update(mcl.best_of(all_oom["ladder"]))
+    assert mcl.cost_row(all_oom) is None, all_oom
+
+    # selection: lowest $/img; within 5% is a tie -> higher img/s wins
+    def row(gpu, usd, img_s):
+        return {"gpu": gpu, "usd_per_1k": usd, "img_s": img_s}
+    rows = [row("A", 1.00, 5.0), row("B", 1.04, 20.0), row("C", 1.06, 50.0),
+            None]
+    assert mcl.select_gpu(rows)["gpu"] == "B"          # C is 6% off
+    assert mcl.select_gpu([row("A", 1.0, 5.0), row("B", 1.05, 6.0)])[
+        "gpu"] == "B"                                    # exactly 5%: tie
+    assert mcl.select_gpu([row("A", 1.0, 5.0), row("B", 1.2, 60.0)])[
+        "gpu"] == "A"
+    assert mcl.select_gpu([None, None]) is None
+
+    # report from bench results (one usable, one OOM-only, one error)
+    results = [res_l4, all_oom | {"gpu_requested": "A10"},
+               {"gpu_requested": "B300", "error": "Traceback\nRuntimeError: "
+                "no capacity"}]
+    rows = [mcl.cost_row(x) for x in mcl.flatten_results(results)]
+    choice = mcl.select_gpu(rows)
+    md = mcl.render_bench_report(results, rows, choice,
+                                 prep={"whoami": "ricecake",
+                                       "can_write": True,
+                                       "write_reason": "token role write"})
+    cmd = ("modal run --detach scripts/modal_cache_latents.py --build --gpu "
+           "L4 --containers 4 --batch 8 --cpu 4 --worker-timeout-h 6 "
+           "--vae-impl ref")
+    assert mcl.build_command(choice) == cmd and cmd in md, md
+    # single-GPU bench (--gpus B200): its measured batch/cores in the command
+    one = {"gpu_requested": "B200", "device_name": "NVIDIA B200",
+           "decode_img_s_per_thread": 0.5, "ladder": [
+               {"batch": 16, "img_s": 10.0, "peak_gib": 40.0},
+               {"batch": 32, "error": "OOM"}]}
+    one.update(mcl.best_of(one["ladder"]))
+    rows1 = [mcl.cost_row(one)]
+    md1 = mcl.render_bench_report([one], rows1, mcl.select_gpu(rows1))
+    # 96848 / 10 / 3600 / 4 + 0.05 = 0.7225 h -> ceil(1.584) = 2
+    assert ("--build --gpu B200 --containers 4 --batch 16 --cpu 31 "
+            "--worker-timeout-h 2 --vae-impl ref") in md1, md1
+    assert "**Chosen: L4 / ref**" in md and "8:2.00 16:OOM" in md, md
+    assert "--containers raised" not in md1, md1
+    # Modal's 24 h cap: at 0.3 img/s a worker of 4 needs 35 h, of 5 28 h,
+    # of 6 23 h -> 6 containers (89.67 h / 6 + 0.05 -> ceil(22.99) = 23)
+    slow = {"gpu_requested": "L4", "device_name": "NVIDIA L4",
+            "decode_img_s_per_thread": 1.0, "ladder": [
+                {"batch": 4, "img_s": 0.3, "peak_gib": 9.0}]}
+    slow.update(mcl.best_of(slow["ladder"]))
+    rows_s = [mcl.cost_row(slow)]
+    assert mcl.worker_timeout_h(rows_s[0]) == 35
+    assert mcl.build_plan(rows_s[0]) == (6, 23), mcl.build_plan(rows_s[0])
+    md_s = mcl.render_bench_report([slow], rows_s, mcl.select_gpu(rows_s))
+    assert ("--containers 6 --batch 4 --cpu 4 --worker-timeout-h 23 "
+            "--vae-impl ref") in md_s
+    assert "--containers raised from 4 to 6" in md_s, md_s
+    assert mcl.build_plan(choice) == (4, 6)   # L4 at 2 img/s fits as is
+    assert "- A10 " in md and "- B300 " in md and "no capacity" in md, md
+
+    # ladder: stub encoder, OOM at batch 8 stops it, wrong shape -> error
+    class OutOfMemoryError(RuntimeError):
+        pass
+    stub = __import__("cache_latents").StubEncoder()
+
+    seen_threads = []
+
+    def enc(x):
+        seen_threads.append(torch.get_num_threads())
+        if x.shape[0] >= 8:
+            raise OutOfMemoryError("CUDA out of memory. Tried to allocate")
+        return stub(x)
+    imgs = [torch.rand(3, 64, 32) * 2 - 1 for _ in range(5)]
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    threads0 = torch.get_num_threads()
+    torch.set_num_threads(3)
+    try:
+        with quiet:
+            lad = mcl.run_ladder(enc, imgs, (2, 4, 8, 16), (16, 8, 4),
+                                 min_images=4, min_seconds=0.0)
+        # timed with 1 CPU thread (as the OMP_NUM_THREADS=1 build), restored
+        assert seen_threads and set(seen_threads) == {1}, seen_threads
+        assert torch.get_num_threads() == 3
+        seen_threads.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            mcl.run_ladder(enc, imgs, (2,), (16, 8, 4), min_images=2,
+                           min_seconds=0.0, intra_threads=None)
+        assert set(seen_threads) == {3}, seen_threads
+    finally:
+        torch.set_num_threads(threads0)
+    assert [x["batch"] for x in lad] == [2, 4, 8], lad
+    assert lad[2] == {"batch": 8, "error": "OOM"}, lad
+    assert all(x["img_s"] > 0 and x["images"] >= max(4, 3 * x["batch"])
+               for x in lad[:2]), lad
+    with contextlib.redirect_stdout(io.StringIO()):
+        lad = mcl.run_ladder(stub, imgs, (2,), (16, 4, 4), min_images=2,
+                             min_seconds=0.0)
+    assert lad[0]["error"].startswith("ValueError: output (2, 16, 8, 4)"), lad
+
+    # per-(gpu, impl) rows: a B200 bench result with all three impls
+    import vae_fast
+    assert mcl.VAE_IMPLS == vae_fast.IMPLS
+    assert mcl.parse_impls(" 2d,ref,2d") == ["2d", "ref"]
+    assert mcl.parse_impls(mcl.DEFAULT_IMPLS) == list(vae_fast.IMPLS)
+    for bad in ("", "3d", "ref,2d-compiled"):
+        try:
+            mcl.parse_impls(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"parse_impls accepted {bad!r}")
+
+    def impl_res(img_s, fp32, first=None, ladder=True):
+        c = {"fp32_mean_max_rel": fp32, "fp32_std_max_rel": 1e-7,
+             "fp32_sample_max_rel": 1e-7, "bf16_mean_max_rel": 4e-3,
+             "bf16_std_max_rel": 2e-3, "ref_bf16_mean_max_rel": 4e-3,
+             "ref_bf16_std_max_rel": 2e-3, "first_call_s": first}
+        c["ok"], c["fail_reasons"] = mcl.gate_check(c)
+        r = {"check": c}
+        if ladder:
+            r["ladder"] = [{"batch": 16, "img_s": img_s, "peak_gib": 30.0},
+                           {"batch": 32, "error": "OOM"}]
+            r.update(mcl.best_of(r["ladder"]))
+        return r
+    b200 = {"gpu_requested": "B200", "device_name": "NVIDIA B200",
+            "decode_img_s_per_thread": 0.5, "impls": {
+                "ref": impl_res(10.0, 0.0),
+                "2d": impl_res(25.0, 3e-7, first=0.4),
+                # failed correctness: never costed, even with a fast ladder
+                "2d-compile": impl_res(90.0, 2e-3, first=95.0)}}
+    ents = mcl.flatten_results([b200])
+    assert [(e["impl"], bool(e["error"])) for e in ents] == [
+        ("ref", False), ("2d", False), ("2d-compile", True)], ents
+    assert ents[2]["error"] == ("correctness FAILED: fp32_mean_max_rel "
+                                "2.00e-03 >= 0.0001"), ents[2]
+    rows_b = [mcl.cost_row(e) for e in ents]
+    assert rows_b[2] is None and rows_b[1]["impl"] == "2d", rows_b
+    assert rows_b[1]["fp32_err"] == 3e-7 and rows_b[1]["compile_s"] is None
+    pick = mcl.select_gpu(rows_b)
+    assert (pick["gpu"], pick["impl"]) == ("B200", "2d"), pick
+    md_b = mcl.render_bench_report([b200], rows_b, pick)
+    assert "**Chosen: B200 / 2d**" in md_b, md_b
+    assert "--gpu B200 --containers 4 --batch 16 --cpu " in md_b, md_b
+    assert md_b.rstrip().endswith("--vae-impl 2d"), md_b
+    assert "- B200 2d-compile (NVIDIA B200): correctness FAILED" in md_b, md_b
+    assert "| B200 | 2d | NVIDIA B200 | 16 | 25.00 |" in md_b, md_b
+    # 2d-compile passing and within 5% of 2d: tie -> higher img/s; the
+    # compile time is the first bf16 call
+    b200["impls"]["2d-compile"] = impl_res(26.0, 5e-7, first=95.0)
+    rows_b = [mcl.cost_row(e) for e in mcl.flatten_results([b200])]
+    assert rows_b[2]["compile_s"] == 95.0, rows_b[2]
+    assert close(rows_b[1]["usd_per_1k"] / rows_b[2]["usd_per_1k"],
+                 26.0 / 25.0 * rows_b[1]["usd_h"] / rows_b[2]["usd_h"])
+    pick = mcl.select_gpu(rows_b)
+    assert pick["impl"] == "2d-compile", pick
+    assert mcl.build_command(pick).endswith("--vae-impl 2d-compile")
+    # a GPU-level failure fails all its impls
+    dead = dict(b200, error="Traceback\nRuntimeError: CUDA error")
+    assert all(mcl.cost_row(e) is None
+               for e in mcl.flatten_results([dead]))
+
+    # correctness gate (all of fp32 mean/std/sample, bf16 mean/std vs the
+    # ref's own bf16 error)
+    good = {"fp32_mean_max_rel": 1e-6, "fp32_std_max_rel": 2e-6,
+            "fp32_sample_max_rel": 3e-6, "bf16_mean_max_rel": 0.011,
+            "bf16_std_max_rel": 0.004, "ref_bf16_mean_max_rel": 0.010,
+            "ref_bf16_std_max_rel": 0.003}
+    assert mcl.gate_check(good) == (True, [])
+    # 1.5 * 0.010 + 1e-3 = 0.016: at the limit passes, above fails
+    assert mcl.gate_check(dict(good, bf16_mean_max_rel=0.016))[0]
+    for bad, why in (
+            ({"fp32_std_max_rel": 1.0}, "fp32_std_max_rel"),   # doubled std
+            ({"bf16_mean_max_rel": 0.1}, "bf16_mean_max_rel"),  # bf16 offset
+            ({"bf16_std_max_rel": 0.02}, "bf16_std_max_rel"),
+            ({"fp32_sample_max_rel": 2e-4}, "fp32_sample_max_rel"),
+            ({"fp32_mean_max_rel": None}, "fp32_mean_max_rel None")):
+        ok, reasons = mcl.gate_check(dict(good, **bad))
+        assert not ok and len(reasons) == 1 and why in reasons[0], reasons
+    ok, reasons = mcl.gate_check({k: v for k, v in good.items()
+                                  if k != "bf16_std_max_rel"})
+    assert not ok and reasons == ["bf16_std_max_rel not measured"], reasons
+    assert mcl.gate_check(dict(good, error="Tb\nOOM"))[1] == ["error: OOM"]
+    failed = {"gpu_requested": "B200", "decode_img_s_per_thread": 1.0,
+              "impls": {"2d": {"check": dict(good, fp32_std_max_rel=1.0,
+                                             ok=False, fail_reasons=[
+                                                 "fp32_std_max_rel 1.00e+00 "
+                                                 ">= 0.0001"])}}}
+    assert mcl.flatten_results([failed])[0]["error"] == (
+        "correctness FAILED: fp32_std_max_rel 1.00e+00 >= 0.0001")
+
+    # plain return types (the laptop has no torch to unpickle torch objects)
+    import numpy as np
+    from torch.torch_version import TorchVersion
+    plain = mcl.to_plain({"torch": TorchVersion("2.13.0"),
+                          "dtype": torch.bfloat16, 3: (np.float32(0.5),
+                                                       torch.tensor(2.0)),
+                          "t": torch.ones(2), "n": np.int64(4), "b": True})
+    assert plain == {"torch": "2.13.0", "dtype": "torch.bfloat16",
+                     "3": [0.5, 2.0], "t": [1.0, 1.0], "n": 4, "b": True}
+    assert type(plain["torch"]) is str and type(plain["n"]) is int
+
+    # HF token
+    assert mcl.pick_hf_token({"HUGGINGFACE_TOKEN": "c",
+                              "HUGGING_FACE_HUB_TOKEN": "b"}) == (
+        "HUGGING_FACE_HUB_TOKEN", "b")
+    env = {"HUGGINGFACE_TOKEN": "c"}
+    assert mcl.setup_hf_token(env) == ("HUGGINGFACE_TOKEN", "c")
+    assert env["HF_TOKEN"] == "c"
+    assert mcl.pick_hf_token({"HF_TOKEN": ""}) == (None, None)
+
+    def who(role, name="ricecake", scoped=None):
+        tok = {"role": role}
+        if scoped is not None:
+            tok["fineGrained"] = {"scoped": scoped, "global": []}
+        return {"name": name, "auth": {"accessToken": tok}}
+    assert mcl.token_can_write(who("write"))[0] is True
+    assert mcl.token_can_write(who("read"))[0] is False
+    assert mcl.token_can_write(who("write", name="other"))[0] is False
+    assert mcl.token_can_write(who("fineGrained", scoped=[
+        {"entity": {"type": "user", "name": "ricecake"},
+         "permissions": ["repo.content.read", "repo.write"]}]))[0] is True
+    assert mcl.token_can_write(who("fineGrained", scoped=[
+        {"entity": {"type": "user", "name": "ricecake"},
+         "permissions": ["repo.content.read"]}]))[0] is False
+    # write on single repos only: unknown, must not block (create_repo decides)
+    assert mcl.token_can_write(who("fineGrained", scoped=[
+        {"entity": {"type": "dataset",
+                    "name": "ricecake/danbooru-curated-v2-latents"},
+         "permissions": ["repo.content.read", "repo.write"]}]))[0] is None
+    assert mcl.token_can_write(who("mystery"))[0] is None
+    assert mcl.token_can_write({})[0] is None
+
+    # worker / finalize commands
+    assert mcl.worker_cmd(2, 4, 16, 12, python="py", vae_impl="2d")[-2:] == [
+        "--vae-impl", "2d"]
+    assert mcl.worker_cmd(2, 4, 16, 12, python="py") == [
+        "py", "scripts/cache_latents.py", "--out", "/vol/krea2",
+        "--num-workers", "4", "--worker-index", "2", "--batch", "16",
+        "--decode-threads", "12", "--download-dir", "/tmp/dl/w2",
+        "--vae-impl", "ref"]
+    assert mcl.finalize_cmd(python="py") == [
+        "py", "scripts/cache_latents.py", "--out", "/vol/krea2",
+        "--write-manifest", "--download-dir", "/tmp/dl/manifest"]
+
+    env = mcl.worker_env({"PATH": "/bin", "OMP_NUM_THREADS": "64"})
+    assert env == {"PATH": "/bin", "PYTHONUNBUFFERED": "1",
+                   "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}, env
+
+    # upload filter (same semantics as huggingface_hub's ignore_patterns)
+    paths = ["metadata.parquet", "latents/manifest.json",
+             "latents/train-0000.safetensors",
+             "latents/train-0000.safetensors.tmp", "latents/manifest.json.tmp",
+             "_download/manifest/metadata.parquet",
+             "_download/w0/data/train-0001.tar",
+             ".cache/huggingface/upload/latents/x.metadata"]
+    kept = [p for p in paths if mcl.should_upload(p)]
+    assert kept == paths[:3], kept
+    try:
+        from huggingface_hub.utils import filter_repo_objects
+    except ImportError:
+        pass
+    else:
+        assert list(filter_repo_objects(
+            paths, ignore_patterns=mcl.UPLOAD_IGNORE)) == kept
+
+    # commit after every shard: real cache_latents --vae-stub run, 1 worker
+    from test_cache_latents import make_fake_dataset
+
+    class FakeVol:
+        def __init__(self, fail_first=False):
+            self.commits, self.fail = 0, fail_first
+
+        def commit(self):
+            self.commits += 1
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("commit conflict")
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        make_fake_dataset(d / "src")
+        vol, logs = FakeVol(fail_first=True), []
+        cmd = mcl.worker_cmd(0, 1, 2, 2, python=sys.executable,
+                             out=str(d / "out"), dl_root=str(d / "dl")) + [
+            "--tar-dir", str(d / "src"), "--vae-stub", "--device", "cpu"]
+        buf = io.StringIO()
+        rc, tail, n = mcl.stream_worker(
+            cmd, lambda: mcl.commit_volume(vol, logs.append), cwd=str(REPO),
+            env=mcl.worker_env(os.environ), out=buf)
+        shard_lines = [ln for ln in buf.getvalue().splitlines()
+                       if mcl.is_shard_line(ln)]
+        assert rc == 0 and n == 2 and len(shard_lines) == 2, buf.getvalue()
+        assert vol.commits == 2 and len(logs) == 1, (vol.commits, logs)
+        assert "commit conflict" in logs[0], logs
+        assert any("done: 6 images" in ln for ln in tail), tail
+
+        # bench_gpu_impl, real code path (decode, check_impls gate, ladder)
+        # on CPU with a stub VAE (diffusers-free, impl "ref"): the result
+        # must be plain JSON (it is unpickled on the laptop without torch)
+        class StubLatentDist:
+            def __init__(self, mean):
+                self.mean = mean
+                self.std = torch.full_like(mean, 0.1)
+
+            def sample(self):
+                return self.mean + self.std * torch.randn(
+                    self.mean.shape, dtype=self.mean.dtype)
+
+        class StubVae:   # cache_dataset.VaeEncoder-like
+            def __init__(self):
+                self.device, self.dtype = "cpu", torch.bfloat16
+                self.mean = torch.zeros(1, 16, 1, 1, 1)
+                self.std = torch.full((1, 16, 1, 1, 1), 2.0)
+                stub_enc = cl_stub()
+                self.vae = SimpleNamespace(encode=lambda x: SimpleNamespace(
+                    latent_dist=StubLatentDist(
+                        stub_enc(x[:, :, 0]).to(x.dtype)[:, :, None])))
+
+            def to_dtype(self, dtype):
+                self.dtype = dtype
+
+        def cl_stub():
+            return __import__("cache_latents").StubEncoder()
+        logs_b = []
+        res = mcl.bench_gpu_impl(
+            "L4", 2, ["ref"], vae=StubVae(), tar=d / "src/data/train-0000.tar",
+            bucket=(32, 64), device="cpu", ladder=(1, 2), min_images=1,
+            min_seconds=0.0, decode_timing_n=2, log=logs_b.append)
+        assert "error" not in res, res.get("error")
+        assert json.loads(json.dumps(res)) == res, res      # plain JSON
+        assert type(res["torch"]) is str and res["vae_dtype"] == (
+            "torch.bfloat16"), res
+        assert any(ln.startswith("decode: ") and "img/s per thread" in ln
+                   for ln in logs_b), logs_b
+        chk = res["impls"]["ref"]["check"]
+        assert chk["ok"] and chk["fail_reasons"] == [], chk
+        assert [x["batch"] for x in res["impls"]["ref"]["ladder"]] == [1, 2]
+        row = mcl.cost_row(mcl.flatten_results([res])[0])
+        assert row["impl"] == "ref" and row["batch"] in (1, 2), row
+
+        # cache_latents --vae-impl: informational shard metadata only
+        import cache_latents as cl
+        from safetensors import safe_open
+        with safe_open(str(d / "out/latents/train-0000.safetensors"),
+                       framework="numpy") as f:
+            assert f.metadata()["vae_impl"] == "stub", f.metadata()
+        assert cl.build_parser().parse_args(
+            ["--out", "x"]).vae_impl == "ref"          # default unchanged
+        assert cl.build_parser().parse_args(
+            ["--out", "x", "--vae-impl", "2d-compile"]).vae_impl == "2d-compile"
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cl.build_parser().parse_args(["--out", "x", "--vae-impl", "3d"])
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("--vae-impl 3d accepted")
+        tar0 = d / "src/data/train-0000.tar"
+        for impl, want in ((None, None), ("2d", "2d")):
+            outp = d / f"impl_{impl}.safetensors"
+            with contextlib.redirect_stdout(io.StringIO()):
+                cl.process_shard(tar0, outp, cl.StubEncoder(), 2,
+                                 vae_id="Qwen/Qwen-Image",
+                                 source="data/train-0000.tar",
+                                 decode_threads=1, vae_impl=impl)
+            with safe_open(str(outp), framework="numpy") as f:
+                assert f.metadata().get("vae_impl") == want, f.metadata()
+            # shard_done does not look at vae_impl: built shards stay valid
+            assert cl.shard_done(outp, "Qwen/Qwen-Image",
+                                 "data/train-0000.tar", 3), impl
+        ok, lines = mcl.summarize_workers([
+            {"worker": 1, "rc": 0, "seconds": 60},
+            {"worker": 0, "rc": rc, "shards_written": n, "seconds": 1}])
+        assert ok and lines[0].startswith("w0: ok"), lines
+        ok, lines = mcl.summarize_workers([
+            {"worker": 0, "rc": 0}, {"worker": 1, "rc": None,
+                                     "error": "Traceback\nOSError: x"}])
+        assert not ok and "FAILED" in lines[1] and "OSError: x" in lines[1]
+
+        # manifest pass, then the remote content check
+        subprocess.run([sys.executable, "scripts/cache_latents.py",
+                        "--tar-dir", str(d / "src"), "--out",
+                        str(d / "out"), "--write-manifest"], cwd=str(REPO),
+                       check=True, capture_output=True)
+        out = d / "out"
+        expected = mcl.expected_upload(out)
+        assert sorted(expected) == [
+            "latents/manifest.json", "latents/train-0000.safetensors",
+            "latents/train-0001.safetensors", "metadata.parquet"], expected
+        manifest = json.loads((out / "latents/manifest.json").read_text())
+        for p, e in expected.items():
+            data = (out / p).read_bytes()
+            assert e["size"] == len(data), (p, e)
+            assert e["sha256"] == hashlib.sha256(data).hexdigest(), (p, e)
+            if p.endswith(".safetensors"):   # from the manifest, not re-read
+                assert e["sha256"] == manifest["digests"][Path(p).name]
+            else:                            # git blob id = `git hash-object`
+                git = subprocess.run(["git", "hash-object", str(out / p)],
+                                     capture_output=True, text=True)
+                if git.returncode == 0:
+                    assert e["git_sha1"] == git.stdout.strip(), (p, e)
+                assert e["git_sha1"] == hashlib.sha1(
+                    b"blob %d\0" % len(data) + data).hexdigest()
+
+        # what list_repo_tree returns: LFS shards + parquet, a non-LFS
+        # manifest (git blob id only) and a folder
+        def tree(exp, lfs_manifest=False):
+            items = [SimpleNamespace(path="latents", tree_id="t")]
+            for p, e in exp.items():
+                lfs = None
+                if p != "latents/manifest.json" or lfs_manifest:
+                    lfs = SimpleNamespace(sha256=e["sha256"], size=e["size"])
+                items.append(SimpleNamespace(
+                    path=p, size=e["size"], lfs=lfs,
+                    blob_id=e.get("git_sha1") or "f" * 40))
+            return items
+        remote = mcl.remote_entries(tree(expected))
+        assert "latents" not in remote and len(remote) == 4, remote
+        assert remote["latents/manifest.json"]["sha256"] is None, remote
+        assert mcl.verify_upload(expected, remote) == []
+        assert mcl.verify_upload(
+            expected, mcl.remote_entries(tree(expected, True))) == []
+
+        bad = {p: dict(e) for p, e in remote.items()}
+        bad.pop("latents/train-0001.safetensors")
+        bad["metadata.parquet"]["size"] += 1
+        bad["latents/train-0000.safetensors"]["sha256"] = "0" * 64
+        bad["latents/manifest.json"]["blob_id"] = "1" * 40
+        exp_unv = dict(expected, **{"latents/x.safetensors": {
+            "size": 3, "sha256": "a" * 64}})
+        bad["latents/x.safetensors"] = {"size": 3, "sha256": None,
+                                        "blob_id": "2" * 40}
+        probs = mcl.verify_upload(exp_unv, bad)
+        e = expected
+        assert probs == [
+            f"git blob latents/manifest.json: remote {'1' * 40} != local "
+            f"{e['latents/manifest.json']['git_sha1']}",
+            f"sha256 latents/train-0000.safetensors: remote {'0' * 64} != "
+            f"expected {e['latents/train-0000.safetensors']['sha256']}",
+            "missing latents/train-0001.safetensors",
+            "unverifiable latents/x.safetensors: no LFS sha256 on the remote",
+            f"size metadata.parquet: remote {e['metadata.parquet']['size'] + 1}"
+            f" != local {e['metadata.parquet']['size']}"], probs
+        assert ("--finalize-only --reset-upload-cache" in mcl.CONTENT_HELP
+                and "/vol/krea2/.cache/huggingface" in mcl.CONTENT_HELP)
+
+        # finalize_impl with a fake HfApi: write check, privacy, upload,
+        # content check at the commit read after the upload
+        class FakeApi:
+            def __init__(self, who_=None, exists=False, private=True,
+                         auth_ok=True, corrupt=None):
+                self.who = who_ or who("write")
+                self.exists, self.private = exists, private
+                self.auth_ok, self.corrupt = auth_ok, corrupt
+                self.calls, self.uploaded = [], {}
+
+            def whoami(self):
+                self.calls.append("whoami")
+                return self.who
+
+            def repo_exists(self, repo, repo_type):
+                self.calls.append("repo_exists")
+                return self.exists
+
+            def auth_check(self, repo, repo_type, write):
+                self.calls.append(f"auth_check write={write}")
+                if not self.auth_ok:
+                    raise PermissionError("403 Forbidden")
+
+            def create_repo(self, repo, repo_type, private, exist_ok):
+                assert (repo, repo_type, private, exist_ok) == (
+                    mcl.OUT_REPO, "dataset", True, True)
+                self.calls.append("create_repo")
+                if not self.exists:
+                    self.exists, self.private = True, True
+
+            def repo_info(self, repo, repo_type):
+                self.calls.append("repo_info")
+                return SimpleNamespace(private=self.private, sha="c0ffee")
+
+            def upload_large_folder(self, repo, folder, **kw):
+                assert kw["ignore_patterns"] == mcl.UPLOAD_IGNORE, kw
+                assert kw["private"] is True, kw
+                self.calls.append("upload")
+                self.state_at_upload = (Path(folder) / ".cache/huggingface"
+                                        ).exists()
+                self.uploaded = mcl.expected_upload(folder)
+
+            def list_repo_tree(self, repo, repo_type, recursive, expand,
+                               revision):
+                assert (recursive, expand, revision) == (True, True,
+                                                         "c0ffee")
+                self.calls.append("list_repo_tree")
+                items = tree(self.uploaded)
+                if self.corrupt:
+                    for it in items:
+                        if it.path == self.corrupt:
+                            it.lfs.sha256 = "e" * 64
+                return items
+
+        man_cmds = []
+
+        def runner(cmd, cwd):
+            assert cmd == mcl.finalize_cmd(python="py", out=str(out)), cmd
+            man_cmds.append(cmd)
+            return SimpleNamespace(returncode=0)   # manifest already written
+
+        def fin(api, vol=None, **kw):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return mcl.finalize_impl(vol or FakeVol(), api=api,
+                                         out_dir=out, runner=runner,
+                                         python="py", **kw)
+
+        api = FakeApi()
+        r = fin(api)
+        assert r["ok"] and r["problems"] == [] and r["error"] is None, r
+        assert r["revision"] == "c0ffee" and r["n_files"] == 4, r
+        assert api.calls == ["whoami", "repo_exists", "create_repo",
+                             "repo_info", "upload", "repo_info",
+                             "list_repo_tree"], api.calls
+        api = FakeApi(exists=True)                 # existing private repo
+        assert fin(api)["ok"] and api.calls[:3] == [
+            "whoami", "repo_exists", "auth_check write=True"], api.calls
+        api = FakeApi(exists=True, private=False)  # public: never upload
+        r = fin(api)
+        assert not r["ok"] and "not private" in r["error"], r
+        assert "upload" not in api.calls, api.calls
+        api = FakeApi(exists=True, auth_ok=False)
+        r = fin(api)
+        assert not r["ok"] and "cannot write" in r["error"], r
+        assert "403 Forbidden" in r["error"], r
+        assert "create_repo" not in api.calls, api.calls
+        api = FakeApi(who_=who("read"))
+        r = fin(api)
+        assert "token role read" in r["error"] and api.calls == ["whoami"]
+        api = FakeApi(who_=who("fineGrained", scoped=[
+            {"entity": {"type": "dataset", "name": mcl.OUT_REPO},
+             "permissions": ["repo.write"]}]))     # unknown: not blocked
+        assert fin(api)["ok"], api.calls
+        api = FakeApi(corrupt="latents/train-0001.safetensors")
+        r = fin(api)
+        assert not r["ok"] and r["problems"][0].startswith(
+            "sha256 latents/train-0001.safetensors: remote eeee"), r
+        assert "--finalize-only" in r["error"], r
+        assert len(man_cmds) == 4, man_cmds        # read/auth/public stop early
+
+        # --reset-upload-cache: the upload state is gone (and committed)
+        # before upload_large_folder runs; without it the state is kept
+        state = out / ".cache/huggingface/upload/latents"
+        state.mkdir(parents=True)
+        (state / "train-0000.safetensors.metadata").write_text("stale")
+        api = FakeApi()
+        assert fin(api)["ok"] and api.state_at_upload is True
+        api, vol = FakeApi(), FakeVol()
+        r = fin(api, vol=vol, reset_upload_cache=True)
+        assert r["ok"] and api.state_at_upload is False, r
+        assert not (out / ".cache/huggingface").exists()
+        assert any(ln.startswith("--reset-upload-cache: removed")
+                   for ln in r["log"]), r["log"]
+        # commits: after the manifest, after the reset, after the upload
+        assert vol.commits == 3, vol.commits
+    print("    modal_cache_latents: cost math, 5% tie rule, OOM ladder, "
+          "token check, worker command/env/timeout, commit per shard, upload "
+          "filter + content check")
 
 
 # === add new @case functions above this line ===============================

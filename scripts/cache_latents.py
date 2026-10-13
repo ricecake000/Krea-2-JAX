@@ -8,11 +8,16 @@ Images are pre-cropped to their aspect bucket; each is VAE-encoded at
 (bucket_w, bucket_h) and stored normalized ((z - latents_mean) / latents_std,
 exactly like cache_dataset.VaeEncoder) as bf16.
 
+VAE encode path (--vae-impl, scripts/vae_fast.py): "ref" = diffusers
+vae.encode (default), "2d" = equivalent single-frame 2D conv encoder, "2d-compile"
+= the same under torch.compile. Recorded as shard metadata "vae_impl"
+(informational: shard_done ignores it, so shards of any impl stay valid).
+
 Output (<out>):
     metadata.parquet                    verbatim copy (--write-manifest pass)
     latents/manifest.json               {"format", "vae", "n", "shards", "digests"} (--write-manifest pass)
     latents/train-XXXX.safetensors      one per source tar; "<id>" -> (16, bucket_h/8, bucket_w/8)
-                                        bf16; metadata {format, vae, source, count}
+                                        bf16; metadata {format, vae, source, count[, vae_impl]}
 
 Shard files are written atomically (tmp + os.replace); a shard whose output
 already opens with the right format/vae/source/count is skipped, so any run
@@ -56,6 +61,7 @@ from safetensors.torch import save_file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_dataset import VaeEncoder, load_image  # noqa: E402
+from vae_fast import IMPLS as VAE_IMPLS, make_encoder  # noqa: E402
 from krea2_jax.hashing import file_sha256, is_sha256_hex  # noqa: E402
 
 FORMAT = "krea2-latents-v1"
@@ -231,18 +237,23 @@ def encode_samples(samples, encoder, batch, pool, lookahead=2, log=print,
             raise ValueError(f"{tag}: non-finite latents for ids {bad}")
         lat = lat.detach().to(torch.bfloat16).cpu()
         for k, s in enumerate(chunk):
-            out[str(s["id"])] = lat[k].clone()  # own storage (safetensors)
+            # own, contiguous storage: safetensors refuses strided tensors
+            # (e.g. channels_last latents from cudnn.benchmark / inductor)
+            out[str(s["id"])] = lat[k].clone(
+                memory_format=torch.contiguous_format)
     return out, resized
 
 
 def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
-                  expected_count=None, decode_threads=4, log=print, tag=None):
+                  expected_count=None, decode_threads=4, log=print, tag=None,
+                  vae_impl=None):
     """Encode one dataset tar into one `krea2-latents-v1` shard file.
 
     `encoder(imgs (N, 3, H, W) float32 in [-1, 1]) -> (N, 16, H/8, W/8)`.
     Skips the work when `out_path` is already complete for this job (with
     `expected_count` given this check needs no tar). Writes
-    `<out_path>.tmp` then os.replace. Returns stats
+    `<out_path>.tmp` then os.replace. `vae_impl` (if given) is stored as
+    extra metadata; it is not part of shard_done. Returns stats
     {skipped, n, resized, seconds}.
     """
     out_path = Path(out_path)
@@ -266,9 +277,11 @@ def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
                                           log=log, tag=tag)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name(out_path.name + ".tmp")
-    save_file(tensors, str(tmp), metadata={
-        "format": FORMAT, "vae": vae_id, "source": source,
-        "count": str(len(tensors))})
+    meta = {"format": FORMAT, "vae": vae_id, "source": source,
+            "count": str(len(tensors))}
+    if vae_impl is not None:
+        meta["vae_impl"] = vae_impl
+    save_file(tensors, str(tmp), metadata=meta)
     os.replace(tmp, out_path)
     return {"skipped": False, "n": len(tensors), "resized": resized,
             "seconds": time.time() - t0}
@@ -532,6 +545,11 @@ def build_parser():
                     default="auto",
                     help="VAE compute dtype; auto = bf16 on GPU, fp32 on CPU "
                          "(latents are stored bf16 either way)")
+    ap.add_argument("--vae-impl", choices=VAE_IMPLS, default="ref",
+                    help="VAE encode path (scripts/vae_fast.py): ref = "
+                         "diffusers vae.encode, 2d = equivalent single-frame "
+                         "2D encoder, 2d-compile = 2d under torch.compile; "
+                         "stored as shard metadata vae_impl")
     ap.add_argument("--decode-threads", type=int, default=6,
                     help="CPU threads decoding WebP ahead of the VAE")
     ap.add_argument("--download-dir", default=None,
@@ -609,6 +627,7 @@ def main(argv=None):
     # Encoder loads lazily: a fully cached rerun never touches the model.
     if args.vae_stub:
         encoder = StubEncoder()
+        vae_impl = STUB_VAE_ID
     else:
         device = args.device
         if (device == "cuda" and args.num_workers > 1
@@ -618,10 +637,11 @@ def main(argv=None):
             dtype = torch.float32 if device == "cpu" else torch.bfloat16
         else:
             dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[args.dtype]
-        print(f"{tag} loading VAE {args.vae} on {device} ({dtype})",
-              flush=True)
+        print(f"{tag} loading VAE {args.vae} on {device} ({dtype}), impl "
+              f"{args.vae_impl}", flush=True)
         vae = VaeEncoder(args.vae, device, dtype)
-        encoder = lambda imgs: vae_encode_batch(vae, imgs)  # noqa: E731
+        encoder = make_encoder(vae, args.vae_impl)
+        vae_impl = args.vae_impl
 
     def get_tar(t):
         t0 = time.time()
@@ -643,7 +663,7 @@ def main(argv=None):
                 path, lat_dir / shard_name(t), encoder, args.batch,
                 vae_id=vae_id, source=t, expected_count=counts[t],
                 decode_threads=args.decode_threads,
-                tag=f"{tag} {Path(t).stem}")
+                tag=f"{tag} {Path(t).stem}", vae_impl=vae_impl)
             if remote and not args.keep_tars:
                 path.unlink(missing_ok=True)
             done_imgs += stats["n"]
