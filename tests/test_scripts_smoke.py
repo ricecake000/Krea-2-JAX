@@ -11,6 +11,13 @@ tiny model config on 8 emulated devices:
   modal_text_parity_flow scripts/modal_text_parity.py control flow (exit
                          codes, skip-on-tokenizer-failure, exit 1) with a
                          mocked subprocess runner, no Modal SDK
+  modal_cache_latents_flow scripts/modal_cache_latents.py pure parts, no
+                         Modal SDK: cost model vs hand-computed numbers, GPU
+                         selection (5% tie -> higher img/s, failed GPUs and
+                         OOM/error ladder rows ignored), batch ladder (stub
+                         encoder), HF token write check, worker command, the
+                         commit-per-shard stream on a real stub
+                         cache_latents run, upload filter + remote check
 
 Structure: every case is a function registered with @case (name = function
 name); `main` runs them all, or only those named on the command line:
@@ -420,6 +427,244 @@ def modal_text_parity_flow():
     print("    modal_text_parity: exit codes aggregated, tokenizer failure "
           "skips model checks, download failure reported, log written "
           "before exit 1")
+
+
+@case
+def modal_cache_latents_flow():
+    """scripts/modal_cache_latents.py without Modal (the import is guarded):
+    pricing/cost math against hand-computed numbers, the selection rule,
+    the ladder's OOM handling, token parsing, the worker command, the
+    stream that commits the volume after every shard (real cache_latents
+    --vae-stub run on a tiny dataset), the upload filter and size check."""
+    import contextlib
+    import io
+    import tempfile
+    from math import isclose
+
+    import torch
+
+    sys.path.insert(0, str(REPO / "scripts"))
+    import modal_cache_latents as mcl
+
+    def close(a, b):
+        return isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+
+    # GPU strings / prices
+    assert mcl.gpu_key("h100!") == "H100" and mcl.gpu_key("B200+") == "B200"
+    assert mcl.parse_gpus(" l4, A10 ,H100!,l4") == ["L4", "A10", "H100!"]
+    for bad in ("T4", "B200:2", "A10G"):
+        try:
+            mcl.gpu_key(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"gpu_key accepted {bad!r}")
+
+    # cores_needed = max(4, ceil(1.5 * img_s / decode) + 1)
+    assert mcl.cores_needed(2.0, 1.0) == 4        # ceil(3) + 1 = 4
+    assert mcl.cores_needed(1.0, 10.0) == 4       # floor of 4
+    assert mcl.cores_needed(10.0, 0.5) == 31      # ceil(30) + 1
+    assert mcl.cores_needed(3.1, 1.0) == 6        # ceil(4.65) + 1
+
+    # cost: L4 at 2 img/s, 1 img/s/thread decode -> 4 cores
+    # hourly = 0.80 + 4 * 0.0472 + 32 * 0.00799 = 1.24448 $/h
+    # $/1k = 1.24448 / 7200 * 1000 = 0.172844...; hours = 96848 / 7200
+    # 1 ctr: 1.24448 * (13.451111 + 0.05) = 16.8018627...
+    # 4 ctr: 1.24448 * (13.451111 + 0.2) = 16.9885347..., wall 3.4127777 h
+    res_l4 = {"gpu_requested": "L4", "device_name": "NVIDIA L4",
+              "decode_img_s_per_thread": 1.0,
+              "ladder": [{"batch": 4, "img_s": 1.5, "peak_gib": 6.0},
+                         {"batch": 8, "img_s": 2.0, "peak_gib": 11.0},
+                         {"batch": 16, "error": "OOM"}]}
+    best = mcl.best_of(res_l4["ladder"])
+    assert best == {"best_batch": 8, "best_img_s": 2.0,
+                    "best_peak_gib": 11.0}, best
+    res_l4.update(best)
+    r = mcl.cost_row(res_l4)
+    assert r["cores"] == 4 and r["batch"] == 8, r
+    assert close(r["usd_h"], 1.24448), r
+    assert close(r["usd_per_1k"], 0.17284444444444444), r
+    assert close(r["hours_1"], 13.45111111111111), r
+    assert close(r["proj"][1]["usd"], 16.801862755555558), r
+    assert close(r["proj"][4]["usd"], 16.988534755555555), r
+    assert close(r["proj"][4]["wall_h"], 3.4127777777777775), r
+    # B200 at 10 img/s, 0.5 img/s/thread -> 31 cores:
+    # 6.25 + 31 * 0.0472 + 0.25568 = 7.96888 $/h -> 0.2213577.. $/1k
+    r = mcl.cost_row({"gpu_requested": "B200", "best_img_s": 10.0,
+                      "best_batch": 16, "decode_img_s_per_thread": 0.5})
+    assert r["cores"] == 31 and close(r["usd_h"], 7.96888), r
+    assert close(r["usd_per_1k"], 0.2213577777777778), r
+    # unusable results -> None (never selected)
+    assert mcl.cost_row({"gpu_requested": "L4", "error": "boom",
+                         "best_img_s": 99.0,
+                         "decode_img_s_per_thread": 1.0}) is None
+    all_oom = {"gpu_requested": "L4", "decode_img_s_per_thread": 1.0,
+               "ladder": [{"batch": 4, "error": "OOM"}]}
+    all_oom.update(mcl.best_of(all_oom["ladder"]))
+    assert mcl.cost_row(all_oom) is None, all_oom
+
+    # selection: lowest $/img; within 5% is a tie -> higher img/s wins
+    def row(gpu, usd, img_s):
+        return {"gpu": gpu, "usd_per_1k": usd, "img_s": img_s}
+    rows = [row("A", 1.00, 5.0), row("B", 1.04, 20.0), row("C", 1.06, 50.0),
+            None]
+    assert mcl.select_gpu(rows)["gpu"] == "B"          # C is 6% off
+    assert mcl.select_gpu([row("A", 1.0, 5.0), row("B", 1.05, 6.0)])[
+        "gpu"] == "B"                                    # exactly 5%: tie
+    assert mcl.select_gpu([row("A", 1.0, 5.0), row("B", 1.2, 60.0)])[
+        "gpu"] == "A"
+    assert mcl.select_gpu([None, None]) is None
+
+    # report from bench results (one usable, one OOM-only, one error)
+    results = [res_l4, all_oom | {"gpu_requested": "A10"},
+               {"gpu_requested": "B300", "error": "Traceback\nRuntimeError: "
+                "no capacity"}]
+    rows = [mcl.cost_row(x) for x in results]
+    choice = mcl.select_gpu(rows)
+    md = mcl.render_bench_report(results, rows, choice,
+                                 prep={"whoami": "ricecake",
+                                       "can_write": True,
+                                       "write_reason": "token role write"})
+    cmd = ("modal run --detach scripts/modal_cache_latents.py --build --gpu "
+           "L4 --containers 4 --batch 8 --cpu 4")
+    assert mcl.build_command(choice) == cmd and cmd in md, md
+    assert "**Chosen: L4**" in md and "8:2.00 16:OOM" in md, md
+    assert "- A10 " in md and "- B300 " in md and "no capacity" in md, md
+
+    # ladder: stub encoder, OOM at batch 8 stops it, wrong shape -> error
+    class OutOfMemoryError(RuntimeError):
+        pass
+    stub = __import__("cache_latents").StubEncoder()
+
+    def enc(x):
+        if x.shape[0] >= 8:
+            raise OutOfMemoryError("CUDA out of memory. Tried to allocate")
+        return stub(x)
+    imgs = [torch.rand(3, 64, 32) * 2 - 1 for _ in range(5)]
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    with quiet:
+        lad = mcl.run_ladder(enc, imgs, (2, 4, 8, 16), (16, 8, 4),
+                             min_images=4, min_seconds=0.0)
+    assert [x["batch"] for x in lad] == [2, 4, 8], lad
+    assert lad[2] == {"batch": 8, "error": "OOM"}, lad
+    assert all(x["img_s"] > 0 and x["images"] >= max(4, 3 * x["batch"])
+               for x in lad[:2]), lad
+    with contextlib.redirect_stdout(io.StringIO()):
+        lad = mcl.run_ladder(stub, imgs, (2,), (16, 4, 4), min_images=2,
+                             min_seconds=0.0)
+    assert lad[0]["error"].startswith("ValueError: output (2, 16, 8, 4)"), lad
+
+    # HF token
+    assert mcl.pick_hf_token({"HUGGINGFACE_TOKEN": "c",
+                              "HUGGING_FACE_HUB_TOKEN": "b"}) == (
+        "HUGGING_FACE_HUB_TOKEN", "b")
+    env = {"HUGGINGFACE_TOKEN": "c"}
+    assert mcl.setup_hf_token(env) == ("HUGGINGFACE_TOKEN", "c")
+    assert env["HF_TOKEN"] == "c"
+    assert mcl.pick_hf_token({"HF_TOKEN": ""}) == (None, None)
+
+    def who(role, name="ricecake", scoped=None):
+        tok = {"role": role}
+        if scoped is not None:
+            tok["fineGrained"] = {"scoped": scoped, "global": []}
+        return {"name": name, "auth": {"accessToken": tok}}
+    assert mcl.token_can_write(who("write"))[0] is True
+    assert mcl.token_can_write(who("read"))[0] is False
+    assert mcl.token_can_write(who("write", name="other"))[0] is False
+    assert mcl.token_can_write(who("fineGrained", scoped=[
+        {"entity": {"type": "user", "name": "ricecake"},
+         "permissions": ["repo.content.read", "repo.write"]}]))[0] is True
+    assert mcl.token_can_write(who("fineGrained", scoped=[
+        {"entity": {"type": "user", "name": "ricecake"},
+         "permissions": ["repo.content.read"]}]))[0] is False
+    assert mcl.token_can_write(who("mystery"))[0] is None
+    assert mcl.token_can_write({})[0] is False
+
+    # worker / finalize commands
+    assert mcl.worker_cmd(2, 4, 16, 12, python="py") == [
+        "py", "scripts/cache_latents.py", "--out", "/vol/krea2",
+        "--num-workers", "4", "--worker-index", "2", "--batch", "16",
+        "--decode-threads", "12", "--download-dir", "/tmp/dl/w2"]
+    assert mcl.finalize_cmd(python="py") == [
+        "py", "scripts/cache_latents.py", "--out", "/vol/krea2",
+        "--write-manifest", "--download-dir", "/tmp/dl/manifest"]
+
+    # upload filter (same semantics as huggingface_hub's ignore_patterns)
+    paths = ["metadata.parquet", "latents/manifest.json",
+             "latents/train-0000.safetensors",
+             "latents/train-0000.safetensors.tmp", "latents/manifest.json.tmp",
+             "_download/manifest/metadata.parquet",
+             "_download/w0/data/train-0001.tar",
+             ".cache/huggingface/upload/latents/x.metadata"]
+    kept = [p for p in paths if mcl.should_upload(p)]
+    assert kept == paths[:3], kept
+    try:
+        from huggingface_hub.utils import filter_repo_objects
+    except ImportError:
+        pass
+    else:
+        assert list(filter_repo_objects(
+            paths, ignore_patterns=mcl.UPLOAD_IGNORE)) == kept
+
+    # commit after every shard: real cache_latents --vae-stub run, 1 worker
+    from test_cache_latents import make_fake_dataset
+
+    class FakeVol:
+        def __init__(self, fail_first=False):
+            self.commits, self.fail = 0, fail_first
+
+        def commit(self):
+            self.commits += 1
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("commit conflict")
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        make_fake_dataset(d / "src")
+        vol, logs = FakeVol(fail_first=True), []
+        cmd = mcl.worker_cmd(0, 1, 2, 2, python=sys.executable,
+                             out=str(d / "out"), dl_root=str(d / "dl")) + [
+            "--tar-dir", str(d / "src"), "--vae-stub", "--device", "cpu"]
+        buf = io.StringIO()
+        rc, tail, n = mcl.stream_worker(
+            cmd, lambda: mcl.commit_volume(vol, logs.append), cwd=str(REPO),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"}, out=buf)
+        shard_lines = [ln for ln in buf.getvalue().splitlines()
+                       if mcl.is_shard_line(ln)]
+        assert rc == 0 and n == 2 and len(shard_lines) == 2, buf.getvalue()
+        assert vol.commits == 2 and len(logs) == 1, (vol.commits, logs)
+        assert "commit conflict" in logs[0], logs
+        assert any("done: 6 images" in ln for ln in tail), tail
+        ok, lines = mcl.summarize_workers([
+            {"worker": 1, "rc": 0, "seconds": 60},
+            {"worker": 0, "rc": rc, "shards_written": n, "seconds": 1}])
+        assert ok and lines[0].startswith("w0: ok"), lines
+        ok, lines = mcl.summarize_workers([
+            {"worker": 0, "rc": 0}, {"worker": 1, "rc": None,
+                                     "error": "Traceback\nOSError: x"}])
+        assert not ok and "FAILED" in lines[1] and "OSError: x" in lines[1]
+
+        # manifest pass, then the remote size check
+        subprocess.run([sys.executable, "scripts/cache_latents.py",
+                        "--tar-dir", str(d / "src"), "--out",
+                        str(d / "out"), "--write-manifest"], cwd=str(REPO),
+                       check=True, capture_output=True)
+        expected = mcl.expected_upload_sizes(d / "out")
+        assert sorted(expected) == [
+            "latents/manifest.json", "latents/train-0000.safetensors",
+            "latents/train-0001.safetensors", "metadata.parquet"], expected
+        assert mcl.verify_upload(expected, dict(expected)) == []
+        remote = dict(expected, extra=1)
+        remote.pop("latents/train-0001.safetensors")
+        remote["metadata.parquet"] += 1
+        assert mcl.verify_upload(expected, remote) == [
+            "missing latents/train-0001.safetensors",
+            f"size metadata.parquet: remote {expected['metadata.parquet'] + 1}"
+            f" != local {expected['metadata.parquet']}"], remote
+    print("    modal_cache_latents: cost math, 5% tie rule, OOM ladder, "
+          "token check, worker command, commit per shard, upload filter + "
+          "size check")
 
 
 # === add new @case functions above this line ===============================
