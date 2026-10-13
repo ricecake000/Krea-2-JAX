@@ -627,6 +627,24 @@ python scripts/sample.py --base-ckpt ./full_out/model.safetensors \
   --prompt "..." --steps 28 --cfg 4.5 --seed 0
 ```
 
+### Quality eval on Modal (full FT vs base)
+
+`scripts/modal_eval_full.py` samples the R2 export (`krea2-fullft/run1/
+model.safetensors`) and `raw.safetensors` with the same prompt, seed and
+sampler settings (28 steps, CFG 4.5, `--attn cudnn`) on one Modal GPU (H100
+by default; the DiTs run one after the other), decodes on CPU containers and
+writes `NN_{base,ft,pair}.png`, `prompts.json` and an `index.html` contact
+sheet to `/home/mj/krea2-ops/eval/run1_<UTC>/`. Prompts: 40 dataset captions
+from the 3 most common buckets (formatted like training) + 10 OOD prompts at
+1024x1024. Text goes through the training text path (JAX Qwen3-VL tower,
+`text_rows` 256).
+
+```bash
+modal run scripts/modal_eval_full.py --only-prompts   # prompt table (CPU only)
+modal run scripts/modal_eval_full.py --limit 2        # smoke run
+modal run scripts/modal_eval_full.py                  # full eval (rough: ~35 min, ~$3 on H100)
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -653,6 +671,8 @@ python tests/test_scripts_smoke.py # aot_analysis / bench_step / parity scripts 
 python tests/test_sampling.py      # sampler: text caching, text compaction, head-sharded splash
 python tests/test_layer_loop.py    # --layer-loop unroll == scan (outputs + grads), list-block
                                    # checkpoint I/O + shardings, no slice/DUS in the HLO
+python tests/test_modal_eval_full.py  # Modal eval: prompt selection, caption format, tiny
+                                      # generate path, decode/index writing (no Modal)
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -683,6 +703,7 @@ scripts/
   parity_full.py    # torch vs jax full-model parity (node check)
   node_attention_parity.py  # jax-aiter attention vs reference (node check)
   sample.py         # jax DiT + torch encode/decode
+  modal_eval_full.py  # Modal: full FT vs base side-by-side images + contact sheet
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
