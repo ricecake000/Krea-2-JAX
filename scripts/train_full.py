@@ -514,6 +514,11 @@ def parse_args(argv=None):
                          "run exits cleanly (continue with --resume)")
     ap.add_argument("--save-every", type=int, default=1000,
                     help="orbax train-state checkpoint interval (steps)")
+    ap.add_argument("--save-steps", default="",
+                    help="comma-separated extra steps at which the train "
+                         "state is also saved (e.g. an early '20' to prove "
+                         "the save path); like --save-every, only steps "
+                         "below --steps (the final save always happens)")
     ap.add_argument("--keep", type=int, default=3,
                     help="number of orbax checkpoints to keep")
     ap.add_argument("--log-every", type=int, default=10)
@@ -583,6 +588,19 @@ def parse_caption_probs(text):
     return probs
 
 
+def parse_save_steps(text):
+    """'20,500' -> frozenset({20, 500}); '' -> empty. Positive ints only."""
+    text = str(text).strip()
+    try:
+        steps = frozenset(int(x) for x in text.split(",")) if text else frozenset()
+    except ValueError:
+        steps = None
+    if steps is None or any(s < 1 for s in steps):
+        raise SystemExit(f"--save-steps must be comma-separated positive "
+                         f"integers, got {text!r}")
+    return steps
+
+
 def resolution_metadata(config, img_tokens=None):
     """The resolution fields of an export's metadata: bucketed runs record
     {"resolution": "bucketed", "img_tokens": N}; a run config from the older
@@ -622,6 +640,7 @@ def main(argv=None):
     cfg = KREA2_CONFIG
     if args.model_config:
         cfg = dataclasses.replace(cfg, **json.loads(args.model_config))
+    save_steps = parse_save_steps(args.save_steps)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "ckpt"
@@ -1047,7 +1066,9 @@ def main(argv=None):
                 log(f"{stop['sig']} received; stopping at step {last_step} "
                     "(resume with --resume)")
                 break
-            if args.save_every and step % args.save_every == 0 and step < args.steps:
+            if step < args.steps and (
+                    (args.save_every and step % args.save_every == 0)
+                    or step in save_steps):
                 save(step)
             if args.export_every and step % args.export_every == 0 and step < args.steps:
                 export(step)
