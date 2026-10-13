@@ -50,6 +50,12 @@ TINY = dict(
 )
 TEXT_OVERRIDES = {"select_layers": [0, 1, 2]}
 TEXT_ROWS = 32
+# s3transfer 0.19.x constants.py ALLOWED_DOWNLOAD_ARGS (boto3 download_file
+# rejects any other ExtraArgs key)
+ALLOWED_DOWNLOAD_ARGS = {
+    "ChecksumMode", "VersionId", "SSECustomerAlgorithm", "SSECustomerKey",
+    "SSECustomerKeyMD5", "RequestPayer", "ExpectedBucketOwner",
+}
 
 
 def write_parquet(path, rows):
@@ -251,17 +257,21 @@ def test_downloads(tmp_path):
                     "ETag": f'"{self.etag}"',
                     "LastModified": self.last_modified}
 
-        replaced_by = None   # ETag of a concurrent replacement
+        replaced_by = None   # ETag the object has after the download
 
         def download_file(self, bucket, key, filename, ExtraArgs=None,
                           Config=None):
+            # boto3 validates ExtraArgs against s3transfer's
+            # ALLOWED_DOWNLOAD_ARGS (s3transfer 0.19.x constants.py) and
+            # raises ValueError for anything else (e.g. IfMatch)
+            bad = set(ExtraArgs or {}) - ALLOWED_DOWNLOAD_ARGS
+            if bad:
+                raise ValueError(f"Invalid extra_args key(s) {sorted(bad)}")
             self.downloads += 1
             assert filename.endswith(".part") and Config == "cfg"
-            assert ExtraArgs == {"IfMatch": f'"{self.etag}"'}, ExtraArgs
-            Path(filename).write_bytes(self.data[:10])   # partial
-            if self.replaced_by is not None:   # S3: 412 PreconditionFailed
-                raise RuntimeError("PreconditionFailed (IfMatch)")
             Path(filename).write_bytes(self.data)
+            if self.replaced_by is not None:   # replaced meanwhile
+                self.etag = self.replaced_by
 
     def fetch(s3, dest):
         return mef.r2_fetch(s3, "bkt", mef.R2_KEY, dest, log.append,
@@ -312,15 +322,15 @@ def test_downloads(tmp_path):
         assert "identity" in str(e)
     else:
         raise AssertionError("FT without identity marker accepted")
-    # object replaced during the download: IfMatch fails -> no file, no
-    # sidecar (nothing recorded under the old identity)
+    # head_object changes between before and after the download -> error,
+    # no file, no sidecar (nothing recorded under the old identity)
     racy = FakeS3(payload, etag="e3")
     racy.replaced_by = "e4"
     dest3 = tmp_path / "ft3" / "model.safetensors"
     try:
         fetch(racy, dest3)
     except RuntimeError as e:
-        assert "PreconditionFailed" in str(e)
+        assert "changed during the download" in str(e), e
     else:
         raise AssertionError("concurrent replacement not detected")
     assert not dest3.exists() and not mef.r2_marker_path(dest3).exists()

@@ -506,8 +506,10 @@ def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
     (r2_marker_path, written only after a complete, size-checked download)
     must equal the object's head_object identity (key, ETag, size,
     LastModified) and dest must have that size. A replaced object (even of
-    the same size) is downloaded again, with IfMatch on the observed ETag.
-    -> (status, identity)."""
+    the same size) is downloaded again. s3transfer pins every ranged part
+    GET to the ETag of its own HeadObject (IfMatch); head_object is asked
+    again after the download, and an identity that changed meanwhile is an
+    error (no file, no sidecar). -> (status, identity)."""
     dest = Path(dest)
     head = client.head_object(Bucket=bucket, Key=key)
     ident = r2_identity(head, key)
@@ -527,15 +529,16 @@ def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
 
         transfer_config = TransferConfig(**R2_TRANSFER)
     try:
-        # IfMatch binds every ranged GET to the object head_object saw: a
-        # concurrent replacement fails here instead of being recorded under
-        # the old identity
-        client.download_file(bucket, key, str(part),
-                             ExtraArgs={"IfMatch": head["ETag"]},
-                             Config=transfer_config)
+        client.download_file(bucket, key, str(part), Config=transfer_config)
     except BaseException:
         part.unlink(missing_ok=True)
         raise
+    after = r2_identity(client.head_object(Bucket=bucket, Key=key), key)
+    if after != ident:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"r2:{key}: the object changed during the download "
+                           f"(before {ident}, after {after}); run prepare "
+                           "again")
     got = part.stat().st_size
     if got != size:
         part.unlink(missing_ok=True)
