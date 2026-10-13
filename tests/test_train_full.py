@@ -50,6 +50,9 @@ carry padded image rows):
      unroll (or an older checkpoint that does not record layer_loop, or
      records no run config at all) is a hard config error, raised before
      any --resume-step rename.
+  q. --save-steps adds saves on top of --save-every (each step once, none at
+     --steps besides the final save) and they rotate under --keep; garbage
+     values are a SystemExit.
 
 Requires CPU PyTorch + einops (tiny reference checkpoint, parity check).
 """
@@ -970,11 +973,12 @@ def main():
     assert not cbd("--xla_force_host_platform_device_count=8 --foo=1")
     print("k. command_buffers_disabled parses XLA_FLAGS (last token wins): ok")
 
-    # --- n. CLI run with a --timestep-mu override ---
+    # --- n. CLI run with a --timestep-mu override (+ q. --save-steps) ---
     outM = tmp / "run_mu"
     stepsM, logM = run_train(base, cache, outM,
-                             ("--steps", "2", "--timestep-mu", "0.8"))
-    assert sorted(stepsM) == [1, 2], sorted(stepsM)
+                             ("--steps", "3", "--timestep-mu", "0.8",
+                              "--save-steps", "1, 2,3", "--keep", "2"))
+    assert sorted(stepsM) == [1, 2, 3], sorted(stepsM)
     assert all(math.isfinite(v[0]) for v in stepsM.values()), stepsM
     assert "mu 0.8000 (--timestep-mu, all samples)" in logM, logM
     assert "(per sample)" in log1, log1
@@ -983,6 +987,22 @@ def main():
     print(f"n. --timestep-mu 0.8 CLI run: losses "
           f"{', '.join(f'{stepsM[s][0]:.4f}' for s in (1, 2))}, recorded in "
           "the run config: ok")
+    saved = re.findall(r"^saved train state \S+/(\d+) \(async\)$", logM, re.M)
+    assert saved == ["1", "2", "3"], saved  # 3 = the final save, only once
+    assert fullft_ckpt.all_steps(str(outM / "ckpt")) == [2, 3], \
+        sorted(os.listdir(outM / "ckpt"))
+    assert "save_steps" not in cfgM, cfgM
+    pss = train_full.parse_save_steps
+    assert pss("") == frozenset() and pss("20, 500,20") == {20, 500}
+    for bad in ("0", "-5", "a", "1,,2", "1.5"):
+        try:
+            pss(bad)
+        except SystemExit as e:
+            assert "--save-steps" in str(e), e
+        else:
+            raise AssertionError(f"--save-steps {bad!r} was not refused")
+    print("q. --save-steps 1,2,3 --steps 3 --keep 2: saved 1, 2, 3 (once), "
+          "kept [2, 3]; garbage refused: ok")
 
     # --- o. a latent shard corrupted under an unchanged manifest ---
     bad_cache = shutil.copytree(cache, tmp / "data_corrupt")

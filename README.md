@@ -510,6 +510,7 @@ Useful knobs:
 | `--act-sharding` | on | constrain activations to batch sharding (see above); `off` only for A/B |
 | `--layer-loop` | scan | `unroll`: per-layer weight arrays + unrolled block loop, no per-layer slice/DUS copies on GPU, longer compile (see above); not resumable across modes |
 | `--save-every` / `--keep` | 1000 / 3 | orbax checkpoints of params + optimizer + EMA |
+| `--save-steps` | – | comma-separated extra save steps on top of `--save-every` (e.g. `20`: an early save that proves the checkpoint path); counted against `--keep`, not part of the resume config |
 | `--export-every` | 0 | extra `model_stepNNNNNN.safetensors` exports (0 = only at the end) |
 | `--max-hours` | – | stop cleanly (checkpoint + export) after a wall-clock budget; counts only the train loop (see below) |
 | `--resume` | off | continue the newest checkpoint in `--output-dir/ckpt`; without it the script refuses to reuse a directory that already holds checkpoints |
