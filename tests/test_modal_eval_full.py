@@ -251,9 +251,16 @@ def test_downloads(tmp_path):
                     "ETag": f'"{self.etag}"',
                     "LastModified": self.last_modified}
 
-        def download_file(self, bucket, key, filename, Config=None):
+        replaced_by = None   # ETag of a concurrent replacement
+
+        def download_file(self, bucket, key, filename, ExtraArgs=None,
+                          Config=None):
             self.downloads += 1
             assert filename.endswith(".part") and Config == "cfg"
+            assert ExtraArgs == {"IfMatch": f'"{self.etag}"'}, ExtraArgs
+            Path(filename).write_bytes(self.data[:10])   # partial
+            if self.replaced_by is not None:   # S3: 412 PreconditionFailed
+                raise RuntimeError("PreconditionFailed (IfMatch)")
             Path(filename).write_bytes(self.data)
 
     def fetch(s3, dest):
@@ -305,6 +312,19 @@ def test_downloads(tmp_path):
         assert "identity" in str(e)
     else:
         raise AssertionError("FT without identity marker accepted")
+    # object replaced during the download: IfMatch fails -> no file, no
+    # sidecar (nothing recorded under the old identity)
+    racy = FakeS3(payload, etag="e3")
+    racy.replaced_by = "e4"
+    dest3 = tmp_path / "ft3" / "model.safetensors"
+    try:
+        fetch(racy, dest3)
+    except RuntimeError as e:
+        assert "PreconditionFailed" in str(e)
+    else:
+        raise AssertionError("concurrent replacement not detected")
+    assert not dest3.exists() and not mef.r2_marker_path(dest3).exists()
+    assert not list(dest3.parent.iterdir()), list(dest3.parent.iterdir())
     # a short download: error, no dest, no marker
     short = FakeS3(payload[:-1], size=len(payload) + 5)
     dest2 = tmp_path / "ft2" / "model.safetensors"
@@ -335,7 +355,8 @@ def test_downloads(tmp_path):
 def run_mock(prompts, deadline, load_s, cold_s, warm_s, load_allowance,
              cold_allowance):
     """run_models with a fake clock: load takes load_s, the first sample of a
-    resolution cold_s (compile; shared by the models), later ones warm_s.
+    resolution cold_s (compile; shared by the models), later ones warm_s
+    (cold_s / warm_s: seconds, or {(w, h): seconds}).
     -> (rows, skipped, notes, loads, end time)."""
     clock = SimpleNamespace(t=0.0)
     compiled, loads, freed = set(), [], []
@@ -348,7 +369,8 @@ def run_mock(prompts, deadline, load_s, cold_s, warm_s, load_allowance,
     def sample(params, name, p):
         assert params == name and name not in freed
         shape = (p["width"], p["height"])
-        clock.t += warm_s if shape in compiled else cold_s
+        d = warm_s if shape in compiled else cold_s
+        clock.t += d[shape] if isinstance(d, dict) else d
         compiled.add(shape)
         return {"finite": True}
 
@@ -387,6 +409,19 @@ def test_scheduler(tmp_path=None):
     assert end <= 200 and not skipped, (end, skipped, notes)
     assert [r["model"] for r in rows] == ["base"] * 50 + ["ft"] * 50
     assert sum(r["first_of_shape"] for r in rows) == 1
+    # Codex round 2: warm times are per resolution. 49 prompts of a fast
+    # resolution A (3 s warm) must not make the slow B (200 s warm) look
+    # cheap; with a global warm estimate FT's B sample ran past the deadline.
+    a, b = (64, 64), (64, 96)
+    probe = mef.finalize_prompts(
+        [{"source": "ood", "row_id": None, "variant": None, "artist": "",
+          "caption": f"p{i}", "width": (b if i == 49 else a)[0],
+          "height": (b if i == 49 else a)[1]} for i in range(50)], seed=0)
+    for deadline in (900, 1100, 1300, 3450):
+        rows, skipped, notes, loads, end = run_mock(
+            probe, deadline, 120, {a: 240, b: 240}, {a: 3, b: 200}, 300, 240)
+        assert end <= deadline, (deadline, end, notes)
+    assert len(rows) == 100 and not skipped, (rows, skipped)   # 3450 s
     # an expired deadline: no model is loaded, every sample is skipped
     rows, skipped, notes, loads, end = run_mock(
         same_shape_prompts(3), -1, 20, 60, 10, 20, 60)

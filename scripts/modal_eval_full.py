@@ -506,9 +506,11 @@ def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
     (r2_marker_path, written only after a complete, size-checked download)
     must equal the object's head_object identity (key, ETag, size,
     LastModified) and dest must have that size. A replaced object (even of
-    the same size) is downloaded again. -> (status, identity)."""
+    the same size) is downloaded again, with IfMatch on the observed ETag.
+    -> (status, identity)."""
     dest = Path(dest)
-    ident = r2_identity(client.head_object(Bucket=bucket, Key=key), key)
+    head = client.head_object(Bucket=bucket, Key=key)
+    ident = r2_identity(head, key)
     size = ident["size"]
     if (dest.is_file() and dest.stat().st_size == size
             and read_r2_marker(dest) == ident):
@@ -524,7 +526,16 @@ def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
         from boto3.s3.transfer import TransferConfig
 
         transfer_config = TransferConfig(**R2_TRANSFER)
-    client.download_file(bucket, key, str(part), Config=transfer_config)
+    try:
+        # IfMatch binds every ranged GET to the object head_object saw: a
+        # concurrent replacement fails here instead of being recorded under
+        # the old identity
+        client.download_file(bucket, key, str(part),
+                             ExtraArgs={"IfMatch": head["ETag"]},
+                             Config=transfer_config)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     got = part.stat().st_size
     if got != size:
         part.unlink(missing_ok=True)
@@ -651,18 +662,19 @@ def run_models(order, models, load, sample, free, deadline=None,
       cold  first sample of a resolution (includes its compile): the largest
             measured cold time, else `cold_allowance`
       warm  a resolution compiled before (by any model: the models share the
-            compiled steps): the largest measured warm time, else the
-            measured cold time of that resolution
+            compiled steps): the largest measured warm time OF THAT
+            RESOLUTION, else its measured cold time
       load  the previous model's measured load time, else `load_allowance`
     A model is loaded only if some prompt is left for it and the time left
     covers its load plus its first sample; otherwise it is skipped with a
     note. A sample starts only if it fits AND the later models can still
-    load and pair it, with every prompt done so far, at the warm estimate
-    (0 until one is measured): a later model only samples the prompts every
-    earlier model finished, so the outputs stay paired.
+    load and pair it, with every prompt done so far, each at its
+    resolution's warm time (an unmeasured resolution: the largest warm time
+    measured so far, 0 before any): a later model only samples the prompts
+    every earlier model finished, so the outputs stay paired.
     -> (rows, skipped "<id>_<model>", notes, {name: load seconds})."""
     rows, skipped, notes, load_s = [], [], [], {}
-    cold, warm, last_load = {}, None, None   # cold: (w, h) -> seconds
+    cold, warm, last_load = {}, {}, None   # (w, h) -> seconds
     allowed = {p["id"] for p in order}
 
     def left():
@@ -672,9 +684,14 @@ def run_models(order, models, load, sample, free, deadline=None,
         return (p["width"], p["height"])
 
     def est(shape):
+        """Time of the next sample of this resolution."""
         if shape not in cold:
             return max(cold.values(), default=cold_allowance)
-        return warm if warm is not None else cold[shape]
+        return warm.get(shape, cold[shape])
+
+    def pair_cost(shape):
+        """A later model's (warm) sample of this resolution."""
+        return warm.get(shape, max(warm.values(), default=0.0))
 
     for k, (name, path) in enumerate(models):
         todo = [p for p in order if p["id"] in allowed]
@@ -693,10 +710,11 @@ def run_models(order, models, load, sample, free, deadline=None,
         params = load(name, path)
         last_load = load_s[name] = clock() - t0
         later = len(models) - k - 1
-        done = set()
+        done, done_shapes = set(), []
         for p in todo:
             shape = shape_of(p)
-            reserve = later * (last_load + (len(done) + 1) * (warm or 0.0))
+            reserve = later * (last_load + sum(
+                pair_cost(s) for s in done_shapes + [shape]))
             if est(shape) + reserve > left():
                 skipped.append(f"{p['id']}_{name}")
                 continue
@@ -707,10 +725,11 @@ def run_models(order, models, load, sample, free, deadline=None,
             if first:
                 cold[shape] = dt
             else:
-                warm = max(warm or 0.0, dt)
+                warm[shape] = max(warm.get(shape, 0.0), dt)
             rows.append({"id": p["id"], "model": name, "seconds": dt,
                          "first_of_shape": first, **extra})
             done.add(p["id"])
+            done_shapes.append(shape)
         allowed &= done
         free(params)
         del params
