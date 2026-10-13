@@ -10,6 +10,10 @@ weights:
   * idempotent downloads: HF marker check; R2 skip only when the sidecar
     identity (key, ETag, size, LastModified) matches head_object (a replaced
     same-size object is downloaded again); weights identity for the eval
+  * --ft-key / --base-key / --labels: volume cache path per R2 key (the
+    default key keeps /vol/ft/run1/model.safetensors), prepare fetches the
+    R2 base instead of the HF one, weights identity of an R2 base, labels
+    on index.html / prompts.json; invalid keys / labels refused
   * run_models scheduling with a mocked clock: no sample ends after the
     deadline, warm samples are not charged the cold compile, no model load
     once the deadline has passed
@@ -355,6 +359,131 @@ def test_downloads(tmp_path):
         "HUGGINGFACE_TOKEN", "t")
     print("    HF marker check, R2 identity marker (ETag/size/LastModified) "
           "skip + re-download, weights identity")
+
+
+def test_keys_and_labels(tmp_path):
+    """--ft-key / --base-key / --labels: cache paths, prepare wiring, weights
+    identity of an R2 base, labels on index.html / prompts.json."""
+    # cache paths: the default ft key keeps the existing volume location
+    assert mef.r2_cache_path(mef.R2_KEY) == Path(
+        "/vol/ft/run1/model.safetensors")
+    assert mef.r2_cache_path(
+        "krea2-fullft/run1/exports/model_step1513_params.safetensors") == Path(
+        "/vol/ft/run1/exports/model_step1513_params.safetensors")
+    assert mef.r2_cache_path("other/run2/model.safetensors") == Path(
+        "/vol/r2/other/run2/model.safetensors")
+    assert mef.r2_cache_path("krea2-fullft") == Path("/vol/r2/krea2-fullft")
+    for bad in ("", "/abs/key", "a//b", "a/../b", "./a", "a/"):
+        try:
+            mef.r2_cache_path(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"bad key {bad!r} accepted")
+    assert mef.parse_labels("base,ft") == ("base", "ft")
+    assert mef.parse_labels(" run1-ema , run1-raw ") == ("run1-ema",
+                                                         "run1-raw")
+    for bad in ("base", "a,b,c", "a,", ",b", "x,x"):
+        try:
+            mef.parse_labels(bad)
+        except ValueError as e:
+            assert "--labels" in str(e)
+        else:
+            raise AssertionError(f"--labels {bad!r} accepted")
+    assert mef.side_paths() == (("base", "/vol/base/raw.safetensors"),
+                                ("ft", "/vol/ft/run1/model.safetensors"))
+    assert mef.side_paths("x/ft.safetensors", mef.R2_KEY) == (
+        ("base", "/vol/ft/run1/model.safetensors"),
+        ("ft", "/vol/r2/x/ft.safetensors"))
+    assert mef.check_sides(mef.R2_KEY, "", "a,b") == ("a", "b")
+    for args in (("a/../b", "", "base,ft"), (mef.R2_KEY, "/x", "base,ft"),
+                 (mef.R2_KEY, "", "same,same")):
+        try:
+            mef.check_sides(*args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"check_sides{args} accepted")
+
+    # prepare: which artifacts are fetched from where
+    calls = []
+    saved = {k: getattr(mef, k) for k in ("hf_fetch", "r2_fetch", "r2_client",
+                                          "VOL_DATA")}
+    try:
+        mef.hf_fetch = lambda repo, dest, *a, **k: calls.append(
+            ("hf", repo, str(dest))) or "skipped"
+        mef.r2_fetch = lambda client, bucket, key, dest, **k: calls.append(
+            ("r2", bucket, key, str(dest))) or ("downloaded", {})
+        mef.r2_client = lambda env: "client"
+        mef.VOL_DATA = str(tmp_path / "no-data")
+        env = {"R2_BUCKET": "bkt"}
+        out = mef.prepare_impl(False, 1, 1, 0, env=env, log=lambda *_: None)
+        assert out["prompts"] is None and not out["errors"], out
+        assert ("hf", mef.BASE_REPO, mef.VOL_BASE) in calls, calls
+        assert ("r2", "bkt", mef.R2_KEY,
+                "/vol/ft/run1/model.safetensors") in calls, calls
+        calls.clear()
+        ft_key = "krea2-fullft/run1/exports/model_step1513_params.safetensors"
+        out = mef.prepare_impl(False, 1, 1, 0, env=env, log=lambda *_: None,
+                               ft_key=ft_key, base_key=mef.R2_KEY)
+        assert out["artifacts"]["base"] == out["artifacts"]["ft"] == \
+            "downloaded", out
+        assert not any(c[:2] == ("hf", mef.BASE_REPO) for c in calls), calls
+        assert [c[2:] for c in calls if c[0] == "r2"] == [
+            (mef.R2_KEY, "/vol/ft/run1/model.safetensors"),
+            (ft_key, "/vol/ft/run1/exports/model_step1513_params.safetensors")]
+        calls.clear()
+        mef.prepare_impl(True, 1, 1, 0, env=env, log=lambda *_: None,
+                         ft_key=ft_key, base_key=mef.R2_KEY)
+        assert [c[0] for c in calls] == ["hf"], calls   # parquet only
+    finally:
+        for k, v in saved.items():
+            setattr(mef, k, v)
+
+    # weights identity with the base side from R2
+    ft_path, base_path = tmp_path / "ft.safetensors", tmp_path / "b.safetensors"
+    ids = {}
+    for path, key, etag in ((ft_path, "k/ft", "eF"), (base_path, "k/b", "eB")):
+        path.write_bytes(b"z" * 5)
+        ids[key] = {"key": key, "etag": etag, "size": 5,
+                    "last_modified": "2026-10-14T03:00:00+00:00"}
+        mef.r2_marker_path(path).write_text(json.dumps(ids[key]))
+    w = mef.weights_identity(tmp_path / "nobase", ft_path, base_path=base_path)
+    assert w == {"base": ids["k/b"], "ft": ids["k/ft"]}, w
+    lines = mef.weights_lines(w, ("run1-ema", "run1-raw"))
+    assert lines[0].startswith("run1-ema (base): r2 k/b etag eB"), lines
+    assert lines[1].startswith("run1-raw (ft): r2 k/ft etag eF"), lines
+    assert mef.weights_lines(w)[0].startswith("base: r2 k/b"), lines
+    base_path.write_bytes(b"z" * 6)   # no longer matches its marker
+    try:
+        mef.weights_identity(tmp_path / "nobase", ft_path, base_path=base_path)
+    except RuntimeError as e:
+        assert "identity" in str(e)
+    else:
+        raise AssertionError("R2 base without a matching marker accepted")
+
+    # labels on the outputs (files keep the side names)
+    prompts = tiny_prompts()[:1]
+    lat = tmp_path / "lat"
+    lat.mkdir()
+    p = prompts[0]
+    np.save(lat / f"{p['id']}_base.npy", np.zeros(
+        (1, 4, p["height"] // 8, p["width"] // 8), np.float32))
+    dec = mef.decode_items(prompts, lat, StubVAE(4), log=lambda *_: None,
+                           labels=("run1-ema", "run1-raw"))
+    out = tmp_path / "out"
+    mef.write_outputs(out, prompts, dec, {"weights": w, "env": {}, "rows": []},
+                      title="t", labels=("run1-ema", "run1-raw"))
+    page = (out / "index.html").read_text()
+    assert "<th>run1-ema</th><th>run1-raw</th>" in page, page
+    assert "run1-raw: not generated" in page and f"{p['id']}_base.png" in page
+    doc = json.loads((out / "prompts.json").read_text())
+    assert doc["labels"] == {"base": "run1-ema", "ft": "run1-raw"}, doc
+    assert (out / f"{p['id']}_base.png").is_file()
+    default = mef.render_index(prompts, "t")
+    assert "<th>base</th><th>ft</th>" in default
+    print("    --ft-key/--base-key cache paths + prepare wiring, R2 base "
+          "identity, --labels on index.html / prompts.json")
 
 
 # ---------------------------------------------------------------------------

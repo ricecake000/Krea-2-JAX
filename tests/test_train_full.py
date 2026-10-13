@@ -52,7 +52,10 @@ carry padded image rows):
      any --resume-step rename.
   q. --save-steps adds saves on top of --save-every (each step once, none at
      --steps besides the final save) and they rotate under --keep; garbage
-     values are a SystemExit.
+     values are a SystemExit. --export-steps likewise adds
+     model_stepNNNNNN.safetensors exports on top of --export-every (none at
+     --steps besides the final model.safetensors), not part of the run
+     config.
 
 Requires CPU PyTorch + einops (tiny reference checkpoint, parity check).
 """
@@ -973,11 +976,13 @@ def main():
     assert not cbd("--xla_force_host_platform_device_count=8 --foo=1")
     print("k. command_buffers_disabled parses XLA_FLAGS (last token wins): ok")
 
-    # --- n. CLI run with a --timestep-mu override (+ q. --save-steps) ---
+    # --- n. CLI run with a --timestep-mu override (+ q. --save-steps,
+    # --export-steps) ---
     outM = tmp / "run_mu"
     stepsM, logM = run_train(base, cache, outM,
                              ("--steps", "3", "--timestep-mu", "0.8",
-                              "--save-steps", "1, 2,3", "--keep", "2"))
+                              "--save-steps", "1, 2,3", "--keep", "2",
+                              "--export-steps", "2,3"))
     assert sorted(stepsM) == [1, 2, 3], sorted(stepsM)
     assert all(math.isfinite(v[0]) for v in stepsM.values()), stepsM
     assert "mu 0.8000 (--timestep-mu, all samples)" in logM, logM
@@ -1001,8 +1006,32 @@ def main():
             assert "--save-steps" in str(e), e
         else:
             raise AssertionError(f"--save-steps {bad!r} was not refused")
+    exported = re.findall(r"^exported \S+/(model\S*\.safetensors) ", logM,
+                          re.M)
+    assert exported == ["model_step000002.safetensors", "model.safetensors"], \
+        exported   # 3 = --steps: only the final export
+    assert sorted(f.name for f in outM.glob("model*.safetensors")) == [
+        "model.safetensors", "model_step000002.safetensors"]
+    meta2 = train_full._export_metadata(outM / "model_step000002.safetensors")
+    assert meta2["step"] == "2" and meta2["source"] == "ema", meta2
+    assert "export_steps" not in cfgM, cfgM
+    for bad in ("0", "x,2"):
+        try:
+            pss(bad, "--export-steps")
+        except SystemExit as e:
+            assert str(e).startswith("--export-steps must be"), e
+        else:
+            raise AssertionError(f"--export-steps {bad!r} was not refused")
+    proc = subprocess.run(
+        train_cmd(base, cache, tmp / "run_bad_export",
+                  ("--steps", "2", "--export-steps", "1,-2")),
+        env={**os.environ, "PYTHONUNBUFFERED": "1"}, capture_output=True,
+        text=True, timeout=900)
+    assert proc.returncode != 0 and "--export-steps must be" in proc.stderr, \
+        proc.stdout + proc.stderr
     print("q. --save-steps 1,2,3 --steps 3 --keep 2: saved 1, 2, 3 (once), "
-          "kept [2, 3]; garbage refused: ok")
+          "kept [2, 3]; --export-steps 2,3: model_step000002 + the final "
+          "export only; garbage refused: ok")
 
     # --- o. a latent shard corrupted under an unchanged manifest ---
     bad_cache = shutil.copytree(cache, tmp / "data_corrupt")

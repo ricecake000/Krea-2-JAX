@@ -23,7 +23,8 @@ derived per sample from its image-token count (or --timestep-mu for all).
 
 Outputs under --output-dir:
     ckpt/<step>/                   orbax train state (params, opt_state, ema)
-    model_stepNNNNNN.safetensors   bf16 official-layout export (--export-every)
+    model_stepNNNNNN.safetensors   bf16 official-layout export (--export-every,
+                                   --export-steps)
     model.safetensors              final bf16 export (EMA weights when enabled)
 The exports are plain Krea 2 checkpoints (same keys as raw.safetensors):
 usable with scripts/sample.py --base-ckpt, the official code and ComfyUI.
@@ -533,6 +534,12 @@ def parse_args(argv=None):
     ap.add_argument("--export-every", type=int, default=0,
                     help="also write model_stepNNNNNN.safetensors every N "
                          "steps (0: export only at the end)")
+    ap.add_argument("--export-steps", default="",
+                    help="comma-separated extra steps at which "
+                         "model_stepNNNNNN.safetensors is also written, on "
+                         "top of --export-every; like --export-every, only "
+                         "steps below --steps (the final export always "
+                         "happens)")
     ap.add_argument("--verify-latents", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="re-hash every latent shard at startup and refuse "
@@ -588,15 +595,16 @@ def parse_caption_probs(text):
     return probs
 
 
-def parse_save_steps(text):
-    """'20,500' -> frozenset({20, 500}); '' -> empty. Positive ints only."""
+def parse_save_steps(text, flag="--save-steps"):
+    """'20,500' -> frozenset({20, 500}); '' -> empty. Positive ints only
+    (`flag` names the option in the error: --save-steps / --export-steps)."""
     text = str(text).strip()
     try:
         steps = frozenset(int(x) for x in text.split(",")) if text else frozenset()
     except ValueError:
         steps = None
     if steps is None or any(s < 1 for s in steps):
-        raise SystemExit(f"--save-steps must be comma-separated positive "
+        raise SystemExit(f"{flag} must be comma-separated positive "
                          f"integers, got {text!r}")
     return steps
 
@@ -641,6 +649,7 @@ def main(argv=None):
     if args.model_config:
         cfg = dataclasses.replace(cfg, **json.loads(args.model_config))
     save_steps = parse_save_steps(args.save_steps)
+    export_steps = parse_save_steps(args.export_steps, "--export-steps")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "ckpt"
@@ -1070,7 +1079,9 @@ def main(argv=None):
                     (args.save_every and step % args.save_every == 0)
                     or step in save_steps):
                 save(step)
-            if args.export_every and step % args.export_every == 0 and step < args.steps:
+            if step < args.steps and (
+                    (args.export_every and step % args.export_every == 0)
+                    or step in export_steps):
                 export(step)
             if args.max_hours and time.time() - t_train > args.max_hours * 3600:
                 log(f"--max-hours {args.max_hours} reached; "

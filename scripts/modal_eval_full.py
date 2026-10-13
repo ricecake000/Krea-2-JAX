@@ -6,6 +6,10 @@ settings for both, images back on the laptop with an HTML contact sheet.
     modal run scripts/modal_eval_full.py --limit 2            # cheap smoke run
     modal run scripts/modal_eval_full.py                      # 40 dataset + 10 OOD prompts
     modal run scripts/modal_eval_full.py --steps 28 --cfg 4.5 --seed 0 --gpu H100
+    modal run scripts/modal_eval_full.py \
+        --base-key krea2-fullft/run1/model.safetensors \
+        --ft-key krea2-fullft/run1/exports/model_step1513_params.safetensors \
+        --labels run1-ema,run1-raw            # any two R2 checkpoints
 
     python scripts/modal_eval_full.py --only-prompts --parquet metadata.parquet
                                        # same table from a local parquet, no Modal
@@ -24,20 +28,32 @@ Options (local entrypoint):
   --gpu G         Modal GPU of `generate`: H100 (default, 80 GB), H200, B200
                   or B300
   --out DIR       default /home/mj/krea2-ops/eval/run1_<UTC timestamp>
+  --ft-key KEY    R2 object sampled as the "ft" side (default
+                  krea2-fullft/run1/model.safetensors, run1's EMA export)
+  --base-key KEY  R2 object sampled as the "base" side (default: none, the
+                  HF base krea/Krea-2-Raw, which prepare then fetches)
+  --labels A,B    display names of the base and ft sides on the pair images,
+                  index.html and in prompts.json "labels" (default base,ft;
+                  files stay NN_base.png / NN_ft.png)
 
 Stages:
   1. `prepare` (CPU): fills the Volume `krea2-eval-cache` idempotently (every
      artifact skipped when already complete, the volume committed after each):
-       /vol/base/raw.safetensors     krea/Krea-2-Raw (gated; HF token)
+       /vol/base/raw.safetensors     krea/Krea-2-Raw (gated; HF token; not
+                                     fetched with --base-key)
        /vol/qwen3-vl-4b/             Qwen/Qwen3-VL-4B-Instruct (*.json,
                                      *.safetensors, merges.txt, vocab.json)
        /vol/qwen-image/vae/          Qwen/Qwen-Image VAE
        /vol/data/metadata.parquet    ricecake/danbooru-curated-v2-latents
                                      (private; only the parquet)
-       /vol/ft/run1/model.safetensors  R2 krea2-fullft/run1/model.safetensors
-                                     (boto3 multipart; reused only while the
-                                     sidecar model.safetensors.r2.json == the
-                                     object's key, ETag, size, LastModified)
+       /vol/ft/<rest>                R2 --ft-key / --base-key objects under
+                                     krea2-fullft/<rest> (default
+                                     /vol/ft/run1/model.safetensors), any
+                                     other key at /vol/r2/<key>
+                                     (r2_cache_path; boto3 multipart; reused
+                                     only while the sidecar <file>.r2.json ==
+                                     the object's key, ETag, size,
+                                     LastModified)
      then builds the prompt table from the parquet (build_prompts).
   2. `generate` (GPU, jax[cuda13]==0.11.0 as scripts/modal_bench_b300.py;
      the same stack runs on Hopper): the text tower through the training
@@ -60,7 +76,7 @@ Stages:
      size, LastModified), "settings", "prompts": [id, source, caption,
      width, height, seed, seconds, ...]}), generate.json (the GPU log) and
      index.html (prompt | base | ft table, relative links; the weights in
-     its header).
+     its header), sides shown under their --labels.
 
 Prompt set (build_prompts, deterministic for --seed): --n-dataset rows drawn
 with np.random.default_rng(seed) among the TOP_BUCKETS most common
@@ -100,9 +116,18 @@ except ImportError:  # importable (pyflakes, tests) without the Modal SDK
     modal = None
 
 LOCAL_REPO = Path(__file__).resolve().parent.parent
-if str(LOCAL_REPO) not in sys.path:
-    sys.path.insert(0, str(LOCAL_REPO))
 REMOTE_REPO = "/repo"
+# the repo locally; /repo (krea2_jax attached by the images) in a container,
+# where this file is mounted on its own
+for _repo in (str(LOCAL_REPO), REMOTE_REPO):
+    if (_repo not in sys.path
+            and os.path.isfile(os.path.join(_repo, "krea2_jax", "r2.py"))):
+        sys.path.insert(0, _repo)
+
+from krea2_jax.r2 import (  # noqa: E402 - needs the sys.path above
+    r2_client, r2_fetch, r2_marker_path, read_r2_marker,
+)
+
 LOCAL_OUT_ROOT = Path("/home/mj/krea2-ops/eval")
 RUN_NAME = "run1"
 
@@ -113,9 +138,8 @@ TEXT_PATTERNS = ["*.json", "*.safetensors", "merges.txt", "vocab.json"]
 VAE_REPO = "Qwen/Qwen-Image"
 VAE_PATTERNS = ["vae/*", "model_index.json"]
 DATA_REPO, PARQUET = "ricecake/danbooru-curated-v2-latents", "metadata.parquet"
-R2_KEY = "krea2-fullft/run1/model.safetensors"
-R2_ENV = ("R2_ACCOUNT_ID", "R2_BUCKET", "R2_ACCESS_KEY_ID",
-          "R2_SECRET_ACCESS_KEY")
+R2_PREFIX = "krea2-fullft"
+R2_KEY = f"{R2_PREFIX}/{RUN_NAME}/model.safetensors"   # default --ft-key
 TOKEN_ENV_NAMES = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
 
 # --- volume layout ---
@@ -125,7 +149,9 @@ VOL_BASE = f"{VOL}/base"
 VOL_TEXT = f"{VOL}/qwen3-vl-4b"
 VOL_VAE = f"{VOL}/qwen-image"
 VOL_DATA = f"{VOL}/data"
-VOL_FT = f"{VOL}/ft/{RUN_NAME}"
+VOL_FT_ROOT = f"{VOL}/ft"            # R2 objects under R2_PREFIX/ (r2_cache_path)
+VOL_FT = f"{VOL_FT_ROOT}/{RUN_NAME}"
+VOL_R2 = f"{VOL}/r2"                 # any other R2 object, by its key
 VOL_RUNS = f"{VOL}/runs"
 VOL_JAX_CACHE = f"{VOL}/jax_cache"   # persistent compile cache across runs
 MARKER = ".eval_done.json"           # written after a complete HF download
@@ -223,8 +249,6 @@ CPU_ENV = {
     "PYTHONUNBUFFERED": "1",
     "TORCHDYNAMO_DISABLE": "1",
 }
-R2_TRANSFER = dict(max_concurrency=32, multipart_threshold=64 * 2**20,
-                   multipart_chunksize=64 * 2**20)
 
 
 # --------------------------------------------------------------- prompts
@@ -374,6 +398,34 @@ def check_gpu(gpu):
     return g
 
 
+def parse_labels(text):
+    """--labels 'base,ft' -> ("base", "ft"): the display names of the two
+    sides (images, index.html, prompts.json), or ValueError. Files keep the
+    side names (NN_base.png, NN_ft.png)."""
+    labels = tuple(x.strip() for x in str(text).split(","))
+    if len(labels) != 2 or not all(labels) or labels[0] == labels[1]:
+        raise ValueError(f"--labels must be two different non-empty "
+                         f"comma-separated names (base,ft), got {text!r}")
+    return labels
+
+
+def side_paths(ft_key=R2_KEY, base_key=None):
+    """(("base", path), ("ft", path)): the safetensors each side samples
+    with, on the volume (the HF base, or r2_cache_path(base_key))."""
+    base = (r2_cache_path(base_key) if base_key
+            else Path(VOL_BASE, BASE_FILE))
+    return (("base", str(base)), ("ft", str(r2_cache_path(ft_key))))
+
+
+def check_sides(ft_key, base_key, labels):
+    """Validate --ft-key / --base-key (r2_cache_path) and --labels -> the
+    labels tuple, or ValueError."""
+    r2_cache_path(ft_key)
+    if base_key:
+        r2_cache_path(base_key)
+    return parse_labels(labels)
+
+
 def estimate(prompts, steps, cfg, gpu=DEFAULT_GPU):
     """Rough generate-stage time/cost: {"minutes", "usd", "images"}."""
     gpu = check_gpu(gpu)
@@ -455,114 +507,43 @@ def hf_fetch(repo_id, dest, patterns, token, repo_type=None, log=print):
     return "downloaded"
 
 
-def r2_client(env):
-    """boto3 S3 client for Cloudflare R2 from the `krea2-r2` secret env."""
-    missing = [k for k in R2_ENV if not env.get(k)]
-    if missing:
-        raise RuntimeError(f"Modal secret krea2-r2 lacks {missing}")
-    import boto3
-    from botocore.config import Config
-
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{env['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-        aws_access_key_id=env["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=env["R2_SECRET_ACCESS_KEY"],
-        region_name="auto",
-        config=Config(retries={"max_attempts": 10, "mode": "adaptive"},
-                      max_pool_connections=64,
-                      request_checksum_calculation="when_required",
-                      response_checksum_validation="when_required"),
-    )
+def r2_cache_path(key):
+    """Volume path caching the R2 object `key`: keys under R2_PREFIX/ map to
+    VOL_FT_ROOT/<rest> (the default --ft-key stays at
+    /vol/ft/run1/model.safetensors), any other key to VOL_R2/<key>. Raises
+    ValueError for a key that is not a plain relative object path."""
+    key = str(key)
+    parts = key.split("/")
+    if (not key or key.startswith("/")
+            or any(p in ("", ".", "..") for p in parts)):
+        raise ValueError(f"bad R2 key {key!r}: need a relative object key "
+                         "(no empty, '.' or '..' components)")
+    if parts[0] == R2_PREFIX and len(parts) > 1:
+        return Path(VOL_FT_ROOT, *parts[1:])
+    return Path(VOL_R2, *parts)
 
 
-def r2_marker_path(dest):
-    """Sidecar with the R2 object identity of a complete download."""
-    dest = Path(dest)
-    return dest.with_name(dest.name + ".r2.json")
+def _r2_cached_identity(path):
+    """The R2 identity marker of a cached object, checked against the file's
+    size; raises if prepare did not complete it."""
+    ident = read_r2_marker(path)
+    if (ident is None or not Path(path).is_file()
+            or Path(path).stat().st_size != ident.get("size")):
+        raise RuntimeError(f"{path}: no matching R2 identity marker "
+                           f"({r2_marker_path(path).name}); run prepare")
+    return ident
 
 
-def r2_identity(head, key):
-    """head_object response -> {"key", "etag", "size", "last_modified"}
-    (plain JSON types)."""
-    lm = head.get("LastModified")
-    return {"key": key, "etag": str(head.get("ETag", "")).strip('"'),
-            "size": int(head["ContentLength"]),
-            "last_modified": (lm.isoformat() if hasattr(lm, "isoformat")
-                              else None if lm is None else str(lm))}
-
-
-def read_r2_marker(dest):
-    """The identity recorded next to dest, or None."""
-    try:
-        return json.loads(r2_marker_path(dest).read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
-    """Download s3://bucket/key to dest (multipart, via dest.part) unless dest
-    is a complete download of the CURRENT object: its sidecar marker
-    (r2_marker_path, written only after a complete, size-checked download)
-    must equal the object's head_object identity (key, ETag, size,
-    LastModified) and dest must have that size. A replaced object (even of
-    the same size) is downloaded again. s3transfer pins every ranged part
-    GET to the ETag of its own HeadObject (IfMatch); head_object is asked
-    again after the download, and an identity that changed meanwhile is an
-    error (no file, no sidecar). -> (status, identity)."""
-    dest = Path(dest)
-    head = client.head_object(Bucket=bucket, Key=key)
-    ident = r2_identity(head, key)
-    size = ident["size"]
-    if (dest.is_file() and dest.stat().st_size == size
-            and read_r2_marker(dest) == ident):
-        log(f"r2:{key}: complete ({size / 2**30:.2f} GiB, etag "
-            f"{ident['etag']}), skipped")
-        return "skipped", ident
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    marker = r2_marker_path(dest)
-    marker.unlink(missing_ok=True)   # dest is not trusted until re-marked
-    part = dest.with_name(dest.name + ".part")
-    t0 = time.time()
-    if transfer_config is None:
-        from boto3.s3.transfer import TransferConfig
-
-        transfer_config = TransferConfig(**R2_TRANSFER)
-    try:
-        client.download_file(bucket, key, str(part), Config=transfer_config)
-    except BaseException:
-        part.unlink(missing_ok=True)
-        raise
-    after = r2_identity(client.head_object(Bucket=bucket, Key=key), key)
-    if after != ident:
-        part.unlink(missing_ok=True)
-        raise RuntimeError(f"r2:{key}: the object changed during the download "
-                           f"(before {ident}, after {after}); run prepare "
-                           "again")
-    got = part.stat().st_size
-    if got != size:
-        part.unlink(missing_ok=True)
-        raise RuntimeError(f"r2:{key}: downloaded {got} bytes, object has "
-                           f"{size}")
-    os.replace(part, dest)
-    tmp = marker.with_name(marker.name + ".tmp")
-    tmp.write_text(json.dumps(ident, indent=1))
-    os.replace(tmp, marker)
-    dt = time.time() - t0
-    log(f"r2:{key}: {size / 2**30:.2f} GiB (etag {ident['etag']}) in "
-        f"{dt:.0f} s ({size / 2**20 / max(dt, 1e-6):.0f} MiB/s) -> {dest}")
-    return "downloaded", ident
-
-
-def weights_identity(base_dir=VOL_BASE, ft_path=f"{VOL_FT}/model.safetensors"):
-    """Which weights an eval uses: {"base": {repo, revision, file, size},
-    "ft": the R2 identity of the downloaded object}. Raises if the FT file
-    has no identity marker matching its size (prepare did not complete it)."""
-    ft = read_r2_marker(ft_path)
-    if (ft is None or not Path(ft_path).is_file()
-            or Path(ft_path).stat().st_size != ft.get("size")):
-        raise RuntimeError(f"{ft_path}: no matching R2 identity marker "
-                           f"({r2_marker_path(ft_path).name}); run prepare")
+def weights_identity(base_dir=VOL_BASE, ft_path=f"{VOL_FT}/model.safetensors",
+                     base_path=None):
+    """Which weights an eval uses: {"base": {repo, revision, file, size}
+    (HF), or the R2 identity of base_path when the base side comes from R2
+    (--base-key), "ft": the R2 identity of the downloaded object}. Raises if
+    an R2 file has no identity marker matching its size (prepare did not
+    complete it)."""
+    ft = _r2_cached_identity(ft_path)
+    if base_path is not None:
+        return {"base": _r2_cached_identity(base_path), "ft": ft}
     try:
         m = json.loads((Path(base_dir) / MARKER).read_text())
     except (OSError, ValueError):
@@ -572,36 +553,49 @@ def weights_identity(base_dir=VOL_BASE, ft_path=f"{VOL_FT}/model.safetensors"):
     return {"base": base, "ft": ft}
 
 
-def weights_lines(weights):
-    """Human-readable identity lines (index.html info, local log)."""
-    b, f = weights["base"], weights["ft"]
-    return [f"base: {b['repo']}/{b['file']} @ {b['revision']} "
-            f"({b['size']} bytes)",
-            f"ft: r2 {f['key']} etag {f['etag']}, {f['size']} bytes, "
-            f"last modified {f['last_modified']}"]
+def weights_lines(weights, labels=MODELS):
+    """Human-readable identity lines (index.html info, local log), one per
+    side, named by its label (plus the side when the label differs)."""
+    out = []
+    for side, label in zip(MODELS, labels):
+        w = weights[side]
+        name = side if label == side else f"{label} ({side})"
+        if "key" in w:
+            out.append(f"{name}: r2 {w['key']} etag {w['etag']}, {w['size']} "
+                       f"bytes, last modified {w['last_modified']}")
+        else:
+            out.append(f"{name}: {w['repo']}/{w['file']} @ {w['revision']} "
+                       f"({w['size']} bytes)")
+    return out
 
 
 def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
-                 env=None, log=print):
+                 env=None, log=print, ft_key=R2_KEY, base_key=None):
     """Fill the volume (everything, or only the parquet), then build the
-    prompt table. -> {"artifacts": {name: status}, "errors": {name: msg},
-    "prompts": [...] (None when the parquet is missing)}."""
+    prompt table. The FT side is the R2 object ft_key; the base side is the
+    HF checkpoint, or the R2 object base_key when given (the HF base is then
+    not fetched). R2 objects are cached at r2_cache_path(key).
+    -> {"artifacts": {name: status}, "errors": {name: msg}, "prompts": [...]
+    (None when the parquet is missing)}."""
     env = os.environ if env is None else env
     token_name, token = pick_hf_token(env)
     log(f"HF token from {token_name or 'nowhere (anonymous)'}")
     tasks = [("parquet", lambda: hf_fetch(DATA_REPO, VOL_DATA, [PARQUET],
                                           token, repo_type="dataset", log=log))]
     if not parquet_only:
+        def r2_task(key):
+            return lambda: r2_fetch(r2_client(env), env["R2_BUCKET"], key,
+                                    r2_cache_path(key), log=log)[0]
+
         tasks += [
             ("text_encoder", lambda: hf_fetch(TEXT_REPO, VOL_TEXT,
                                               TEXT_PATTERNS, token, log=log)),
             ("vae", lambda: hf_fetch(VAE_REPO, VOL_VAE, VAE_PATTERNS, token,
                                      log=log)),
-            ("base", lambda: hf_fetch(BASE_REPO, VOL_BASE, [BASE_FILE], token,
-                                      log=log)),
-            ("ft", lambda: r2_fetch(r2_client(env), env["R2_BUCKET"], R2_KEY,
-                                    f"{VOL_FT}/model.safetensors",
-                                    log=log)[0]),
+            ("base", r2_task(base_key) if base_key else
+             lambda: hf_fetch(BASE_REPO, VOL_BASE, [BASE_FILE], token,
+                              log=log)),
+            ("ft", r2_task(ft_key)),
         ]
     out = {"artifacts": {}, "errors": {}, "prompts": None}
     for name, fn in tasks:
@@ -955,10 +949,11 @@ def make_pair(base, ft, label, labels=MODELS, strip=None):
     return out
 
 
-def decode_items(items, latent_dir, vae, log=print):
+def decode_items(items, latent_dir, vae, log=print, labels=MODELS):
     """items: prompt dicts. For each, decode <id>_<model>.npy of every model
     that exists in latent_dir -> [{"id", "png": {model: bytes, "pair":
-    bytes}, "missing": [models], "seconds"}]."""
+    bytes}, "missing": [models], "seconds"}]; the pair image names the
+    halves by `labels`."""
     import numpy as np
 
     out = []
@@ -975,7 +970,8 @@ def decode_items(items, latent_dir, vae, log=print):
         if imgs:
             label = f"{p['id']}  {p['width']}x{p['height']}  seed {p['seed']}"
             pngs["pair"] = png_bytes(make_pair(imgs.get("base"),
-                                               imgs.get("ft"), label))
+                                               imgs.get("ft"), label,
+                                               labels=tuple(labels)))
         dt = time.time() - t0
         log(f"[{p['id']}] decoded {sorted(imgs)} in {dt:.1f} s"
             + (f" (missing {missing})" if missing else ""))
@@ -994,22 +990,22 @@ def merge_timings(prompts, gen_rows):
     return [{**p, "seconds": secs.get(p["id"], {})} for p in prompts]
 
 
-def render_index(prompts, title, info_lines=()):
+def render_index(prompts, title, info_lines=(), labels=MODELS):
     """index.html: one table row per prompt (id + caption + settings | base
-    | ft), images by relative link."""
+    | ft, headed and captioned by `labels`), images by relative link."""
     esc = html.escape
     rows = []
     for p in prompts:
         cells = []
-        for name in MODELS:
+        for name, label in zip(MODELS, labels):
             f = f"{p['id']}_{name}.png"
             sec = p.get("seconds", {}).get(name)
-            cap = f"{name}" + (f" ({sec:.1f} s)" if sec is not None else "")
+            cap = f"{label}" + (f" ({sec:.1f} s)" if sec is not None else "")
             if p.get("files", {}).get(name, True):
                 cells.append(f'<td><a href="{f}"><img src="{f}" loading="lazy">'
                              f"</a><div class=cap>{esc(cap)}</div></td>")
             else:
-                cells.append(f"<td class=missing>{esc(name)}: not "
+                cells.append(f"<td class=missing>{esc(label)}: not "
                              "generated</td>")
         meta = (f"{p['source']}"
                 + (f" row {p['row_id']} ({p['variant']})"
@@ -1021,6 +1017,7 @@ def render_index(prompts, title, info_lines=()):
             f"<div class=meta>{esc(meta)}</div>"
             f"<p>{esc(p['caption'])}</p></td>{''.join(cells)}</tr>")
     info = "".join(f"<li>{esc(x)}</li>" for x in info_lines)
+    head = "".join(f"<th>{esc(x)}</th>" for x in labels)
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1037,18 +1034,18 @@ td.missing {{ color: #a00; }}
 </style></head><body>
 <h1>{esc(title)}</h1>
 <ul>{info}</ul>
-<table><tr><th>prompt</th><th>base</th><th>ft</th></tr>
+<table><tr><th>prompt</th>{head}</tr>
 {chr(10).join(rows)}
 </table></body></html>
 """
 
 
 def write_outputs(out_dir, prompts, decoded, gen=None, title="eval",
-                  info_lines=()):
+                  info_lines=(), labels=MODELS):
     """Write <id>_{base,ft,pair}.png, prompts.json ({"weights", "settings",
-    "prompts"}; weights/settings from gen), generate.json (when gen) and
-    index.html into out_dir. decoded: decode_items output (any order).
-    Returns the list of written paths."""
+    "labels": {side: display name}, "prompts"}; weights/settings from gen),
+    generate.json (when gen) and index.html into out_dir. decoded:
+    decode_items output (any order). Returns the list of written paths."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     by_id = {d["id"]: d for d in decoded}
@@ -1068,13 +1065,14 @@ def write_outputs(out_dir, prompts, decoded, gen=None, title="eval",
     (out_dir / "prompts.json").write_text(json.dumps({
         "weights": gen.get("weights") if gen else None,
         "settings": gen.get("env") if gen else None,
+        "labels": dict(zip(MODELS, labels)),
         "prompts": prompts}, indent=1))
     written.append(out_dir / "prompts.json")
     if gen is not None:
         (out_dir / "generate.json").write_text(json.dumps(gen, indent=1))
         written.append(out_dir / "generate.json")
     (out_dir / "index.html").write_text(render_index(prompts, title,
-                                                     info_lines))
+                                                     info_lines, labels))
     written.append(out_dir / "index.html")
     return written
 
@@ -1121,57 +1119,70 @@ if modal is not None:
                   timeout=PREPARE_TIMEOUT_S, volumes={VOL: vol},
                   secrets=[hf_secret, r2_secret])
     def prepare(parquet_only: bool, n_dataset: int, n_ood: int,
-                seed: int) -> dict:
+                seed: int, ft_key: str = R2_KEY, base_key: str = "") -> dict:
         _remote_path()
         return prepare_impl(parquet_only, n_dataset, n_ood, seed,
-                            commit=vol.commit)
+                            commit=vol.commit, ft_key=ft_key,
+                            base_key=base_key or None)
 
     # gpu is overridden per call with .with_options(gpu=--gpu)
     @app.function(image=gpu_image, gpu=DEFAULT_GPU, cpu=float(GENERATE_CPU),
                   memory=GENERATE_MEM_GIB * 1024, timeout=GENERATE_TIMEOUT_S,
                   volumes={VOL: vol})
-    def generate(prompts: list, steps: int, cfg: float, run_id: str) -> dict:
+    def generate(prompts: list, steps: int, cfg: float, run_id: str,
+                 ft_key: str = R2_KEY, base_key: str = "") -> dict:
         _remote_path()
         deadline = time.time() + GENERATE_TIMEOUT_S - GENERATE_MARGIN_S
-        weights = weights_identity()   # refuses an FT file without identity
+        models = side_paths(ft_key, base_key or None)
+        # refuses an R2 file without identity
+        weights = weights_identity(
+            ft_path=dict(models)["ft"],
+            base_path=dict(models)["base"] if base_key else None)
         for line in weights_lines(weights):
             print(line)
         try:
             return generate_impl(
-                prompts, (("base", f"{VOL_BASE}/{BASE_FILE}"),
-                          ("ft", f"{VOL_FT}/model.safetensors")),
-                VOL_TEXT, f"{VOL_RUNS}/{run_id}", steps, cfg,
+                prompts, models, VOL_TEXT, f"{VOL_RUNS}/{run_id}", steps, cfg,
                 deadline=deadline, weights=weights)
         finally:
             vol.commit()   # latents + the persistent compile cache
 
     @app.function(image=cpu_image, cpu=float(DECODE_CPU),
                   timeout=DECODE_TIMEOUT_S, volumes={VOL: vol})
-    def decode(items: list, run_id: str) -> list:
+    def decode(items: list, run_id: str, labels: list = list(MODELS)) -> list:
         _remote_path()
         import torch
 
         torch.set_num_threads(DECODE_CPU)
         vol.reload()
-        return decode_items(items, f"{VOL_RUNS}/{run_id}", load_vae(VOL_VAE))
+        return decode_items(items, f"{VOL_RUNS}/{run_id}", load_vae(VOL_VAE),
+                            labels=tuple(labels))
 
     @app.local_entrypoint()
     def main(n_dataset: int = 40, n_ood: int = len(OOD_PROMPTS),
              steps: int = DEFAULT_STEPS, cfg: float = DEFAULT_CFG,
              seed: int = 0, only_prompts: bool = False, limit: int = 0,
-             gpu: str = DEFAULT_GPU, out: str = ""):
+             gpu: str = DEFAULT_GPU, out: str = "", ft_key: str = R2_KEY,
+             base_key: str = "", labels: str = ",".join(MODELS)):
         if n_dataset < 0 or steps <= 0 or cfg < 0 or limit < 0:
             raise SystemExit("--n-dataset/--limit must be >= 0, --steps > 0, "
                              "--cfg >= 0")
         ood_prompts(n_ood)   # validates --n-ood
         try:
             gpu = check_gpu(gpu)
+            labels = check_sides(ft_key, base_key, labels)
         except ValueError as e:
             raise SystemExit(str(e)) from e
         stamp = utc_stamp()
+        src = {"base": f"r2 {base_key}" if base_key else f"hf {BASE_REPO}",
+               "ft": f"r2 {ft_key}"}
+        for (side, path), label in zip(side_paths(ft_key, base_key or None),
+                                       labels):
+            print(f"{label} ({side}): {src[side]} -> {path}")
         print(f"prepare: {'parquet only' if only_prompts else 'all artifacts'}"
               f" -> volume {VOLUME_NAME}")
-        prep = prepare.remote(only_prompts, n_dataset, n_ood, seed)
+        prep = prepare.remote(only_prompts, n_dataset, n_ood, seed, ft_key,
+                              base_key)
         for name, status in prep["artifacts"].items():
             print(f"  {name}: {status}"
                   + (f" ({prep['errors'][name]})" if name in prep["errors"]
@@ -1192,7 +1203,7 @@ if modal is not None:
         out_dir = Path(out) if out else LOCAL_OUT_ROOT / run_id
         t0 = time.time()
         gen = generate.with_options(gpu=gpu).remote(prompts, steps, cfg,
-                                                    run_id)
+                                                    run_id, ft_key, base_key)
         print(f"generate: {len(gen['rows'])} images in "
               f"{(time.time() - t0) / 60:.1f} min (container: "
               + ", ".join(f"{k} {v:.0f}s" for k, v in gen["timings"].items())
@@ -1207,14 +1218,15 @@ if modal is not None:
         t0 = time.time()
         decoded = []
         for res in decode.map(chunks(todo, DECODE_PROMPTS_PER_CALL),
-                              kwargs={"run_id": run_id}):
+                              kwargs={"run_id": run_id,
+                                      "labels": list(labels)}):
             decoded.extend(res)
         print(f"decode: {len(decoded)} prompts in "
               f"{(time.time() - t0) / 60:.1f} min")
         env = gen["env"]
-        for line in weights_lines(gen["weights"]):
+        for line in weights_lines(gen["weights"], labels):
             print(f"  {line}")
-        info = [f"run {run_id}"] + weights_lines(gen["weights"]) + [
+        info = [f"run {run_id}"] + weights_lines(gen["weights"], labels) + [
             f"steps {steps}, cfg {cfg}, negative {NEGATIVE_PROMPT!r}, mu from "
             f"resolution, attn {env['attn']}, compact text "
             f"{env['compact_text']}",
@@ -1223,8 +1235,8 @@ if modal is not None:
             f"{gen['text']['select_layers']}",
         ] + [f"NOTE: {n}" for n in gen["notes"]]
         paths = write_outputs(out_dir, prompts, decoded, gen,
-                              title=f"Krea 2 full FT {RUN_NAME} vs base",
-                              info_lines=info)
+                              title=f"Krea 2: {labels[1]} vs {labels[0]}",
+                              info_lines=info, labels=labels)
         print(f"\nwrote {len(paths)} files to {out_dir}")
         print(f"open {out_dir / 'index.html'}")
 
@@ -1237,7 +1249,8 @@ def build_arg_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Modal: modal run scripts/modal_eval_full.py [--n-dataset 40 "
                "--n-ood 10 --steps 28 --cfg 4.5 --seed 0 --only-prompts "
-               "--limit N --gpu H100 --out DIR]")
+               "--limit N --gpu H100 --out DIR --ft-key KEY --base-key KEY "
+               "--labels base,ft]")
     ap.add_argument("--n-dataset", type=int, default=40)
     ap.add_argument("--n-ood", type=int, default=len(OOD_PROMPTS))
     ap.add_argument("--steps", type=int, default=DEFAULT_STEPS)
@@ -1252,6 +1265,12 @@ def build_arg_parser():
                     choices=GPU_CHOICES,
                     help="GPU of the generate stage (cost estimate)")
     ap.add_argument("--out", default="")
+    ap.add_argument("--ft-key", default=R2_KEY,
+                    help="R2 object of the ft side")
+    ap.add_argument("--base-key", default="",
+                    help="R2 object of the base side (default: the HF base)")
+    ap.add_argument("--labels", default=",".join(MODELS),
+                    help="display names of the base and ft sides")
     return ap
 
 
@@ -1263,6 +1282,10 @@ def local_main(argv=None):
                          "--only-prompts --parquet PATH)")
     if not args.parquet:
         raise SystemExit("--only-prompts locally needs --parquet PATH")
+    try:
+        check_sides(args.ft_key, args.base_key, args.labels)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
     prompts = apply_limit(build_prompts(args.parquet, args.n_dataset,
                                         args.n_ood, args.seed), args.limit)
     print(prompt_table(prompts))
