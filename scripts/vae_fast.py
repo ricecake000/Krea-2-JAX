@@ -29,7 +29,8 @@ VaeEncoder.to_dtype().
 
 make_encoder(vae_encoder, impl) -> callable with the same contract as
 cache_latents.vae_encode_batch (imgs (N, 3, H, W) in [-1, 1] -> normalized
-latents (N, 16, H/8, W/8)); impl "ref" (diffusers), "2d" or "2d-compile"
+latents (N, 16, H/8, W/8), contiguous even when cuDNN / inductor pick a
+channels_last layout); impl "ref" (diffusers), "2d" or "2d-compile"
 (torch.compile(dynamic=True) of the 2D encoder; posterior sampling stays
 eager). The 2d variants turn on torch.backends.cudnn.benchmark.
 Parity: tests/test_vae_fast.py (tiny random VAE, CPU fp32).
@@ -244,7 +245,9 @@ class FastEncoder:
         mean, std = self.dist(imgs)
         z = mean + std * torch.randn(mean.shape, device=mean.device,
                                      dtype=mean.dtype)
-        return (z - self.mean) / self.std
+        # cuDNN (benchmark) / inductor may pick channels_last; callers
+        # (cache_latents -> safetensors) need the default layout
+        return ((z - self.mean) / self.std).contiguous()
 
 
 def make_encoder(vae_encoder, impl):

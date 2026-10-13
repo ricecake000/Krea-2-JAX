@@ -17,6 +17,7 @@ Checks, for 2 non-square bucket-like shapes x batch 1 and 3:
     2d impl, rejects a wrong tap, a doubled std and a bf16-only mean offset,
     restores dtype / TF32 flags; bench_gpu_impl end to end on CPU returns
     plain JSON
+  * channels_last moments from the 2D net still give contiguous latents
 """
 
 import os
@@ -219,6 +220,48 @@ def check_bench_gate(log):
         f"{rows[1]['img_s']:.1f} img/s; JSON-plain result")
 
 
+def check_channels_last(log):
+    """The 2D net may hand back channels_last moments (cudnn.benchmark /
+    inductor): make_encoder's callable still returns contiguous latents
+    (safetensors needs them), and the bench gate + ladder do not depend on
+    the layout."""
+    import contextlib
+    import io
+
+    import modal_cache_latents as mcl
+    import vae_fast
+
+    enc = stand_in_encoder(tiny_vae(seed=7))
+    x = torch.rand(2, 3, *SHAPES[0], generator=torch.Generator()
+                   .manual_seed(4)) * 2 - 1
+    fwd = vae_fast.Encoder2d.forward
+
+    def channels_last_forward(self, inp):
+        return fwd(self, inp).contiguous(memory_format=torch.channels_last)
+    vae_fast.Encoder2d.forward = channels_last_forward
+    try:
+        fast = vae_fast.make_encoder(enc, "2d")
+        m, _ = fast.dist(x)
+        assert not m.is_contiguous(), m.stride()   # really strided
+        z = fast(x)
+        assert z.is_contiguous() and z.shape == (2, 16, SHAPES[0][0] // 8,
+                                                 SHAPES[0][1] // 8), z.stride()
+        torch.manual_seed(3)
+        z_ref = vae_fast.make_encoder(enc, "ref")(x)
+        torch.manual_seed(3)
+        assert max_rel(fast(x), z_ref) < TOL
+        with contextlib.redirect_stdout(io.StringIO()):
+            checks, encs = mcl.check_impls(enc, ["ref", "2d"], x)
+            lad = mcl.run_ladder(encs["2d"], list(x), (2,),
+                                 (16, SHAPES[0][0] // 8, SHAPES[0][1] // 8),
+                                 min_images=2, min_seconds=0.0)
+    finally:
+        vae_fast.Encoder2d.forward = fwd
+    assert checks["2d"]["ok"], checks["2d"]
+    assert "img_s" in lad[0], lad
+    log("  channels_last moments: contiguous latents, gate + ladder OK")
+
+
 def main():
     try:
         import diffusers
@@ -237,6 +280,7 @@ def main():
         print(f"  {impl}: worst max rel error mean {worst['mean']:.2e}, std "
               f"{worst['std']:.2e}, sample {worst['sample']:.2e} (< {TOL})")
     check_bench_gate(print)
+    check_channels_last(print)
     print(f"ALL VAE_FAST TESTS PASSED ({time.time() - t0:.1f}s)")
 
 

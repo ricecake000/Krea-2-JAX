@@ -237,7 +237,10 @@ def encode_samples(samples, encoder, batch, pool, lookahead=2, log=print,
             raise ValueError(f"{tag}: non-finite latents for ids {bad}")
         lat = lat.detach().to(torch.bfloat16).cpu()
         for k, s in enumerate(chunk):
-            out[str(s["id"])] = lat[k].clone()  # own storage (safetensors)
+            # own, contiguous storage: safetensors refuses strided tensors
+            # (e.g. channels_last latents from cudnn.benchmark / inductor)
+            out[str(s["id"])] = lat[k].clone(
+                memory_format=torch.contiguous_format)
     return out, resized
 
 
