@@ -669,8 +669,10 @@ modal run scripts/modal_eval_full.py \
 without the training node: it downloads only what restoring that one tree
 needs (`<run>/ckpt/<step>/{<source>/, meta/, top-level files}`, never
 `opt_state/`; ETag/size-checked, resumable), runs `scripts/export_full.py`,
-uploads `krea2-fullft/<run>/exports/model_step<step>_<source>.safetensors`,
-and prints a weight-drift report vs the base (`||W - W_base|| / ||W_base||`:
+uploads `krea2-fullft/<run>/exports/model_step<step>_<source>.safetensors`
+(user metadata: checkpoint fingerprint + sha256; a cached export or an
+existing R2 object is reused only when made from the same checkpoint
+objects, i.e. same keys, sizes and ETags), and prints a weight-drift report vs the base (`||W - W_base|| / ||W_base||`:
 global, median / p90 / max over tensors, per DiT block, per tensor kind),
 also written to `/home/mj/krea2-ops/eval/drift_<run>_<step>.json`. The base
 `raw.safetensors` comes from `modal_eval_full.py`'s prepare (run that once

@@ -11,8 +11,12 @@ weights (a fake S3 client serves a tiny real orbax checkpoint):
     during the download or a short download is an error leaving no file;
     paginated listings; download_file ExtraArgs within the s3transfer 0.19.x
     allowlist
-  * upload: skipped for an identical-size object, --force replaces, a size
-    mismatch after the upload is an error
+  * upload: skipped only for an object with the same size AND user metadata
+    (checkpoint fingerprint + sha256); same-size other weights are
+    overwritten without --force; ExtraArgs within the s3transfer 0.19.x
+    upload allowlist; a size mismatch after the upload is an error
+  * export reuse keyed by the checkpoint identity: another --prefix or a
+    replaced checkpoint object re-exports (sidecar + drift JSON record it)
   * drift report on synthetic safetensors with known drift (per tensor,
     global, median / p90 / max, by block, by kind, missing / extra / shape
     mismatch / non-finite, bf16 input), tensor kinds of every official key
@@ -53,6 +57,22 @@ ALLOWED_DOWNLOAD_ARGS = {
     "ChecksumMode", "VersionId", "SSECustomerAlgorithm", "SSECustomerKey",
     "SSECustomerKeyMD5", "RequestPayer", "ExpectedBucketOwner",
 }
+# s3transfer 0.19.x manager.py TransferManager.ALLOWED_UPLOAD_ARGS
+# (_ALLOWED_SHARED_ARGS + ChecksumType, MpuObjectSize + the full-object
+# checksum args); boto3 upload_file rejects any other ExtraArgs key
+ALLOWED_UPLOAD_ARGS = {
+    "ACL", "CacheControl", "ChecksumAlgorithm", "ContentDisposition",
+    "ContentEncoding", "ContentLanguage", "ContentType", "ExpectedBucketOwner",
+    "Expires", "GrantFullControl", "GrantRead", "GrantReadACP",
+    "GrantWriteACP", "Metadata", "ObjectLockLegalHoldStatus",
+    "ObjectLockMode", "ObjectLockRetainUntilDate", "RequestPayer",
+    "ServerSideEncryption", "StorageClass", "SSECustomerAlgorithm",
+    "SSECustomerKey", "SSECustomerKeyMD5", "SSEKMSKeyId",
+    "SSEKMSEncryptionContext", "Tagging", "WebsiteRedirectLocation",
+    "ChecksumType", "MpuObjectSize", "ChecksumCRC32", "ChecksumCRC32C",
+    "ChecksumCRC64NVME", "ChecksumMD5", "ChecksumSHA1", "ChecksumSHA256",
+    "ChecksumSHA512", "ChecksumXXHASH3",
+}
 T1 = datetime(2026, 10, 14, 3, 0, tzinfo=timezone.utc)
 
 
@@ -70,14 +90,16 @@ class FakeS3:
 
     def __init__(self, page=3):
         self.objects, self.etags, self.page = {}, {}, page
+        self.metadata = {}
         self.downloads, self.uploads, self.lists = [], [], 0
         self.after_download = None
         self.short = set()
         self.upload_size_delta = 0
 
-    def put(self, key, data, etag=None):
+    def put(self, key, data, etag=None, metadata=None):
         self.objects[key] = bytes(data)
         self.etags[key] = etag or f"e{len(self.etags)}-{len(data)}"
+        self.metadata[key] = dict(metadata or {})
 
     def put_dir(self, local, prefix):
         for p in sorted(Path(local).rglob("*")):
@@ -103,7 +125,8 @@ class FakeS3:
         if Key not in self.objects:
             raise FakeClientError("404")
         return {"ContentLength": len(self.objects[Key]),
-                "ETag": f'"{self.etags[Key]}"', "LastModified": T1}
+                "ETag": f'"{self.etags[Key]}"', "LastModified": T1,
+                "Metadata": dict(self.metadata[Key])}
 
     def download_file(self, bucket, key, filename, ExtraArgs=None,
                       Config=None):
@@ -119,11 +142,15 @@ class FakeS3:
             self.after_download(key)
 
     def upload_file(self, filename, bucket, key, ExtraArgs=None, Config=None):
-        assert bucket == "bkt" and Config == "cfg" and not ExtraArgs
+        bad = set(ExtraArgs or {}) - ALLOWED_UPLOAD_ARGS
+        if bad:
+            raise ValueError(f"Invalid extra_args key(s) {sorted(bad)}")
+        assert bucket == "bkt" and Config == "cfg"
         data = Path(filename).read_bytes()
         if self.upload_size_delta:
             data = data[:len(data) + self.upload_size_delta]
-        self.put(key, data, etag=f"u{len(self.uploads)}")
+        self.put(key, data, etag=f"u{len(self.uploads)}",
+                 metadata=(ExtraArgs or {}).get("Metadata"))
         self.uploads.append(key)
 
 
@@ -305,23 +332,35 @@ def test_upload(tmp_path):
     f = tmp_path / "x.safetensors"
     f.write_bytes(b"abc" * 100)
     log = []
-    st, ident = mxf.upload_export(s3, "bkt", "k/x", f, transfer_config="cfg",
-                                  log=log.append)
+    meta = {"ckpt-fingerprint": "fp1", "sha256": "s1"}
+
+    def up(path=f, metadata=meta, key="k/x", **kw):
+        return mxf.upload_export(s3, "bkt", key, path, metadata,
+                                 transfer_config="cfg", log=log.append, **kw)
+    st, ident = up()
     assert st == "uploaded" and s3.objects["k/x"] == f.read_bytes()
+    assert s3.metadata["k/x"] == meta
     assert ident["size"] == 300 and ident["key"] == "k/x"
-    st, _ = mxf.upload_export(s3, "bkt", "k/x", f, transfer_config="cfg",
-                              log=log.append)
+    st, _ = up()
     assert st == "skipped" and len(s3.uploads) == 1
-    st, _ = mxf.upload_export(s3, "bkt", "k/x", f, force=True,
-                              transfer_config="cfg", log=log.append)
+    st, _ = up(force=True)
     assert st == "uploaded" and len(s3.uploads) == 2
+    # same size, other weights (other fingerprint / sha256): overwritten
+    # without --force
+    st, _ = up(metadata={"ckpt-fingerprint": "fp2", "sha256": "s1"})
+    assert st == "uploaded" and len(s3.uploads) == 3
+    st, _ = up(metadata={"ckpt-fingerprint": "fp2", "sha256": "s2"})
+    assert st == "uploaded" and s3.metadata["k/x"]["sha256"] == "s2"
+    # a same-size object without metadata (e.g. uploaded by hand)
+    s3.put("k/x", s3.objects["k/x"])
+    assert up(metadata={"ckpt-fingerprint": "fp2", "sha256": "s2"})[0] == \
+        "uploaded"
     f.write_bytes(b"abcd" * 100)   # a different size replaces it
-    assert mxf.upload_export(s3, "bkt", "k/x", f, transfer_config="cfg",
-                             log=log.append)[0] == "uploaded"
+    assert up(metadata={"ckpt-fingerprint": "fp2", "sha256": "s2"})[0] == \
+        "uploaded"
     s3.upload_size_delta = -1
     try:
-        mxf.upload_export(s3, "bkt", "k/y", f, transfer_config="cfg",
-                          log=log.append)
+        up(key="k/y")
     except RuntimeError as e:
         assert "uploaded object has" in str(e), e
     else:
@@ -331,12 +370,21 @@ def test_upload(tmp_path):
         def head_object(self, Bucket, Key):
             raise FakeClientError("403")
     try:
-        mxf.upload_export(Denied(), "bkt", "k/z", f, transfer_config="cfg")
+        mxf.upload_export(Denied(), "bkt", "k/z", f, meta,
+                          transfer_config="cfg")
     except FakeClientError:
         pass
     else:
         raise AssertionError("a 403 on head_object was swallowed")
-    print("    upload: same-size skip, --force, size check, head errors")
+    try:   # the fake enforces s3transfer's upload allowlist
+        s3.upload_file(str(f), "bkt", "k/w", ExtraArgs={"IfMatch": "x"},
+                       Config="cfg")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("IfMatch accepted by the fake upload_file")
+    print("    upload: skip only on same size + metadata, other weights of "
+          "the same size overwritten, --force, size check, head errors")
 
 
 def test_drift_known(tmp_path):
@@ -514,6 +562,17 @@ def test_export_impl(tmp_path):
     key = "krea2-fullft/run1/exports/model_step7_params.safetensors"
     assert res["upload"]["status"] == "uploaded" and res["upload"]["key"] == key
     assert s3.objects[key] == exp.read_bytes()
+    side = json.loads(mxf.export_source_path(exp).read_text())
+    import hashlib
+
+    assert side["sha256"] == hashlib.sha256(exp.read_bytes()).hexdigest()
+    assert side["size"] == exp.stat().st_size and side["step"] == 7
+    assert side["bucket_sha256"] == hashlib.sha256(b"bkt").hexdigest()
+    assert "bkt" not in json.dumps(side)
+    assert s3.metadata[key] == {"ckpt-fingerprint": side["ckpt_fingerprint"],
+                                "sha256": side["sha256"]}
+    assert res["export"]["source_identity"] == side
+    assert res["drift"]["export_source"] == side
     assert not any("/opt_state/" in k or "/ema/" in k for k in s3.downloads)
     f_params, f_ema = res["drift"]["files"]
     assert f_params["label"] == "exports/run1_7_params.safetensors"
@@ -539,6 +598,42 @@ def test_export_impl(tmp_path):
     assert len(s3.downloads) == n_dl and len(s3.uploads) == n_up
     assert [f["label"] for f in res2["drift"]["files"]] == [
         "exports/run1_7_params.safetensors"]
+    # the same step under another prefix: other checkpoint identity -> a new
+    # download + export (not the cached file), uploaded under that prefix
+    for k in [k for k in s3.objects if k.startswith("krea2-fullft/run1/ckpt/")]:
+        s3.put("other/" + k[len("krea2-fullft/"):], s3.objects[k])
+    n_dl = len(s3.downloads)
+    resp = mxf.export_impl("run1", 7, "params", [], prefix="other", **kw)
+    assert resp["export"]["status"] == "exported", resp["export"]
+    assert len(s3.downloads) > n_dl and all(
+        k.startswith("other/") for k in s3.downloads[n_dl:])
+    side_o = resp["export"]["source_identity"]
+    assert side_o["prefix"] == "other"
+    assert side_o["ckpt_fingerprint"] != side["ckpt_fingerprint"]
+    assert resp["upload"]["key"] == \
+        "other/run1/exports/model_step7_params.safetensors"
+    # back to the original prefix: the sidecar (now "other") does not match
+    res2b = mxf.export_impl("run1", 7, "params", [], **kw)
+    assert res2b["export"]["status"] == "exported"
+    # (the local ckpt dir's marker was for "other": everything re-fetched)
+    assert res2b["export"]["download"]["downloaded"] == \
+        res2b["export"]["download"]["objects"]
+    assert res2b["upload"]["status"] == "skipped"   # R2 object already this
+    # a replaced checkpoint object at the same step: re-export (only that
+    # object downloaded); the same bytes on R2 but a new fingerprint ->
+    # re-uploaded without --force
+    rk = next(k for k in s3.objects
+              if k.startswith("krea2-fullft/run1/ckpt/7/params/"))
+    s3.put(rk, s3.objects[rk], etag="replaced")
+    n_dl, n_up = len(s3.downloads), len(s3.uploads)
+    res2c = mxf.export_impl("run1", 7, "params", [], **kw)
+    assert res2c["export"]["status"] == "exported"
+    assert s3.downloads[n_dl:] == [rk], s3.downloads[n_dl:]
+    assert res2c["upload"]["status"] == "uploaded"
+    assert len(s3.uploads) == n_up + 1
+    assert res2c["drift"]["export_source"]["ckpt_fingerprint"] not in (
+        side["ckpt_fingerprint"], side_o["ckpt_fingerprint"])
+    n_up = len(s3.uploads)
     # --force: export again (download complete -> nothing fetched), upload
     res3 = mxf.export_impl("run1", 7, "params", [], force=True, **kw)
     assert res3["export"]["status"] == "exported"

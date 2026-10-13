@@ -20,8 +20,8 @@ Options (local entrypoint, argparse):
                     repeatable
   --drift-only      no download / export / upload: only the drift report of
                     the existing export (if any) and the --compare files
-  --force           export and upload again even if the export exists on the
-                    volume / an object of the same size exists on R2
+  --force           export and upload again even if a matching export exists
+                    on the volume / a matching object exists on R2
   --prefix P        R2 prefix of the runs (default krea2-fullft)
   --out PATH        local drift JSON (default
                     /home/mj/krea2-ops/eval/drift_<run>_<step>.json)
@@ -30,8 +30,12 @@ One function (`export_full_remote`, EXPORT_CPU cores, EXPORT_MEM_GIB GiB:
 scripts/export_full.py holds the fp32 tree, ~48 GiB for the 12.9B DiT, plus
 the largest leaf's transient copies) on the Volume `krea2-eval-cache` of
 scripts/modal_eval_full.py, with the `krea2-r2` secret:
-  1. download (unless the export already exists for this step/source):
-     every object of <prefix>/<run>/ckpt/<step>/ that restoring ONE tree
+  0. list <prefix>/<run>/ckpt/<step>/ (always): the checkpoint fingerprint
+     is the sha256 of the selected objects' sorted (key, size, ETag). An
+     existing export is reused only if its sidecar
+     <export>.src.json records the same (bucket sha256, prefix, run, step,
+     source, fingerprint) and the file's size; otherwise:
+  1. download every object of <prefix>/<run>/ckpt/<step>/ that restoring ONE tree
      needs -- the top-level files (_CHECKPOINT_METADATA, commit marker),
      <source>/ and meta/ (never opt_state/ or the other tree) -- into
      /vol/ckpt/<run>/<source>/<step>/ (an orbax dir of its own per tree: a
@@ -46,18 +50,21 @@ scripts/modal_eval_full.py, with the `krea2-r2` secret:
      --source S --base-ckpt /vol/base/raw.safetensors (cached by
      modal_eval_full's prepare; keys/shapes checked before writing) ->
      /vol/exports/<run>_<step>_<source>.safetensors (bf16, metadata step /
-     source).
+     source), then the sidecar (identity + size + the file's sha256).
   3. upload to <prefix>/<run>/exports/model_step<step>_<source>.safetensors
-     (skipped when an object of identical size exists, unless --force);
-     size re-checked after the upload.
+     with user metadata {ckpt-fingerprint, sha256}; skipped only when the
+     object has this size and exactly this metadata (unless --force), any
+     other object there is overwritten; size and metadata re-checked after
+     the upload.
   4. drift report: the base and every compared file are streamed tensor by
      tensor (safe_open, float64 sums): per tensor ||W - W_base|| /
      ||W_base||; per file the global drift sqrt(sum ||dW||^2 / sum
      ||W_base||^2), median / p90 / max over tensors, and the same global
      ratio per DiT block (block00..block27, txtfusion, other) and per tensor
      kind (attn_q/k/v/o, attn_gate, mlp, norm, modulation, embed_final).
-     Saved to /vol/drift/<run>_<step>.json, returned, printed as tables and
-     written locally (--out).
+     Saved (with the export's sidecar as "export_source") to
+     /vol/drift/<run>_<step>.json, returned, printed as tables and written
+     locally (--out).
 
 Secrets: `krea2-r2` (R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID,
 R2_SECRET_ACCESS_KEY); values (incl. the bucket name) are never printed.
@@ -68,6 +75,7 @@ and export flow are plain functions (tests/test_modal_export_full.py).
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -211,8 +219,9 @@ def _write_json(path, obj):
 
 def download_ckpt_tree(client, bucket, prefix, step_dir, tree, marker_path,
                        transfer_config=None, workers=DOWNLOAD_WORKERS,
-                       log=print):
-    """Mirror select_ckpt_objects(<listing of prefix>, tree) into step_dir.
+                       log=print, sel=None):
+    """Mirror select_ckpt_objects(<listing of prefix>, tree) into step_dir
+    (sel: that selection when the caller already listed the prefix).
 
     An object is skipped when the marker records its listing (ETag, size)
     and the local file has that size; every other one is downloaded to
@@ -224,8 +233,9 @@ def download_ckpt_tree(client, bucket, prefix, step_dir, tree, marker_path,
     -> {"objects", "downloaded", "skipped", "bytes", "seconds"}."""
     t0 = time.time()
     step_dir = Path(step_dir)
-    sel = select_ckpt_objects(list_objects(client, bucket, prefix), prefix,
-                              tree)
+    if sel is None:
+        sel = select_ckpt_objects(list_objects(client, bucket, prefix),
+                                  prefix, tree)
     marker = _read_json(marker_path) or {}
     if marker.get("prefix") != prefix or marker.get("tree") != tree:
         marker = {}
@@ -311,6 +321,50 @@ def export_metadata(path):
         return None
 
 
+def ckpt_fingerprint(sel):
+    """sha256 over the sorted (key, size, ETag) of the selected checkpoint
+    objects: changes with the prefix/run/step and with any replaced object."""
+    items = sorted((o["key"], o["size"], o["etag"]) for o in sel.values())
+    return hashlib.sha256(json.dumps(items).encode()).hexdigest()
+
+
+def file_sha256(path, chunk=16 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                return h.hexdigest()
+            h.update(b)
+
+
+def export_source_path(export):
+    """Sidecar of an export: the checkpoint identity it was made from plus
+    the file's size and sha256."""
+    export = Path(export)
+    return export.with_name(export.name + ".src.json")
+
+
+def source_identity(bucket, prefix, run, step, source, sel):
+    """What an export is made from. The bucket name is a secret value, so
+    only its sha256 is recorded."""
+    return {"bucket_sha256": hashlib.sha256(bucket.encode()).hexdigest(),
+            "prefix": prefix, "run": run, "step": int(step),
+            "source": source, "ckpt_fingerprint": ckpt_fingerprint(sel)}
+
+
+def export_reusable(path, ident):
+    """True if path is a complete export whose sidecar records exactly
+    `ident` and the file's current size."""
+    side = _read_json(export_source_path(path))
+    if not side or not Path(path).is_file():
+        return False
+    return ({k: side.get(k) for k in ident} == ident
+            and side.get("size") == Path(path).stat().st_size
+            and bool(side.get("sha256"))
+            and export_matches(path, ident["step"], ident["source"]))
+
+
 def export_matches(path, step, source):
     """True if path is an export_full output of this step and source."""
     meta = export_metadata(path)
@@ -346,25 +400,33 @@ def run_export(ckpt_root, step, source, out_path, base_path,
     return time.time() - t0
 
 
-def upload_export(client, bucket, key, path, force=False,
+def upload_export(client, bucket, key, path, metadata, force=False,
                   transfer_config=None, log=print):
-    """Upload path to key unless an object of the same size exists (and not
-    force); the size is re-checked after the upload. -> (status, identity)."""
+    """Upload path to key with user metadata `metadata` (str -> str: the
+    checkpoint fingerprint and the file's sha256), unless the object already
+    has this size and exactly this metadata (and not force); any other
+    existing object is overwritten. Size and metadata are re-checked after
+    the upload. -> (status, identity)."""
     size = Path(path).stat().st_size
+    metadata = {str(k).lower(): str(v) for k, v in metadata.items()}
     head = head_or_none(client, bucket, key)
-    if head is not None and int(head["ContentLength"]) == size and not force:
-        log(f"r2:{key}: exists with the same size ({size} bytes), upload "
+    if (head is not None and int(head["ContentLength"]) == size
+            and (head.get("Metadata") or {}) == metadata and not force):
+        log(f"r2:{key}: exists with the same size and metadata, upload "
             "skipped (--force to replace)")
         return "skipped", r2_identity(head, key)
     if transfer_config is None:
         transfer_config = make_transfer_config()
     t0 = time.time()
-    client.upload_file(str(path), bucket, key, Config=transfer_config)
+    client.upload_file(str(path), bucket, key,
+                       ExtraArgs={"Metadata": metadata},
+                       Config=transfer_config)
     head = client.head_object(Bucket=bucket, Key=key)
     ident = r2_identity(head, key)
-    if ident["size"] != size:
+    if ident["size"] != size or (head.get("Metadata") or {}) != metadata:
         raise RuntimeError(f"r2:{key}: uploaded object has {ident['size']} "
-                           f"bytes, local file {size}")
+                           f"bytes / metadata {head.get('Metadata')}, local "
+                           f"file {size} bytes / {metadata}")
     dt = time.time() - t0
     log(f"r2:{key}: uploaded {size / 2**30:.2f} GiB in {dt:.0f} s "
         f"(etag {ident['etag']})")
@@ -589,15 +651,24 @@ def export_impl(run, step, source, compares=(), drift_only=False, force=False,
             client = r2_client(env)
         bucket = env["R2_BUCKET"]
         exp = {"path": str(paths["export"])}
-        if not force and export_matches(paths["export"], step, source):
-            log(f"{paths['export']}: export of step {step} ({source}) "
-                "exists, skipped (--force to redo)")
+        # always list the checkpoint (cheap): the export is reused only if
+        # it was made from exactly these objects
+        sp = step_prefix(prefix, run, step)
+        sel = select_ckpt_objects(list_objects(client, bucket, sp), sp,
+                                  source)
+        ident = source_identity(bucket, prefix, run, step, source, sel)
+        side_path = export_source_path(paths["export"])
+        if not force and export_reusable(paths["export"], ident):
+            log(f"{paths['export']}: export of this checkpoint (fingerprint "
+                f"{ident['ckpt_fingerprint'][:12]}) exists, skipped (--force "
+                "to redo)")
             exp["status"] = "skipped"
         else:
+            side_path.unlink(missing_ok=True)
             exp["download"] = download_ckpt_tree(
-                client, bucket, step_prefix(prefix, run, step),
-                paths["step_dir"], source, paths["marker"],
-                transfer_config=transfer_config, log=log)
+                client, bucket, sp, paths["step_dir"], source,
+                paths["marker"], transfer_config=transfer_config, log=log,
+                sel=sel)
             commit()
             exp["seconds"] = run_export(paths["ckpt_root"], step, source,
                                         paths["export"], base_path,
@@ -605,15 +676,21 @@ def export_impl(run, step, source, compares=(), drift_only=False, force=False,
             if not export_matches(paths["export"], step, source):
                 raise RuntimeError(f"{paths['export']}: not an export of step "
                                    f"{step} ({source}) after export_full")
+            _write_json(side_path, {
+                **ident, "size": paths["export"].stat().st_size,
+                "sha256": file_sha256(paths["export"])})
             exp["status"] = "exported"
             commit()
+        side = _read_json(side_path)
         exp["size"] = paths["export"].stat().st_size
+        exp["source_identity"] = side
         out["export"] = exp
-        status, ident = upload_export(
+        status, up = upload_export(
             client, bucket, export_key(prefix, run, step, source),
-            paths["export"], force=force, transfer_config=transfer_config,
-            log=log)
-        out["upload"] = {"status": status, **ident}
+            paths["export"], {"ckpt-fingerprint": side["ckpt_fingerprint"],
+                              "sha256": side["sha256"]},
+            force=force, transfer_config=transfer_config, log=log)
+        out["upload"] = {"status": status, **up}
     files = []
     if paths["export"].is_file():
         files.append((vol_label(paths["export"], vol), paths["export"]))
@@ -624,6 +701,9 @@ def export_impl(run, step, source, compares=(), drift_only=False, force=False,
                            f"{paths['export']} and no --compare")
     report = drift_report(base_path, files, log=log)
     report["base"] = vol_label(base_path, vol)
+    if paths["export"].is_file():   # what the export was made from
+        report["export_source"] = _read_json(
+            export_source_path(paths["export"]))
     _write_json(paths["drift"], report)
     commit()
     log(drift_table(report))
