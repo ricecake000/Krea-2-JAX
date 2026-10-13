@@ -35,7 +35,9 @@ Stages:
        /vol/data/metadata.parquet    ricecake/danbooru-curated-v2-latents
                                      (private; only the parquet)
        /vol/ft/run1/model.safetensors  R2 krea2-fullft/run1/model.safetensors
-                                     (boto3 multipart, size == ContentLength)
+                                     (boto3 multipart; reused only while the
+                                     sidecar model.safetensors.r2.json == the
+                                     object's key, ETag, size, LastModified)
      then builds the prompt table from the parquet (build_prompts).
   2. `generate` (GPU, jax[cuda13]==0.11.0 as scripts/modal_bench_b300.py;
      the same stack runs on Hopper): the text tower through the training
@@ -53,9 +55,12 @@ Stages:
      scripts/sample.py::decode_latents), .map over chunks of
      DECODE_PROMPTS_PER_CALL prompts: PNG bytes of base, ft and the captioned
      pair.
-  4. local: <out>/NN_base.png, NN_ft.png, NN_pair.png, prompts.json (id,
-     source, caption, width, height, seed, seconds, ...), generate.json (the
-     GPU log) and index.html (prompt | base | ft table, relative links).
+  4. local: <out>/NN_base.png, NN_ft.png, NN_pair.png, prompts.json
+     ({"weights": the evaluated checkpoints (HF revision; R2 key, ETag,
+     size, LastModified), "settings", "prompts": [id, source, caption,
+     width, height, seed, seconds, ...]}), generate.json (the GPU log) and
+     index.html (prompt | base | ft table, relative links; the weights in
+     its header).
 
 Prompt set (build_prompts, deterministic for --seed): --n-dataset rows drawn
 with np.random.default_rng(seed) among the TOP_BUCKETS most common
@@ -81,6 +86,7 @@ import gc
 import html
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -159,7 +165,11 @@ COMPACT_TEXT = False
 DEFAULT_GPU = "H100"
 GPU_CHOICES = ("H100", "H200", "B200", "B300")
 GENERATE_TIMEOUT_S = 60 * 60
-GENERATE_MARGIN_S = 150   # stop sampling this long before the hard timeout
+GENERATE_MARGIN_S = 150   # tail kept free for results + volume commit
+# run_models' allowances until measured: one 25.6 GB DiT load, and the first
+# sample of a resolution incl. its compile
+LOAD_ALLOWANCE_S = 300
+COLD_ALLOWANCE_S = 240
 GENERATE_MEM_GIB = 64     # host RAM: one 25.6 GB checkpoint staged at a time
 GENERATE_CPU = 8
 PREPARE_TIMEOUT_S = 2 * 3600
@@ -406,9 +416,10 @@ def marker_ok(dest):
                for rel, size in files.items())
 
 
-def write_marker(dest, repo_id, patterns):
+def write_marker(dest, repo_id, patterns, revision=None):
     """Record every downloaded file (relative path -> size) under dest
-    (hub bookkeeping in .cache/ and the marker itself excluded)."""
+    (hub bookkeeping in .cache/ and the marker itself excluded) and the
+    repo revision (commit sha) it came from."""
     dest = Path(dest)
     files = {str(p.relative_to(dest)): p.stat().st_size
              for p in sorted(dest.rglob("*"))
@@ -418,24 +429,28 @@ def write_marker(dest, repo_id, patterns):
         raise RuntimeError(f"{repo_id}: nothing downloaded into {dest} "
                            f"(patterns {patterns})")
     (dest / MARKER).write_text(json.dumps(
-        {"repo": repo_id, "patterns": patterns, "files": files}, indent=1))
+        {"repo": repo_id, "revision": revision, "patterns": patterns,
+         "files": files}, indent=1))
     return files
 
 
 def hf_fetch(repo_id, dest, patterns, token, repo_type=None, log=print):
-    """snapshot_download(allow_patterns) into dest unless marker_ok(dest)."""
+    """snapshot_download(allow_patterns) of the repo's current commit into
+    dest unless marker_ok(dest)."""
     if marker_ok(dest):
         log(f"{repo_id}: complete in {dest}, skipped")
         return "skipped"
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi, snapshot_download
 
     t0 = time.time()
     Path(dest).mkdir(parents=True, exist_ok=True)
-    snapshot_download(repo_id, repo_type=repo_type, local_dir=str(dest),
-                      allow_patterns=list(patterns), token=token)
-    files = write_marker(dest, repo_id, patterns)
+    sha = HfApi(token=token).repo_info(repo_id, repo_type=repo_type).sha
+    snapshot_download(repo_id, repo_type=repo_type, revision=sha,
+                      local_dir=str(dest), allow_patterns=list(patterns),
+                      token=token)
+    files = write_marker(dest, repo_id, patterns, revision=sha)
     gib = sum(files.values()) / 2**30
-    log(f"{repo_id}: {len(files)} files, {gib:.2f} GiB in "
+    log(f"{repo_id}@{sha}: {len(files)} files, {gib:.2f} GiB in "
         f"{time.time() - t0:.0f} s -> {dest}")
     return "downloaded"
 
@@ -461,16 +476,48 @@ def r2_client(env):
     )
 
 
-def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
-    """Download s3://bucket/key to dest (multipart, via dest.part) unless
-    dest already has the object's ContentLength; the size is checked after
-    the download too."""
+def r2_marker_path(dest):
+    """Sidecar with the R2 object identity of a complete download."""
     dest = Path(dest)
-    size = int(client.head_object(Bucket=bucket, Key=key)["ContentLength"])
-    if dest.is_file() and dest.stat().st_size == size:
-        log(f"r2:{key}: complete ({size / 2**30:.2f} GiB), skipped")
-        return "skipped"
+    return dest.with_name(dest.name + ".r2.json")
+
+
+def r2_identity(head, key):
+    """head_object response -> {"key", "etag", "size", "last_modified"}
+    (plain JSON types)."""
+    lm = head.get("LastModified")
+    return {"key": key, "etag": str(head.get("ETag", "")).strip('"'),
+            "size": int(head["ContentLength"]),
+            "last_modified": (lm.isoformat() if hasattr(lm, "isoformat")
+                              else None if lm is None else str(lm))}
+
+
+def read_r2_marker(dest):
+    """The identity recorded next to dest, or None."""
+    try:
+        return json.loads(r2_marker_path(dest).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
+    """Download s3://bucket/key to dest (multipart, via dest.part) unless dest
+    is a complete download of the CURRENT object: its sidecar marker
+    (r2_marker_path, written only after a complete, size-checked download)
+    must equal the object's head_object identity (key, ETag, size,
+    LastModified) and dest must have that size. A replaced object (even of
+    the same size) is downloaded again. -> (status, identity)."""
+    dest = Path(dest)
+    ident = r2_identity(client.head_object(Bucket=bucket, Key=key), key)
+    size = ident["size"]
+    if (dest.is_file() and dest.stat().st_size == size
+            and read_r2_marker(dest) == ident):
+        log(f"r2:{key}: complete ({size / 2**30:.2f} GiB, etag "
+            f"{ident['etag']}), skipped")
+        return "skipped", ident
     dest.parent.mkdir(parents=True, exist_ok=True)
+    marker = r2_marker_path(dest)
+    marker.unlink(missing_ok=True)   # dest is not trusted until re-marked
     part = dest.with_name(dest.name + ".part")
     t0 = time.time()
     if transfer_config is None:
@@ -480,13 +527,44 @@ def r2_fetch(client, bucket, key, dest, log=print, transfer_config=None):
     client.download_file(bucket, key, str(part), Config=transfer_config)
     got = part.stat().st_size
     if got != size:
+        part.unlink(missing_ok=True)
         raise RuntimeError(f"r2:{key}: downloaded {got} bytes, object has "
                            f"{size}")
     os.replace(part, dest)
+    tmp = marker.with_name(marker.name + ".tmp")
+    tmp.write_text(json.dumps(ident, indent=1))
+    os.replace(tmp, marker)
     dt = time.time() - t0
-    log(f"r2:{key}: {size / 2**30:.2f} GiB in {dt:.0f} s "
-        f"({size / 2**20 / max(dt, 1e-6):.0f} MiB/s) -> {dest}")
-    return "downloaded"
+    log(f"r2:{key}: {size / 2**30:.2f} GiB (etag {ident['etag']}) in "
+        f"{dt:.0f} s ({size / 2**20 / max(dt, 1e-6):.0f} MiB/s) -> {dest}")
+    return "downloaded", ident
+
+
+def weights_identity(base_dir=VOL_BASE, ft_path=f"{VOL_FT}/model.safetensors"):
+    """Which weights an eval uses: {"base": {repo, revision, file, size},
+    "ft": the R2 identity of the downloaded object}. Raises if the FT file
+    has no identity marker matching its size (prepare did not complete it)."""
+    ft = read_r2_marker(ft_path)
+    if (ft is None or not Path(ft_path).is_file()
+            or Path(ft_path).stat().st_size != ft.get("size")):
+        raise RuntimeError(f"{ft_path}: no matching R2 identity marker "
+                           f"({r2_marker_path(ft_path).name}); run prepare")
+    try:
+        m = json.loads((Path(base_dir) / MARKER).read_text())
+    except (OSError, ValueError):
+        m = {}
+    base = {"repo": m.get("repo", BASE_REPO), "revision": m.get("revision"),
+            "file": BASE_FILE, "size": m.get("files", {}).get(BASE_FILE)}
+    return {"base": base, "ft": ft}
+
+
+def weights_lines(weights):
+    """Human-readable identity lines (index.html info, local log)."""
+    b, f = weights["base"], weights["ft"]
+    return [f"base: {b['repo']}/{b['file']} @ {b['revision']} "
+            f"({b['size']} bytes)",
+            f"ft: r2 {f['key']} etag {f['etag']}, {f['size']} bytes, "
+            f"last modified {f['last_modified']}"]
 
 
 def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
@@ -508,7 +586,8 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
             ("base", lambda: hf_fetch(BASE_REPO, VOL_BASE, [BASE_FILE], token,
                                       log=log)),
             ("ft", lambda: r2_fetch(r2_client(env), env["R2_BUCKET"], R2_KEY,
-                                    f"{VOL_FT}/model.safetensors", log=log)),
+                                    f"{VOL_FT}/model.safetensors",
+                                    log=log)[0]),
         ]
     out = {"artifacts": {}, "errors": {}, "prompts": None}
     for name, fn in tasks:
@@ -560,27 +639,109 @@ def _device_gib(jax):
         return "n/a"
 
 
+def run_models(order, models, load, sample, free, deadline=None,
+               clock=time.time, load_allowance=LOAD_ALLOWANCE_S,
+               cold_allowance=COLD_ALLOWANCE_S, log=print):
+    """Run the models one after another over `order` within `deadline`.
+
+    load(name, path) -> params; sample(params, name, prompt) -> dict of extra
+    row fields; free(params). Durations are measured with `clock`.
+
+    Time estimates (no sample may end after `deadline`):
+      cold  first sample of a resolution (includes its compile): the largest
+            measured cold time, else `cold_allowance`
+      warm  a resolution compiled before (by any model: the models share the
+            compiled steps): the largest measured warm time, else the
+            measured cold time of that resolution
+      load  the previous model's measured load time, else `load_allowance`
+    A model is loaded only if some prompt is left for it and the time left
+    covers its load plus its first sample; otherwise it is skipped with a
+    note. A sample starts only if it fits AND the later models can still
+    load and pair it, with every prompt done so far, at the warm estimate
+    (0 until one is measured): a later model only samples the prompts every
+    earlier model finished, so the outputs stay paired.
+    -> (rows, skipped "<id>_<model>", notes, {name: load seconds})."""
+    rows, skipped, notes, load_s = [], [], [], {}
+    cold, warm, last_load = {}, None, None   # cold: (w, h) -> seconds
+    allowed = {p["id"] for p in order}
+
+    def left():
+        return math.inf if deadline is None else deadline - clock()
+
+    def shape_of(p):
+        return (p["width"], p["height"])
+
+    def est(shape):
+        if shape not in cold:
+            return max(cold.values(), default=cold_allowance)
+        return warm if warm is not None else cold[shape]
+
+    for k, (name, path) in enumerate(models):
+        todo = [p for p in order if p["id"] in allowed]
+        if not todo:
+            notes.append(f"{name}: not loaded (no prompt left to sample)")
+            continue
+        need = ((last_load if last_load is not None else load_allowance)
+                + min(est(shape_of(p)) for p in todo))
+        if need > left():
+            notes.append(f"{name}: not loaded ({max(left(), 0):.0f} s left < "
+                         f"{need:.0f} s for its load + one sample)")
+            skipped += [f"{p['id']}_{name}" for p in todo]
+            allowed = set()
+            continue
+        t0 = clock()
+        params = load(name, path)
+        last_load = load_s[name] = clock() - t0
+        later = len(models) - k - 1
+        done = set()
+        for p in todo:
+            shape = shape_of(p)
+            reserve = later * (last_load + (len(done) + 1) * (warm or 0.0))
+            if est(shape) + reserve > left():
+                skipped.append(f"{p['id']}_{name}")
+                continue
+            t0 = clock()
+            extra = sample(params, name, p)
+            dt = clock() - t0
+            first = shape not in cold
+            if first:
+                cold[shape] = dt
+            else:
+                warm = max(warm or 0.0, dt)
+            rows.append({"id": p["id"], "model": name, "seconds": dt,
+                         "first_of_shape": first, **extra})
+            done.add(p["id"])
+        allowed &= done
+        free(params)
+        del params
+    if skipped:
+        notes.append(f"deadline: {len(skipped)} (prompt, model) samples "
+                     f"skipped ({skipped})")
+    return rows, skipped, notes, load_s
+
+
 def generate_impl(prompts, models, te_dir, out_dir, steps=DEFAULT_STEPS,
                   guidance=DEFAULT_CFG, *, attn=ATTN, text_rows=TEXT_ROWS,
                   text_overrides=None, model_cfg=None, compact=COMPACT_TEXT,
-                  deadline=None, log=print):
+                  deadline=None, weights=None, log=print):
     """Sample every prompt with every model; latents -> out_dir/<id>_<model>.npy
     (float32, (1, C, H/8, W/8)).
 
     models: ((name, safetensors path), ...), run one after another: load
     (bf16), sample every prompt, free (device buffers deleted) before the
-    next model loads, so only one DiT is resident. Text: the train_full path (from_hf_config(te_dir,
+    next model loads, so only one DiT is resident. Text: the train_full
+    path (from_hf_config(te_dir,
     **text_overrides), CaptionTemplate(text_rows), load_qwen3_text_params
     bf16, text_states) -> bf16 (1, text_rows, txtlayers, txtdim) + bool
     mask, as sample.py feeds sample_latents; uncond = NEGATIVE_PROMPT
     through the same path. The text tower is freed before the DiTs load.
-    deadline: time.time() by which sampling must end; the time left is split
-    evenly over the models still to run (reserving their load time), a
-    sample starts only if the slowest one so far still fits, and a later
-    model only samples prompts every earlier model finished. Returns a plain-JSON dict: rows (id, model,
-    seconds, first_of_shape, finite, latent_std), skipped "<id>_<model>",
-    notes,
-    timings, text settings, caption token counts.
+    deadline: time.time() by which sampling must end (the caller keeps its
+    own tail margin for writing results); scheduling in run_models.
+    weights: identity of the evaluated checkpoints (weights_identity),
+    copied into the result. Returns a plain-JSON dict: rows (id, model,
+    seconds, first_of_shape, finite, latent_std, shape), skipped
+    "<id>_<model>", notes, timings, text settings, caption token counts,
+    weights, env.
     """
     import jax
     import jax.numpy as jnp
@@ -645,64 +806,46 @@ def generate_impl(prompts, models, te_dir, out_dir, steps=DEFAULT_STEPS,
 
     # --- DiTs (bf16), one at a time (fits an 80 GB H100), mesh as sample.py ---
     mesh = make_mesh()
-    order = generation_order(prompts)
-    rows, skipped, notes, seen = [], [], [], set()
-    allowed = {p["id"] for p in prompts}
-    for k, (name, path) in enumerate(models):
-        t0 = time.time()
+
+    def load(name, path):
         params = load_krea2_params(str(path), mesh=mesh, dtype=jnp.bfloat16)
-        load_s = timings[f"load_{name}_s"] = time.time() - t0
-        log(f"loaded {name} ({path}) in {load_s:.0f} s; device memory in use "
+        log(f"loaded {name} ({path}); device memory in use "
             f"{_device_gib(jax)}")
-        # time budget: split what is left evenly over this and the remaining
-        # models (reserving their load time); a later model only samples the
-        # prompts every earlier model finished, so pairs stay complete
-        model_deadline = None
-        if deadline is not None:
-            now, left = time.time(), len(models) - k
-            model_deadline = now + (deadline - now - (left - 1) * load_s) / left
-        done, slowest, lat = set(), 0.0, None
-        for p in order:
-            if p["id"] not in allowed:
-                continue
-            if model_deadline is not None and (time.time() + slowest
-                                               > model_deadline):
-                skipped.append(f"{p['id']}_{name}")
-                continue
-            t0 = time.time()
-            txt, mask = conds[p["id"]]
-            lat = sample_latents(
-                params, cfg, txt, mask,
-                untxt=un[0], untxt_mask=un[1],
-                height=p["height"], width=p["width"],
-                steps=steps, guidance=guidance, mu=None, seed=p["seed"],
-                attn_impl=attn, attn_mesh=mesh if mesh.size > 1 else None,
-                compact=compact,
-            )
-            arr = np.asarray(jax.device_get(lat).astype(jnp.float32))
-            dt = time.time() - t0
-            np.save(out_dir / f"{p['id']}_{name}.npy", arr)
-            shape = (p["width"], p["height"])
-            first = shape not in seen   # compiled steps are shared by models
-            seen.add(shape)
-            finite = bool(np.isfinite(arr).all())
-            rows.append({"id": p["id"], "model": name, "seconds": dt,
-                         "first_of_shape": first, "finite": finite,
-                         "latent_std": float(arr.std()) if finite else None,
-                         "shape": list(arr.shape)})
-            log(f"[{p['id']}] {name} {p['width']}x{p['height']} seed "
-                f"{p['seed']}: {dt:.1f} s{' (incl. compile)' if first else ''}"
-                f"{'' if finite else ' NON-FINITE'}")
-            done.add(p["id"])
-            slowest = max(slowest, dt)
-        allowed &= done
+        return params
+
+    def sample(params, name, p):
+        txt, mask = conds[p["id"]]
+        t0 = time.time()
+        lat = sample_latents(
+            params, cfg, txt, mask,
+            untxt=un[0], untxt_mask=un[1],
+            height=p["height"], width=p["width"],
+            steps=steps, guidance=guidance, mu=None, seed=p["seed"],
+            attn_impl=attn, attn_mesh=mesh if mesh.size > 1 else None,
+            compact=compact,
+        )
+        arr = np.asarray(jax.device_get(lat).astype(jnp.float32))
+        np.save(out_dir / f"{p['id']}_{name}.npy", arr)
+        finite = bool(np.isfinite(arr).all())
+        log(f"[{p['id']}] {name} {p['width']}x{p['height']} seed "
+            f"{p['seed']}: {time.time() - t0:.1f} s"
+            f"{'' if finite else ' NON-FINITE'}")
+        return {"finite": finite,
+                "latent_std": float(arr.std()) if finite else None,
+                "shape": list(arr.shape)}
+
+    def free(params):
         free_tree(params)
-        del params, lat
         gc.collect()
-        log(f"freed {name}; device memory in use {_device_gib(jax)}")
-    if skipped:
-        notes.append(f"deadline: {len(skipped)} (prompt, model) samples "
-                     f"skipped ({skipped})")
+        log(f"freed a DiT; device memory in use {_device_gib(jax)}")
+
+    rows, skipped, notes, load_s = run_models(
+        generation_order(prompts), models, load, sample, free,
+        deadline=deadline, log=log)
+    for name, sec in load_s.items():
+        timings[f"load_{name}_s"] = sec
+    for n in notes:
+        log(f"NOTE: {n}")
     timings["total_s"] = time.time() - t_start
     return {
         "rows": rows, "skipped": skipped, "notes": notes, "timings": timings,
@@ -712,6 +855,7 @@ def generate_impl(prompts, models, te_dir, out_dir, steps=DEFAULT_STEPS,
                  "position_mode": txt_cfg.position_mode,
                  "states_shape": list(states_shape) if states_shape else None},
         "caption_tokens": cap_tokens,
+        "weights": weights,
         "env": {"jax": jax.__version__, "backend": jax.default_backend(),
                 "device": jax.devices()[0].device_kind, "attn": attn,
                 "compact_text": compact, "steps": steps, "cfg": guidance},
@@ -879,8 +1023,9 @@ td.missing {{ color: #a00; }}
 
 def write_outputs(out_dir, prompts, decoded, gen=None, title="eval",
                   info_lines=()):
-    """Write <id>_{base,ft,pair}.png, prompts.json, generate.json (when gen)
-    and index.html into out_dir. decoded: decode_items output (any order).
+    """Write <id>_{base,ft,pair}.png, prompts.json ({"weights", "settings",
+    "prompts"}; weights/settings from gen), generate.json (when gen) and
+    index.html into out_dir. decoded: decode_items output (any order).
     Returns the list of written paths."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -898,7 +1043,10 @@ def write_outputs(out_dir, prompts, decoded, gen=None, title="eval",
             path = out_dir / f"{p['id']}_{name}.png"
             path.write_bytes(data)
             written.append(path)
-    (out_dir / "prompts.json").write_text(json.dumps(prompts, indent=1))
+    (out_dir / "prompts.json").write_text(json.dumps({
+        "weights": gen.get("weights") if gen else None,
+        "settings": gen.get("env") if gen else None,
+        "prompts": prompts}, indent=1))
     written.append(out_dir / "prompts.json")
     if gen is not None:
         (out_dir / "generate.json").write_text(json.dumps(gen, indent=1))
@@ -963,12 +1111,15 @@ if modal is not None:
     def generate(prompts: list, steps: int, cfg: float, run_id: str) -> dict:
         _remote_path()
         deadline = time.time() + GENERATE_TIMEOUT_S - GENERATE_MARGIN_S
+        weights = weights_identity()   # refuses an FT file without identity
+        for line in weights_lines(weights):
+            print(line)
         try:
             return generate_impl(
                 prompts, (("base", f"{VOL_BASE}/{BASE_FILE}"),
                           ("ft", f"{VOL_FT}/model.safetensors")),
                 VOL_TEXT, f"{VOL_RUNS}/{run_id}", steps, cfg,
-                deadline=deadline)
+                deadline=deadline, weights=weights)
         finally:
             vol.commit()   # latents + the persistent compile cache
 
@@ -1039,8 +1190,9 @@ if modal is not None:
         print(f"decode: {len(decoded)} prompts in "
               f"{(time.time() - t0) / 60:.1f} min")
         env = gen["env"]
-        info = [
-            f"run {run_id}: base = {BASE_REPO}/{BASE_FILE}, ft = r2 {R2_KEY}",
+        for line in weights_lines(gen["weights"]):
+            print(f"  {line}")
+        info = [f"run {run_id}"] + weights_lines(gen["weights"]) + [
             f"steps {steps}, cfg {cfg}, negative {NEGATIVE_PROMPT!r}, mu from "
             f"resolution, attn {env['attn']}, compact text "
             f"{env['compact_text']}",

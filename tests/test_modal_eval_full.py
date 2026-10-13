@@ -7,7 +7,12 @@ weights:
     an empty caption excluded, 3/4 long + artist then medium/short, bucket
     resolution, ids / seeds, OOD prompts at 1024x1024; --limit; the local
     --only-prompts CLI and --help
-  * idempotent downloads: HF marker check, R2 size check / skip (fake client)
+  * idempotent downloads: HF marker check; R2 skip only when the sidecar
+    identity (key, ETag, size, LastModified) matches head_object (a replaced
+    same-size object is downloaded again); weights identity for the eval
+  * run_models scheduling with a mocked clock: no sample ends after the
+    deadline, warm samples are not charged the cold compile, no model load
+    once the deadline has passed
   * generate_impl end to end on a tiny random DiT + tiny Qwen3-VL text
     encoder (attn cudnn = dot_product_attention's xla path on CPU):
     latent shapes, same seed for both models (identical checkpoints give
@@ -227,40 +232,89 @@ def test_downloads(tmp_path):
     assert not mef.marker_ok(d)
     assert mef.hf_fetch is not None
 
+    from datetime import datetime, timezone
+
     payload = bytes(range(256)) * 40
+    t1 = datetime(2026, 10, 14, 3, 0, tzinfo=timezone.utc)
 
     class FakeS3:
-        def __init__(self, data, size=None):
+        """One R2 object: data (what a download writes), size (what
+        head_object reports), etag / last_modified."""
+
+        def __init__(self, data, size=None, etag="e1", last_modified=t1):
             self.data, self.size, self.downloads = data, size, 0
+            self.etag, self.last_modified = etag, last_modified
 
         def head_object(self, Bucket, Key):
             assert (Bucket, Key) == ("bkt", mef.R2_KEY)
-            return {"ContentLength": self.size or len(payload)}
+            return {"ContentLength": self.size or len(self.data),
+                    "ETag": f'"{self.etag}"',
+                    "LastModified": self.last_modified}
 
         def download_file(self, bucket, key, filename, Config=None):
             self.downloads += 1
             assert filename.endswith(".part") and Config == "cfg"
             Path(filename).write_bytes(self.data)
 
+    def fetch(s3, dest):
+        return mef.r2_fetch(s3, "bkt", mef.R2_KEY, dest, log.append,
+                            transfer_config="cfg")
+
     dest = tmp_path / "ft" / "model.safetensors"
+    marker = mef.r2_marker_path(dest)
     log = []
     s3 = FakeS3(payload)
-    assert mef.r2_fetch(s3, "bkt", mef.R2_KEY, dest, log.append,
-                        transfer_config="cfg") == "downloaded"
-    assert dest.read_bytes() == payload and s3.downloads == 1
-    assert mef.r2_fetch(s3, "bkt", mef.R2_KEY, dest, log.append,
-                        transfer_config="cfg") == "skipped"
-    assert s3.downloads == 1
+    status, ident = fetch(s3, dest)
+    assert status == "downloaded" and dest.read_bytes() == payload
+    assert ident == {"key": mef.R2_KEY, "etag": "e1", "size": len(payload),
+                     "last_modified": t1.isoformat()}, ident
+    assert json.loads(marker.read_text()) == ident and s3.downloads == 1
+    assert fetch(s3, dest) == ("skipped", ident) and s3.downloads == 1
+    # same size, replaced object (new ETag / LastModified): downloaded again
+    new = bytes(reversed(payload))
+    s3b = FakeS3(new, etag="e2",
+                 last_modified=datetime(2026, 10, 15, tzinfo=timezone.utc))
+    status, ident_b = fetch(s3b, dest)
+    assert status == "downloaded" and dest.read_bytes() == new, status
+    assert json.loads(marker.read_text()) == ident_b and s3b.downloads == 1
+    assert ident_b["etag"] == "e2"
+    # only LastModified changed: downloaded again too
+    s3c = FakeS3(new, etag="e2", last_modified=t1)
+    assert fetch(s3c, dest)[0] == "downloaded"
+    # right size but no marker (e.g. a crash after the rename): re-download
+    marker.unlink()
+    assert fetch(s3c, dest)[0] == "downloaded" and s3c.downloads == 2
+    assert fetch(s3c, dest)[0] == "skipped" and s3c.downloads == 2
+    # weights identity for the eval, from the markers on disk
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    (base_dir / mef.BASE_FILE).write_bytes(b"w" * 7)
+    mef.write_marker(base_dir, mef.BASE_REPO, [mef.BASE_FILE],
+                     revision="abc123")
+    w = mef.weights_identity(base_dir, dest)
+    assert w["ft"] == json.loads(marker.read_text())
+    assert w["base"] == {"repo": mef.BASE_REPO, "revision": "abc123",
+                         "file": mef.BASE_FILE, "size": 7}, w
+    lines = mef.weights_lines(w)
+    assert "abc123" in lines[0] and "etag e2" in lines[1], lines
+    # an FT file without a matching marker is refused
+    marker.unlink()
+    try:
+        mef.weights_identity(base_dir, dest)
+    except RuntimeError as e:
+        assert "identity" in str(e)
+    else:
+        raise AssertionError("FT without identity marker accepted")
+    # a short download: error, no dest, no marker
     short = FakeS3(payload[:-1], size=len(payload) + 5)
     dest2 = tmp_path / "ft2" / "model.safetensors"
     try:
-        mef.r2_fetch(short, "bkt", mef.R2_KEY, dest2, log.append,
-                     transfer_config="cfg")
+        fetch(short, dest2)
     except RuntimeError as e:
         assert "downloaded" in str(e)
     else:
         raise AssertionError("size mismatch not detected")
-    assert not dest2.exists()
+    assert not dest2.exists() and not mef.r2_marker_path(dest2).exists()
     try:
         mef.r2_client({"R2_BUCKET": "b"})
     except RuntimeError as e:
@@ -269,7 +323,98 @@ def test_downloads(tmp_path):
         raise AssertionError("missing R2 env not detected")
     assert mef.pick_hf_token({"HUGGINGFACE_TOKEN": "t"}) == (
         "HUGGINGFACE_TOKEN", "t")
-    print("    HF marker check, R2 size check + skip + mismatch")
+    print("    HF marker check, R2 identity marker (ETag/size/LastModified) "
+          "skip + re-download, weights identity")
+
+
+# ---------------------------------------------------------------------------
+# run_models scheduling (mocked clock / load / sample)
+# ---------------------------------------------------------------------------
+
+
+def run_mock(prompts, deadline, load_s, cold_s, warm_s, load_allowance,
+             cold_allowance):
+    """run_models with a fake clock: load takes load_s, the first sample of a
+    resolution cold_s (compile; shared by the models), later ones warm_s.
+    -> (rows, skipped, notes, loads, end time)."""
+    clock = SimpleNamespace(t=0.0)
+    compiled, loads, freed = set(), [], []
+
+    def load(name, path):
+        loads.append(name)
+        clock.t += load_s
+        return name
+
+    def sample(params, name, p):
+        assert params == name and name not in freed
+        shape = (p["width"], p["height"])
+        clock.t += warm_s if shape in compiled else cold_s
+        compiled.add(shape)
+        return {"finite": True}
+
+    rows, skipped, notes, load_secs = mef.run_models(
+        mef.generation_order(prompts), (("base", "a"), ("ft", "b")), load,
+        sample, freed.append, deadline=deadline, clock=lambda: clock.t,
+        load_allowance=load_allowance, cold_allowance=cold_allowance,
+        log=lambda *_: None)
+    assert freed == loads, (freed, loads)
+    assert sorted(load_secs) == sorted(loads)
+    base = {r["id"] for r in rows if r["model"] == "base"}
+    assert {r["id"] for r in rows if r["model"] == "ft"} <= base, rows
+    return rows, skipped, notes, loads, clock.t
+
+
+def same_shape_prompts(n, w=64, h=64):
+    return mef.finalize_prompts(
+        [{"source": "ood", "row_id": None, "variant": None, "artist": "",
+          "caption": f"p{i}", "width": w, "height": h} for i in range(n)],
+        seed=0)
+
+
+def test_scheduler(tmp_path=None):
+    # Codex case 1: 100 s budget, 20 s loads, 60 s cold, 10 s warm. The old
+    # logic ran to 140 s; now nothing may end after the deadline.
+    for deadline in (100, 200):
+        rows, skipped, notes, loads, end = run_mock(
+            same_shape_prompts(4), deadline, 20, 60, 10, 20, 60)
+        assert end <= deadline, (deadline, end, rows)
+        assert len(rows) + len(skipped) >= 4
+    assert len(rows) == 8 and end == 170, (rows, end)   # 200 s: all 4 pairs
+    # Codex case 2: 50 same-shape prompts, 90 s cold then 1 s warm, 200 s:
+    # the cold time must not be charged to every warm sample -> all 50 pairs
+    rows, skipped, notes, loads, end = run_mock(
+        same_shape_prompts(50), 200, 2, 90, 1, 10, 100)
+    assert end <= 200 and not skipped, (end, skipped, notes)
+    assert [r["model"] for r in rows] == ["base"] * 50 + ["ft"] * 50
+    assert sum(r["first_of_shape"] for r in rows) == 1
+    # an expired deadline: no model is loaded, every sample is skipped
+    rows, skipped, notes, loads, end = run_mock(
+        same_shape_prompts(3), -1, 20, 60, 10, 20, 60)
+    assert loads == [] and rows == [] and end == 0, (loads, rows)
+    assert skipped == [f"{i:02d}_base" for i in range(3)], skipped
+    assert any("base: not loaded" in n for n in notes), notes
+    assert any("ft: not loaded (no prompt left" in n for n in notes), notes
+    # enough time for BASE's load but not its first (cold) sample: not loaded
+    rows, skipped, notes, loads, end = run_mock(
+        same_shape_prompts(3), 50, 20, 60, 10, 20, 60)
+    assert loads == [] and end == 0, loads
+    # no deadline: everything runs
+    rows, *_ = run_mock(same_shape_prompts(3), None, 20, 60, 10, 20, 60)
+    assert len(rows) == 6
+    # property sweep (allowances >= the real durations): never past the
+    # deadline, FT only pairs BASE outputs (checked in run_mock)
+    mixed = mef.finalize_prompts(
+        [{"source": "ood", "row_id": None, "variant": None, "artist": "",
+          "caption": f"p{i}", "width": 64 + 16 * (i % 3), "height": 64}
+         for i in range(12)], seed=0)
+    for deadline in (0, 30, 60, 100, 150, 250, 400, 800):
+        for load_s, cold_s, warm_s in ((5, 30, 2), (20, 60, 10),
+                                       (40, 90, 30), (1, 10, 9)):
+            *_, end = run_mock(mixed, deadline, load_s, cold_s, warm_s,
+                               load_s, cold_s)
+            assert end <= deadline, (deadline, load_s, cold_s, warm_s, end)
+    print("    run_models: no overrun (100 s case), 50/50 pairs (200 s, "
+          "1 s warm), no load after the deadline, sweep")
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +499,8 @@ def test_generate_tiny(tmp_path):
     res3 = mef.generate_impl(prompts, (("base", a), ("ft", b)), te_dir,
                              tmp_path / "lat3", deadline=time.time() - 1, **kw)
     assert res3["rows"] == [] and len(res3["skipped"]) == 3, res3
-    assert res3["notes"] and "skipped" in res3["notes"][0]
+    assert "load_base_s" not in res3["timings"], res3["timings"]
+    assert any("base: not loaded" in n for n in res3["notes"]), res3["notes"]
     print("    generate_impl: tiny DiT x2 sequential, shapes, same seed, "
           "padded == compact, deadline")
 
@@ -408,20 +554,27 @@ def test_decode_and_outputs(tmp_path):
     one = mef.make_pair(np.zeros((32, 16, 3), np.uint8), None, "x")
     assert one.size[0] == 32
 
-    gen = {"rows": [{"id": prompts[0]["id"], "model": "base",
+    weights = {"base": {"repo": mef.BASE_REPO, "revision": "abc",
+                        "file": mef.BASE_FILE, "size": 1},
+               "ft": {"key": mef.R2_KEY, "etag": "e9", "size": 2,
+                      "last_modified": "2026-10-14T03:00:00+00:00"}}
+    gen = {"weights": weights, "env": {"steps": 2}, "rows": [{"id": prompts[0]["id"], "model": "base",
                      "seconds": 1.234}, {"id": prompts[0]["id"],
                                          "model": "ft", "seconds": 2.0}]}
     prompts[0]["caption"] = 'a <b>"quoted"</b> & caption'
     out = tmp_path / "out"
     paths = mef.write_outputs(out, prompts, list(reversed(dec)), gen,
-                              title="t", info_lines=["steps 2"])
+                              title="t", info_lines=["steps 2"]
+                              + mef.weights_lines(weights))
     names = sorted(p.name for p in paths)
     i0, i1 = prompts[0]["id"], prompts[1]["id"]
     assert names == sorted([f"{i0}_base.png", f"{i0}_ft.png",
                             f"{i0}_pair.png", f"{i1}_base.png",
                             f"{i1}_pair.png", "prompts.json",
                             "generate.json", "index.html"]), names
-    pj = json.loads((out / "prompts.json").read_text())
+    doc = json.loads((out / "prompts.json").read_text())
+    assert doc["weights"] == weights and doc["settings"] == {"steps": 2}
+    pj = doc["prompts"]
     assert pj[0]["seconds"] == {"base": 1.23, "ft": 2.0}
     assert pj[1]["files"] == {"base": True, "ft": False, "pair": True}
     for k in ("id", "source", "caption", "width", "height", "seed"):
@@ -430,6 +583,7 @@ def test_decode_and_outputs(tmp_path):
     assert f'src="{i0}_base.png"' in page and f'src="{i0}_ft.png"' in page
     assert "&lt;b&gt;&quot;quoted&quot;&lt;/b&gt; &amp; caption" in page
     assert "ft: not generated" in page and "steps 2" in page
+    assert "etag e9" in page and "@ abc" in page
     assert "/home/" not in page and str(tmp_path) not in page
     print("    decode (stub VAE) math, pair image, prompts.json, index.html")
 
