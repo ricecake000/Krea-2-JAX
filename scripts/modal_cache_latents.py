@@ -5,7 +5,7 @@ upload it to a private HF dataset repo the training node can `hf download`.
     modal run scripts/modal_cache_latents.py --bench                  # all GPU types
     modal run scripts/modal_cache_latents.py --bench --gpus L4,L40S,B200 --n-decode 128
     modal run --detach scripts/modal_cache_latents.py --build --gpu B200 \\
-        --containers 4 --batch 16 --cpu 12
+        --containers 4 --batch 16 --cpu 12 --worker-timeout-h 4
     modal run scripts/modal_cache_latents.py --finalize-only          # manifest + upload again
 
 Mode 1 (--bench): `prep` (CPU) puts metadata.parquet + data/train-0000.tar of
@@ -27,17 +27,22 @@ Rough cost of a full bench: ~5 min per GPU type, ~$3 for all ten.
 
 Mode 2 (--build): `prep` (VAE only; aborts before any GPU starts when the
 token is clearly read-only), then --containers `build_worker` containers on
---gpu, worker i running `cache_latents.py --num-workers N --worker-index i`
-into /vol/krea2 (shards i, i+N, ...), then `finalize` (CPU): HF write check +
-create the repo FIRST, `cache_latents.py --write-manifest` (verifies every
+--gpu (Modal timeout --worker-timeout-h), worker i running `cache_latents.py
+--num-workers N --worker-index i` into /vol/krea2 (shards i, i+N, ...), then
+`finalize` (CPU): HF write check + create the repo FIRST and refuse a repo
+that is not private, `cache_latents.py --write-manifest` (verifies every
 shard, sha256 digests), upload_large_folder to
-ricecake/danbooru-curated-v2-latents (private) and a size check of every
-uploaded file. A failed worker stops before finalize. Everything is
+ricecake/danbooru-curated-v2-latents and a content check of every uploaded
+file (shard LFS sha256 == manifest digest; parquet/manifest sha256 or git
+blob id == local). A failed worker stops before finalize. Everything is
 resumable: cache_latents skips finished shards, --write-manifest re-verifies
-the digests, upload_large_folder resumes from its state in /vol/krea2/.cache. The orchestration runs in the local entrypoint, so if
-the laptop disconnects during a --detach run the workers finish but finalize
+the digests, upload_large_folder resumes from its state in
+/vol/krea2/.cache. The orchestration runs in the local entrypoint, so if the
+laptop disconnects during a --detach run the workers finish but finalize
 does not start: re-run with --finalize-only (or --build, which skips the
-done shards). Output: /home/mj/krea2-ops/mi350x/results/modal/cache_build_<ts>.md.
+done shards). Never start a second --build while one is still running (two
+workers would write the same shards). Output:
+/home/mj/krea2-ops/mi350x/results/modal/cache_build_<ts>.md.
 
 Volume `krea2-latents` (Volumes v2, created on first use):
     /vol/hf       HF_HOME (VAE weights downloaded once)
@@ -54,6 +59,7 @@ streaming/commit loop and upload checks are plain functions
 """
 
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -108,6 +114,9 @@ DEFAULT_GPUS = ("L4,A10,L40S,A100-40GB,A100-80GB,RTX-PRO-6000,H100!,H200,"
 TIE_FRAC = 0.05
 DEFAULT_OVERHEAD_MIN = 3.0   # startup + VAE load per container
 CONTAINER_COUNTS = (1, 4)    # projected cost/wall-clock columns
+DEFAULT_CONTAINERS = 4
+DEFAULT_WORKER_TIMEOUT_H = 4
+MAX_WORKER_TIMEOUT_H = 24    # Modal's maximum function timeout
 
 # Modal pricing (modal.com/pricing, fetched 2026-10-13); $/h = per-second x
 # 3600. Keys are Modal gpu strings (upper case; "H100!" = H100 without the
@@ -223,7 +232,7 @@ def cost_row(res, n_images=N_IMAGES, overhead_min=DEFAULT_OVERHEAD_MIN,
         "batch": res.get("best_batch"), "img_s": img_s,
         "peak_gib": res.get("best_peak_gib"), "decode": dec, "cores": cores,
         "usd_h": hourly, "usd_per_1k": hourly / (img_s * 3600) * 1000,
-        "hours_1": hours,
+        "hours_1": hours, "overhead_h": over,
         "proj": {k: {"usd": hourly * (hours + k * over),
                      "wall_h": hours / k + over} for k in containers},
     }
@@ -240,10 +249,18 @@ def select_gpu(rows, tie_frac=TIE_FRAC):
     return max(ties, key=lambda r: r["img_s"])
 
 
-def build_command(row, containers=4):
+def worker_timeout_h(row, containers=DEFAULT_CONTAINERS):
+    """Modal timeout for one build worker: ceil(1.5 x its projected hours
+    (share of the images + startup overhead) + 0.5), at least 1."""
+    per_worker = row["hours_1"] / containers + row["overhead_h"]
+    return max(1, math.ceil(1.5 * per_worker + 0.5))
+
+
+def build_command(row, containers=DEFAULT_CONTAINERS):
     return (f"modal run --detach scripts/modal_cache_latents.py --build "
             f"--gpu {row['gpu']} --containers {containers} "
-            f"--batch {row['batch']} --cpu {row['cores']}")
+            f"--batch {row['batch']} --cpu {row['cores']} "
+            f"--worker-timeout-h {worker_timeout_h(row, containers)}")
 
 
 def _ladder_str(ladder):
@@ -353,25 +370,38 @@ def setup_hf_token(env=None):
 
 def token_can_write(whoami, owner=OUT_OWNER):
     """HfApi.whoami() -> (True/False/None, reason): can this token create and
-    write dataset repos under user `owner`? None = cannot tell."""
+    write dataset repos under user `owner`? True only when clearly writable
+    (role write/admin, or fine-grained repo.write on the user), False only
+    when clearly not (role read, another user's token, or a fine-grained
+    token with no repo write permission anywhere), None = cannot tell (e.g.
+    fine-grained write on single repos only): create_repo decides."""
     who = whoami or {}
     name = who.get("name")
     tok = (who.get("auth") or {}).get("accessToken") or {}
     role = tok.get("role")
-    if name != owner:
+    if name is not None and name != owner:
         return False, f"token belongs to {name!r}, not {owner!r}"
     if role in ("write", "admin"):
         return True, f"token role {role}"
     if role == "read":
         return False, "token role read"
     if role == "fineGrained":
-        for s in (tok.get("fineGrained") or {}).get("scoped") or []:
+        fg = tok.get("fineGrained") or {}
+        scoped = fg.get("scoped") or []
+        for s in scoped:
             ent = s.get("entity") or {}
             if (ent.get("type") == "user" and ent.get("name") == owner
                     and "repo.write" in (s.get("permissions") or [])):
                 return True, "fine-grained token with repo.write on " + owner
-        return False, f"fine-grained token without repo.write on user {owner}"
-    return None, f"unknown token role {role!r}"
+        perms = [p for s in scoped for p in s.get("permissions") or []]
+        perms += list(fg.get("global") or [])
+        writes = sorted({p for p in perms
+                         if p.startswith("repo") and "write" in p})
+        if not writes:
+            return False, "fine-grained token without any repo write permission"
+        return None, ("fine-grained token with repo write only on some "
+                      f"entities ({', '.join(writes)})")
+    return None, f"unknown token role {role!r} (user {name!r})"
 
 
 # ------------------------------------------------------------- build helpers
@@ -382,6 +412,16 @@ def worker_cmd(i, n, batch, decode_threads, python="python", out=VOL_OUT,
             "--num-workers", str(n), "--worker-index", str(i),
             "--batch", str(batch), "--decode-threads", str(decode_threads),
             "--download-dir", f"{dl_root}/w{i}"]
+
+
+def worker_env(base):
+    """Subprocess env of a build worker: one intra-op CPU thread per decode
+    thread. The VAE runs on the GPU, so torch's CPU threads only serve
+    decode/normalize/stack; with OMP's default (all cores) every one of the
+    --decode-threads would spawn its own core-wide pool and oversubscribe
+    the cores the cost model sized as 1 core per decode thread."""
+    return {**base, "PYTHONUNBUFFERED": "1", "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1"}
 
 
 def finalize_cmd(python="python", out=VOL_OUT, dl_root=REMOTE_DL):
@@ -447,25 +487,77 @@ def should_upload(relpath, ignore=UPLOAD_IGNORE):
     return not any(fnmatch.fnmatchcase(p, pat) for pat in ignore)
 
 
-def expected_upload_sizes(out_dir):
-    """{repo path: local size} of what the repo must contain: metadata.parquet,
-    latents/manifest.json and every shard the manifest lists."""
+def local_digests(path, chunk=1 << 20):
+    """-> (sha256 hex, git blob sha1 hex) of a file, streamed. The git blob id
+    is what the Hub reports for a file stored without LFS."""
+    path = Path(path)
+    sha, git = hashlib.sha256(), hashlib.sha1()
+    git.update(f"blob {path.stat().st_size}\0".encode())
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            sha.update(b)
+            git.update(b)
+    return sha.hexdigest(), git.hexdigest()
+
+
+def expected_upload(out_dir):
+    """{repo path: {size, sha256[, git_sha1]}} of what the repo must contain:
+    metadata.parquet and latents/manifest.json (hashed here) and every shard
+    the manifest lists (sha256 from its "digests", not re-read)."""
     out_dir = Path(out_dir)
-    manifest = json.loads((out_dir / "latents" / "manifest.json").read_text())
-    paths = [PARQUET, "latents/manifest.json"] + [
-        f"latents/{s}" for s in manifest["shards"]]
-    return {p: (out_dir / p).stat().st_size for p in paths}
+    mpath = out_dir / "latents" / "manifest.json"
+    manifest = json.loads(mpath.read_text())
+    digests = manifest.get("digests") or {}
+    exp = {}
+    for p in (PARQUET, "latents/manifest.json"):
+        sha, git = local_digests(out_dir / p)
+        exp[p] = {"size": (out_dir / p).stat().st_size, "sha256": sha,
+                  "git_sha1": git}
+    for s in manifest["shards"]:
+        exp[f"latents/{s}"] = {"size": (out_dir / "latents" / s).stat().st_size,
+                               "sha256": digests.get(s)}
+    return exp
+
+
+def remote_entries(files):
+    """list_repo_tree items -> {path: {size, sha256 (LFS oid or None),
+    blob_id}}; folders (no blob_id) are skipped."""
+    out = {}
+    for f in files:
+        if getattr(f, "blob_id", None) is None:
+            continue
+        lfs = getattr(f, "lfs", None)
+        out[f.path] = {"size": f.size, "blob_id": f.blob_id,
+                       "sha256": getattr(lfs, "sha256", None) if lfs else None}
+    return out
 
 
 def verify_upload(expected, remote):
-    """expected/remote: {path: size} -> list of problems (missing files, size
-    mismatches; extra remote files are fine)."""
+    """-> list of problems: missing files, size mismatches, content
+    mismatches (remote LFS sha256 vs expected sha256; for a non-LFS remote
+    file its git blob id vs the local one; a file with neither is
+    unverifiable = a problem). Extra remote files are fine."""
     problems = []
-    for p, size in sorted(expected.items()):
-        if p not in remote:
+    for p, e in sorted(expected.items()):
+        r = remote.get(p)
+        if r is None:
             problems.append(f"missing {p}")
-        elif remote[p] != size:
-            problems.append(f"size {p}: remote {remote[p]} != local {size}")
+        elif r["size"] != e["size"]:
+            problems.append(f"size {p}: remote {r['size']} != local "
+                            f"{e['size']}")
+        elif r.get("sha256"):
+            if r["sha256"] != e.get("sha256"):
+                problems.append(f"sha256 {p}: remote {r['sha256']} != "
+                                f"expected {e.get('sha256')}")
+        elif e.get("git_sha1"):
+            if r.get("blob_id") != e["git_sha1"]:
+                problems.append(f"git blob {p}: remote {r.get('blob_id')} != "
+                                f"local {e['git_sha1']}")
+        else:
+            problems.append(f"unverifiable {p}: no LFS sha256 on the remote")
     return problems
 
 
@@ -489,7 +581,7 @@ def render_build_log(params, prep, workers, fin):
                    f"GB={(fin.get('bytes') or 0) / 1e9:.2f}")
         if fin.get("error"):
             out += ["", "```", fin["error"], "```"]
-        out += [f"- {p}" for p in fin.get("problems") or []]
+        out += [f"- {p}" for p in (fin.get("problems") or [])[:50]]
         out += ["", "```"] + list(fin.get("log") or []) + ["```"]
     return "\n".join(out)
 
@@ -589,11 +681,18 @@ def bench_gpu_impl(gpu_requested, n_decode):
         if len(samples) < DECODE_TIMING_N:
             raise RuntimeError(f"only {len(samples)} {w}x{h} samples in "
                                f"{BENCH_TAR}")
-        t0 = time.perf_counter()
-        for s in samples[:DECODE_TIMING_N]:
-            cl.decode(s)
-        res["decode_img_s_per_thread"] = (DECODE_TIMING_N
-                                          / (time.perf_counter() - t0))
+        # one intra-op thread: the build runs every decode thread with
+        # OMP_NUM_THREADS=1 (worker_env), so this is the per-core rate
+        n_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            t0 = time.perf_counter()
+            for s in samples[:DECODE_TIMING_N]:
+                cl.decode(s)
+            res["decode_img_s_per_thread"] = (DECODE_TIMING_N
+                                              / (time.perf_counter() - t0))
+        finally:
+            torch.set_num_threads(n_threads)
         with ThreadPoolExecutor(DECODE_POOL) as pool:
             imgs = [d[0] for d in pool.map(cl.decode, samples)]
         res["n_decoded"] = len(imgs)
@@ -660,7 +759,7 @@ def build_worker_impl(i, n, batch, decode_threads, vol):
     finished shard (explicitly, on top of Modal's background commits, so a
     killed container loses at most its in-flight shard) and at the end."""
     setup_hf_token()
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env = worker_env(os.environ)
     res = {"worker": i, "device_name": gpu_name_smi()}
     cmd = worker_cmd(i, n, batch, decode_threads, python=sys.executable)
     print(f"w{i}/{n} on {res['device_name']}: $ {' '.join(cmd)}", flush=True)
@@ -680,9 +779,25 @@ class WriteAccessError(Exception):
     pass
 
 
-def finalize_impl(vol):
-    """HF write check + repo creation, --write-manifest, upload, remote size
-    check. Never raises: -> {ok, repo, error, problems, n_files, bytes, log}."""
+class NotPrivateError(Exception):
+    pass
+
+
+UPLOAD_CACHE = f"{VOL_OUT}/.cache/huggingface/upload"
+CONTENT_HELP = (
+    "remote content check FAILED for {n} file(s) in " + OUT_REPO + " (see "
+    "problems). Delete the stale file(s) on the Hub, or the local upload "
+    f"cache {UPLOAD_CACHE} (so upload_large_folder re-hashes and re-sends), "
+    "then re-run --finalize-only.")
+
+
+def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
+                  python=sys.executable, cwd=REMOTE_REPO):
+    """HF write check + repo creation + privacy check, --write-manifest,
+    upload, remote content check. `api` (an HfApi; default: one with the
+    secret's token) and `runner` (subprocess.run signature) are injectable
+    for tests. Never raises: -> {ok, repo, error, problems, n_files, bytes,
+    revision, log}."""
     log = []
 
     def say(msg):
@@ -692,15 +807,15 @@ def finalize_impl(vol):
     res = {"ok": False, "repo": OUT_REPO, "error": None, "problems": [],
            "log": log}
     try:
-        from huggingface_hub import HfApi
-        from huggingface_hub.hf_api import RepoFile
-
         try:
             vol.reload()
         except Exception as e:  # noqa: BLE001 - the mount is fresh anyway
             say(f"WARNING: volume reload failed: {type(e).__name__}: {e}")
-        _, token = setup_hf_token()
-        api = HfApi(token=token)
+        if api is None:
+            from huggingface_hub import HfApi
+
+            _, token = setup_hf_token()
+            api = HfApi(token=token)
         # 1. write access FIRST (before reading ~49 GB for the manifest)
         try:
             who = api.whoami()
@@ -710,41 +825,67 @@ def finalize_impl(vol):
         say(f"HF user {who.get('name')!r}: can write {can} ({why})")
         if can is False:
             raise WriteAccessError(why)
+        if api.repo_exists(OUT_REPO, repo_type="dataset"):
+            try:
+                api.auth_check(OUT_REPO, repo_type="dataset", write=True)
+            except Exception as e:  # noqa: BLE001
+                raise WriteAccessError(
+                    f"auth_check(write=True) failed: {type(e).__name__}: {e}")
+        # create_repo is the real write test
         try:
             api.create_repo(OUT_REPO, repo_type="dataset", private=True,
                             exist_ok=True)
         except Exception as e:  # noqa: BLE001
             raise WriteAccessError(
                 f"create_repo failed: {type(e).__name__}: {e}")
+        # exist_ok keeps an existing repo's visibility: never upload to a
+        # public one
+        private = api.repo_info(OUT_REPO, repo_type="dataset").private
+        if private is not True:
+            raise NotPrivateError(
+                f"{OUT_REPO} exists but is not private (private={private!r});"
+                " nothing was uploaded. Make it private on the Hub (Settings"
+                " -> visibility) or delete it, then re-run --finalize-only.")
         say(f"repo {OUT_REPO} (dataset, private) ready")
         # 2. verify all shards + digests, metadata.parquet, manifest.json
-        cmd = finalize_cmd(python=sys.executable)
+        cmd = finalize_cmd(python=python, out=str(out_dir))
         say("$ " + " ".join(cmd))
-        rc = subprocess.run(cmd, cwd=REMOTE_REPO).returncode
+        rc = runner(cmd, cwd=cwd).returncode
         if rc != 0:
             raise RuntimeError(f"cache_latents.py --write-manifest exit {rc}")
         if not commit_volume(vol, say):
             say("continuing: the manifest is on the container's mount")
         # 3. upload (resumable; its state lives in /vol/krea2/.cache)
         t0 = time.time()
-        api.upload_large_folder(OUT_REPO, VOL_OUT, repo_type="dataset",
+        api.upload_large_folder(OUT_REPO, str(out_dir), repo_type="dataset",
                                 private=True, ignore_patterns=UPLOAD_IGNORE,
                                 num_workers=UPLOAD_WORKERS)
         say(f"upload_large_folder done in {(time.time() - t0) / 60:.1f} min")
         commit_volume(vol, say)
-        # 4. every expected file present with the local size
-        expected = expected_upload_sizes(VOL_OUT)
-        remote = {f.path: f.size for f in api.list_repo_tree(
-            OUT_REPO, repo_type="dataset", recursive=True)
-            if isinstance(f, RepoFile)}
+        # 4. every expected file present with the expected content, read at
+        #    one commit
+        expected = expected_upload(out_dir)
+        sha = api.repo_info(OUT_REPO, repo_type="dataset").sha
+        remote = remote_entries(api.list_repo_tree(
+            OUT_REPO, repo_type="dataset", recursive=True, expand=True,
+            revision=sha))
+        res["revision"] = sha
         res["problems"] = verify_upload(expected, remote)
         res["n_files"] = len(expected)
-        res["bytes"] = sum(expected.values())
-        say(f"remote check: {len(expected)} files, "
+        res["bytes"] = sum(e["size"] for e in expected.values())
+        say(f"remote check at {sha}: {len(expected)} files, "
             f"{res['bytes'] / 1e9:.2f} GB, {len(res['problems'])} problems")
         res["ok"] = not res["problems"]
+        if res["problems"]:
+            res["error"] = CONTENT_HELP.format(n=len(res["problems"]))
+            say("FATAL: " + res["error"])
+            for p in res["problems"][:20]:
+                say("  " + p)
     except WriteAccessError as e:
         res["error"] = WRITE_HELP.format(reason=e)
+        say("FATAL: " + res["error"])
+    except NotPrivateError as e:
+        res["error"] = str(e)
         say("FATAL: " + res["error"])
     except Exception:  # noqa: BLE001
         res["error"] = traceback.format_exc()[-4000:]
@@ -782,8 +923,9 @@ if modal is not None:
     def bench_gpu(gpu_requested: str, n_decode: int) -> dict:
         return bench_gpu_impl(gpu_requested, n_decode)
 
-    @app.function(gpu="L4", cpu=8.0, memory=MEM_MB, timeout=4 * 3600,
-                  **mounts)
+    # gpu, cpu and timeout are always overridden per build with .with_options
+    @app.function(gpu="L4", cpu=8.0, memory=MEM_MB,
+                  timeout=DEFAULT_WORKER_TIMEOUT_H * 3600, **mounts)
     def build_worker(i: int, n: int, batch: int, decode_threads: int) -> dict:
         return build_worker_impl(i, n, batch, decode_threads, vol)
 
@@ -854,22 +996,29 @@ if modal is not None:
                       else "; ".join(fin.get("problems") or [])[:500])
             raise SystemExit(f"finalize FAILED: {reason} (log: {path})")
 
-    def build_local(gpu, containers, batch, cpu, decode_threads):
+    def build_local(gpu, containers, batch, cpu, decode_threads,
+                    worker_timeout_h):
         gpu = gpu.strip().upper()
         if not gpu:
             raise SystemExit("--build needs --gpu (see the bench report)")
         gpu_key(gpu)
         if containers < 1 or batch < 1 or cpu < 1 or decode_threads < 0:
             raise SystemExit("--containers, --batch, --cpu must be >= 1")
+        if not 0 < worker_timeout_h <= MAX_WORKER_TIMEOUT_H:
+            raise SystemExit(f"--worker-timeout-h must be in (0, "
+                             f"{MAX_WORKER_TIMEOUT_H}]")
         threads = decode_threads or cpu
         params = {"gpu": gpu, "containers": containers, "batch": batch,
-                  "cpu": cpu, "decode_threads": threads}
+                  "cpu": cpu, "decode_threads": threads,
+                  "worker_timeout_h": worker_timeout_h}
         p = prep.remote(False)   # VAE once, before N workers would race on it
         _print_prep(p)
         if p.get("can_write") is False:
             raise SystemExit("aborting before any GPU starts: "
                              + WRITE_HELP.format(reason=p["write_reason"]))
-        fn = build_worker.with_options(gpu=gpu, cpu=float(cpu), memory=MEM_MB)
+        fn = build_worker.with_options(
+            gpu=gpu, cpu=float(cpu), memory=MEM_MB,
+            timeout=int(worker_timeout_h * 3600))
         calls = [fn.spawn(i, containers, batch, threads)
                  for i in range(containers)]
         print(f"spawned {containers} workers on {gpu}: {params}")
@@ -896,8 +1045,9 @@ if modal is not None:
              n_decode: int = 128,
              overhead_min: float = DEFAULT_OVERHEAD_MIN,
              build: bool = False, finalize_only: bool = False,
-             gpu: str = "", containers: int = 4, batch: int = 8,
-             cpu: int = 8, decode_threads: int = 0):
+             gpu: str = "", containers: int = DEFAULT_CONTAINERS,
+             batch: int = 8, cpu: int = 8, decode_threads: int = 0,
+             worker_timeout_h: float = DEFAULT_WORKER_TIMEOUT_H):
         modes = [m for m, on in (("--bench", bench), ("--build", build),
                                  ("--finalize-only", finalize_only)) if on]
         if len(modes) != 1:
@@ -906,7 +1056,8 @@ if modal is not None:
         if bench:
             bench_local(gpus, n_decode, overhead_min)
         elif build:
-            build_local(gpu, containers, batch, cpu, decode_threads)
+            build_local(gpu, containers, batch, cpu, decode_threads,
+                        worker_timeout_h)
         else:
             fin = finalize.remote()
             path = _write_build_log({"finalize_only": True}, {}, [], fin)

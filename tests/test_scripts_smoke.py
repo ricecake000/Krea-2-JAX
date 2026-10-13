@@ -15,9 +15,10 @@ tiny model config on 8 emulated devices:
                          Modal SDK: cost model vs hand-computed numbers, GPU
                          selection (5% tie -> higher img/s, failed GPUs and
                          OOM/error ladder rows ignored), batch ladder (stub
-                         encoder), HF token write check, worker command, the
-                         commit-per-shard stream on a real stub
-                         cache_latents run, upload filter + remote check
+                         encoder), HF token write check, worker command +
+                         env + timeout, the commit-per-shard stream on a
+                         real stub cache_latents run, upload filter + remote
+                         content check (sha256 / git blob id)
 
 Structure: every case is a function registered with @case (name = function
 name); `main` runs them all, or only those named on the command line:
@@ -435,11 +436,14 @@ def modal_cache_latents_flow():
     pricing/cost math against hand-computed numbers, the selection rule,
     the ladder's OOM handling, token parsing, the worker command, the
     stream that commits the volume after every shard (real cache_latents
-    --vae-stub run on a tiny dataset), the upload filter and size check."""
+    --vae-stub run on a tiny dataset), the upload filter and finalize with
+    a fake HfApi (write check, privacy, content check)."""
     import contextlib
+    import hashlib
     import io
     import tempfile
     from math import isclose
+    from types import SimpleNamespace
 
     import torch
 
@@ -488,6 +492,10 @@ def modal_cache_latents_flow():
     assert close(r["proj"][1]["usd"], 16.801862755555558), r
     assert close(r["proj"][4]["usd"], 16.988534755555555), r
     assert close(r["proj"][4]["wall_h"], 3.4127777777777775), r
+    # worker timeout: ceil(1.5 * (13.451111 / 4 + 0.05) + 0.5) = ceil(5.619)
+    assert mcl.worker_timeout_h(r) == 6 and mcl.worker_timeout_h(r, 32) == 2
+    fast = dict(r, hours_1=0.1)                  # ceil(0.6125) -> min 1
+    assert mcl.worker_timeout_h(fast) == 1
     # B200 at 10 img/s, 0.5 img/s/thread -> 31 cores:
     # 6.25 + 31 * 0.0472 + 0.25568 = 7.96888 $/h -> 0.2213577.. $/1k
     r = mcl.cost_row({"gpu_requested": "B200", "best_img_s": 10.0,
@@ -526,8 +534,19 @@ def modal_cache_latents_flow():
                                        "can_write": True,
                                        "write_reason": "token role write"})
     cmd = ("modal run --detach scripts/modal_cache_latents.py --build --gpu "
-           "L4 --containers 4 --batch 8 --cpu 4")
+           "L4 --containers 4 --batch 8 --cpu 4 --worker-timeout-h 6")
     assert mcl.build_command(choice) == cmd and cmd in md, md
+    # single-GPU bench (--gpus B200): its measured batch/cores in the command
+    one = {"gpu_requested": "B200", "device_name": "NVIDIA B200",
+           "decode_img_s_per_thread": 0.5, "ladder": [
+               {"batch": 16, "img_s": 10.0, "peak_gib": 40.0},
+               {"batch": 32, "error": "OOM"}]}
+    one.update(mcl.best_of(one["ladder"]))
+    rows1 = [mcl.cost_row(one)]
+    md1 = mcl.render_bench_report([one], rows1, mcl.select_gpu(rows1))
+    # 96848 / 10 / 3600 / 4 + 0.05 = 0.7225 h -> ceil(1.584) = 2
+    assert ("--build --gpu B200 --containers 4 --batch 16 --cpu 31 "
+            "--worker-timeout-h 2") in md1, md1
     assert "**Chosen: L4**" in md and "8:2.00 16:OOM" in md, md
     assert "- A10 " in md and "- B300 " in md and "no capacity" in md, md
 
@@ -577,8 +596,13 @@ def modal_cache_latents_flow():
     assert mcl.token_can_write(who("fineGrained", scoped=[
         {"entity": {"type": "user", "name": "ricecake"},
          "permissions": ["repo.content.read"]}]))[0] is False
+    # write on single repos only: unknown, must not block (create_repo decides)
+    assert mcl.token_can_write(who("fineGrained", scoped=[
+        {"entity": {"type": "dataset",
+                    "name": "ricecake/danbooru-curated-v2-latents"},
+         "permissions": ["repo.content.read", "repo.write"]}]))[0] is None
     assert mcl.token_can_write(who("mystery"))[0] is None
-    assert mcl.token_can_write({})[0] is False
+    assert mcl.token_can_write({})[0] is None
 
     # worker / finalize commands
     assert mcl.worker_cmd(2, 4, 16, 12, python="py") == [
@@ -588,6 +612,10 @@ def modal_cache_latents_flow():
     assert mcl.finalize_cmd(python="py") == [
         "py", "scripts/cache_latents.py", "--out", "/vol/krea2",
         "--write-manifest", "--download-dir", "/tmp/dl/manifest"]
+
+    env = mcl.worker_env({"PATH": "/bin", "OMP_NUM_THREADS": "64"})
+    assert env == {"PATH": "/bin", "PYTHONUNBUFFERED": "1",
+                   "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}, env
 
     # upload filter (same semantics as huggingface_hub's ignore_patterns)
     paths = ["metadata.parquet", "latents/manifest.json",
@@ -629,7 +657,7 @@ def modal_cache_latents_flow():
         buf = io.StringIO()
         rc, tail, n = mcl.stream_worker(
             cmd, lambda: mcl.commit_volume(vol, logs.append), cwd=str(REPO),
-            env={**os.environ, "PYTHONUNBUFFERED": "1"}, out=buf)
+            env=mcl.worker_env(os.environ), out=buf)
         shard_lines = [ln for ln in buf.getvalue().splitlines()
                        if mcl.is_shard_line(ln)]
         assert rc == 0 and n == 2 and len(shard_lines) == 2, buf.getvalue()
@@ -645,26 +673,171 @@ def modal_cache_latents_flow():
                                      "error": "Traceback\nOSError: x"}])
         assert not ok and "FAILED" in lines[1] and "OSError: x" in lines[1]
 
-        # manifest pass, then the remote size check
+        # manifest pass, then the remote content check
         subprocess.run([sys.executable, "scripts/cache_latents.py",
                         "--tar-dir", str(d / "src"), "--out",
                         str(d / "out"), "--write-manifest"], cwd=str(REPO),
                        check=True, capture_output=True)
-        expected = mcl.expected_upload_sizes(d / "out")
+        out = d / "out"
+        expected = mcl.expected_upload(out)
         assert sorted(expected) == [
             "latents/manifest.json", "latents/train-0000.safetensors",
             "latents/train-0001.safetensors", "metadata.parquet"], expected
-        assert mcl.verify_upload(expected, dict(expected)) == []
-        remote = dict(expected, extra=1)
-        remote.pop("latents/train-0001.safetensors")
-        remote["metadata.parquet"] += 1
-        assert mcl.verify_upload(expected, remote) == [
+        manifest = json.loads((out / "latents/manifest.json").read_text())
+        for p, e in expected.items():
+            data = (out / p).read_bytes()
+            assert e["size"] == len(data), (p, e)
+            assert e["sha256"] == hashlib.sha256(data).hexdigest(), (p, e)
+            if p.endswith(".safetensors"):   # from the manifest, not re-read
+                assert e["sha256"] == manifest["digests"][Path(p).name]
+            else:                            # git blob id = `git hash-object`
+                git = subprocess.run(["git", "hash-object", str(out / p)],
+                                     capture_output=True, text=True)
+                if git.returncode == 0:
+                    assert e["git_sha1"] == git.stdout.strip(), (p, e)
+                assert e["git_sha1"] == hashlib.sha1(
+                    b"blob %d\0" % len(data) + data).hexdigest()
+
+        # what list_repo_tree returns: LFS shards + parquet, a non-LFS
+        # manifest (git blob id only) and a folder
+        def tree(exp, lfs_manifest=False):
+            items = [SimpleNamespace(path="latents", tree_id="t")]
+            for p, e in exp.items():
+                lfs = None
+                if p != "latents/manifest.json" or lfs_manifest:
+                    lfs = SimpleNamespace(sha256=e["sha256"], size=e["size"])
+                items.append(SimpleNamespace(
+                    path=p, size=e["size"], lfs=lfs,
+                    blob_id=e.get("git_sha1") or "f" * 40))
+            return items
+        remote = mcl.remote_entries(tree(expected))
+        assert "latents" not in remote and len(remote) == 4, remote
+        assert remote["latents/manifest.json"]["sha256"] is None, remote
+        assert mcl.verify_upload(expected, remote) == []
+        assert mcl.verify_upload(
+            expected, mcl.remote_entries(tree(expected, True))) == []
+
+        bad = {p: dict(e) for p, e in remote.items()}
+        bad.pop("latents/train-0001.safetensors")
+        bad["metadata.parquet"]["size"] += 1
+        bad["latents/train-0000.safetensors"]["sha256"] = "0" * 64
+        bad["latents/manifest.json"]["blob_id"] = "1" * 40
+        exp_unv = dict(expected, **{"latents/x.safetensors": {
+            "size": 3, "sha256": "a" * 64}})
+        bad["latents/x.safetensors"] = {"size": 3, "sha256": None,
+                                        "blob_id": "2" * 40}
+        probs = mcl.verify_upload(exp_unv, bad)
+        e = expected
+        assert probs == [
+            f"git blob latents/manifest.json: remote {'1' * 40} != local "
+            f"{e['latents/manifest.json']['git_sha1']}",
+            f"sha256 latents/train-0000.safetensors: remote {'0' * 64} != "
+            f"expected {e['latents/train-0000.safetensors']['sha256']}",
             "missing latents/train-0001.safetensors",
-            f"size metadata.parquet: remote {expected['metadata.parquet'] + 1}"
-            f" != local {expected['metadata.parquet']}"], remote
+            "unverifiable latents/x.safetensors: no LFS sha256 on the remote",
+            f"size metadata.parquet: remote {e['metadata.parquet']['size'] + 1}"
+            f" != local {e['metadata.parquet']['size']}"], probs
+        assert "/vol/krea2/.cache/huggingface/upload" in mcl.CONTENT_HELP
+
+        # finalize_impl with a fake HfApi: write check, privacy, upload,
+        # content check at the commit read after the upload
+        class FakeApi:
+            def __init__(self, who_=None, exists=False, private=True,
+                         auth_ok=True, corrupt=None):
+                self.who = who_ or who("write")
+                self.exists, self.private = exists, private
+                self.auth_ok, self.corrupt = auth_ok, corrupt
+                self.calls, self.uploaded = [], {}
+
+            def whoami(self):
+                self.calls.append("whoami")
+                return self.who
+
+            def repo_exists(self, repo, repo_type):
+                self.calls.append("repo_exists")
+                return self.exists
+
+            def auth_check(self, repo, repo_type, write):
+                self.calls.append(f"auth_check write={write}")
+                if not self.auth_ok:
+                    raise PermissionError("403 Forbidden")
+
+            def create_repo(self, repo, repo_type, private, exist_ok):
+                assert (repo, repo_type, private, exist_ok) == (
+                    mcl.OUT_REPO, "dataset", True, True)
+                self.calls.append("create_repo")
+                if not self.exists:
+                    self.exists, self.private = True, True
+
+            def repo_info(self, repo, repo_type):
+                self.calls.append("repo_info")
+                return SimpleNamespace(private=self.private, sha="c0ffee")
+
+            def upload_large_folder(self, repo, folder, **kw):
+                assert kw["ignore_patterns"] == mcl.UPLOAD_IGNORE, kw
+                assert kw["private"] is True, kw
+                self.calls.append("upload")
+                self.uploaded = mcl.expected_upload(folder)
+
+            def list_repo_tree(self, repo, repo_type, recursive, expand,
+                               revision):
+                assert (recursive, expand, revision) == (True, True,
+                                                         "c0ffee")
+                self.calls.append("list_repo_tree")
+                items = tree(self.uploaded)
+                if self.corrupt:
+                    for it in items:
+                        if it.path == self.corrupt:
+                            it.lfs.sha256 = "e" * 64
+                return items
+
+        man_cmds = []
+
+        def runner(cmd, cwd):
+            assert cmd == mcl.finalize_cmd(python="py", out=str(out)), cmd
+            man_cmds.append(cmd)
+            return SimpleNamespace(returncode=0)   # manifest already written
+
+        def fin(api):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return mcl.finalize_impl(FakeVol(), api=api, out_dir=out,
+                                         runner=runner, python="py")
+
+        api = FakeApi()
+        r = fin(api)
+        assert r["ok"] and r["problems"] == [] and r["error"] is None, r
+        assert r["revision"] == "c0ffee" and r["n_files"] == 4, r
+        assert api.calls == ["whoami", "repo_exists", "create_repo",
+                             "repo_info", "upload", "repo_info",
+                             "list_repo_tree"], api.calls
+        api = FakeApi(exists=True)                 # existing private repo
+        assert fin(api)["ok"] and api.calls[:3] == [
+            "whoami", "repo_exists", "auth_check write=True"], api.calls
+        api = FakeApi(exists=True, private=False)  # public: never upload
+        r = fin(api)
+        assert not r["ok"] and "not private" in r["error"], r
+        assert "upload" not in api.calls, api.calls
+        api = FakeApi(exists=True, auth_ok=False)
+        r = fin(api)
+        assert not r["ok"] and "cannot write" in r["error"], r
+        assert "403 Forbidden" in r["error"], r
+        assert "create_repo" not in api.calls, api.calls
+        api = FakeApi(who_=who("read"))
+        r = fin(api)
+        assert "token role read" in r["error"] and api.calls == ["whoami"]
+        api = FakeApi(who_=who("fineGrained", scoped=[
+            {"entity": {"type": "dataset", "name": mcl.OUT_REPO},
+             "permissions": ["repo.write"]}]))     # unknown: not blocked
+        assert fin(api)["ok"], api.calls
+        api = FakeApi(corrupt="latents/train-0001.safetensors")
+        r = fin(api)
+        assert not r["ok"] and r["problems"][0].startswith(
+            "sha256 latents/train-0001.safetensors: remote eeee"), r
+        assert "--finalize-only" in r["error"], r
+        assert len(man_cmds) == 4, man_cmds        # read/auth/public stop early
     print("    modal_cache_latents: cost math, 5% tie rule, OOM ladder, "
-          "token check, worker command, commit per shard, upload filter + "
-          "size check")
+          "token check, worker command/env/timeout, commit per shard, upload "
+          "filter + content check")
 
 
 # === add new @case functions above this line ===============================
