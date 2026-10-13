@@ -15,8 +15,11 @@ tiny model config on 8 emulated devices:
                          Modal SDK: cost model vs hand-computed numbers, GPU
                          selection (5% tie -> higher img/s, failed GPUs and
                          OOM/error ladder rows ignored), batch ladder (stub
-                         encoder), HF token write check, worker command +
-                         env + timeout, the commit-per-shard stream on a
+                         encoder), per-(gpu, VAE impl) rows + --vae-impl
+                         threading (bench -> build command -> worker ->
+                         cache_latents shard metadata), HF token write
+                         check, worker command + env + timeout, the
+                         commit-per-shard stream on a
                          real stub cache_latents run, upload filter + remote
                          content check (sha256 / git blob id)
 
@@ -436,8 +439,10 @@ def modal_cache_latents_flow():
     pricing/cost math against hand-computed numbers, the selection rule,
     the ladder's OOM handling, token parsing, the worker command, the
     stream that commits the volume after every shard (real cache_latents
-    --vae-stub run on a tiny dataset), the upload filter and finalize with
-    a fake HfApi (write check, privacy, content check)."""
+    --vae-stub run on a tiny dataset), cache_latents --vae-impl metadata,
+    per-(gpu, impl) bench rows / selection / build command, the upload
+    filter and finalize with a fake HfApi (write check, privacy, content
+    check)."""
     import contextlib
     import hashlib
     import io
@@ -527,14 +532,15 @@ def modal_cache_latents_flow():
     results = [res_l4, all_oom | {"gpu_requested": "A10"},
                {"gpu_requested": "B300", "error": "Traceback\nRuntimeError: "
                 "no capacity"}]
-    rows = [mcl.cost_row(x) for x in results]
+    rows = [mcl.cost_row(x) for x in mcl.flatten_results(results)]
     choice = mcl.select_gpu(rows)
     md = mcl.render_bench_report(results, rows, choice,
                                  prep={"whoami": "ricecake",
                                        "can_write": True,
                                        "write_reason": "token role write"})
     cmd = ("modal run --detach scripts/modal_cache_latents.py --build --gpu "
-           "L4 --containers 4 --batch 8 --cpu 4 --worker-timeout-h 6")
+           "L4 --containers 4 --batch 8 --cpu 4 --worker-timeout-h 6 "
+           "--vae-impl ref")
     assert mcl.build_command(choice) == cmd and cmd in md, md
     # single-GPU bench (--gpus B200): its measured batch/cores in the command
     one = {"gpu_requested": "B200", "device_name": "NVIDIA B200",
@@ -546,8 +552,8 @@ def modal_cache_latents_flow():
     md1 = mcl.render_bench_report([one], rows1, mcl.select_gpu(rows1))
     # 96848 / 10 / 3600 / 4 + 0.05 = 0.7225 h -> ceil(1.584) = 2
     assert ("--build --gpu B200 --containers 4 --batch 16 --cpu 31 "
-            "--worker-timeout-h 2") in md1, md1
-    assert "**Chosen: L4**" in md and "8:2.00 16:OOM" in md, md
+            "--worker-timeout-h 2 --vae-impl ref") in md1, md1
+    assert "**Chosen: L4 / ref**" in md and "8:2.00 16:OOM" in md, md
     assert "--containers raised" not in md1, md1
     # Modal's 24 h cap: at 0.3 img/s a worker of 4 needs 35 h, of 5 28 h,
     # of 6 23 h -> 6 containers (89.67 h / 6 + 0.05 -> ceil(22.99) = 23)
@@ -559,7 +565,8 @@ def modal_cache_latents_flow():
     assert mcl.worker_timeout_h(rows_s[0]) == 35
     assert mcl.build_plan(rows_s[0]) == (6, 23), mcl.build_plan(rows_s[0])
     md_s = mcl.render_bench_report([slow], rows_s, mcl.select_gpu(rows_s))
-    assert "--containers 6 --batch 4 --cpu 4 --worker-timeout-h 23" in md_s
+    assert ("--containers 6 --batch 4 --cpu 4 --worker-timeout-h 23 "
+            "--vae-impl ref") in md_s
     assert "--containers raised from 4 to 6" in md_s, md_s
     assert mcl.build_plan(choice) == (4, 6)   # L4 at 2 img/s fits as is
     assert "- A10 " in md and "- B300 " in md and "no capacity" in md, md
@@ -603,6 +610,64 @@ def modal_cache_latents_flow():
                              min_seconds=0.0)
     assert lad[0]["error"].startswith("ValueError: output (2, 16, 8, 4)"), lad
 
+    # per-(gpu, impl) rows: a B200 bench result with all three impls
+    import vae_fast
+    assert mcl.VAE_IMPLS == vae_fast.IMPLS
+    assert mcl.parse_impls(" 2d,ref,2d") == ["2d", "ref"]
+    assert mcl.parse_impls(mcl.DEFAULT_IMPLS) == list(vae_fast.IMPLS)
+    for bad in ("", "3d", "ref,2d-compiled"):
+        try:
+            mcl.parse_impls(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"parse_impls accepted {bad!r}")
+
+    def impl_res(img_s, fp32, ok=True, first=None, ladder=True):
+        r = {"check": {"fp32_mean_max_rel": fp32, "bf16_mean_max_rel": 4e-3,
+                       "ok": ok, "first_call_s": first}}
+        if ladder:
+            r["ladder"] = [{"batch": 16, "img_s": img_s, "peak_gib": 30.0},
+                           {"batch": 32, "error": "OOM"}]
+            r.update(mcl.best_of(r["ladder"]))
+        return r
+    b200 = {"gpu_requested": "B200", "device_name": "NVIDIA B200",
+            "decode_img_s_per_thread": 0.5, "impls": {
+                "ref": impl_res(10.0, 0.0),
+                "2d": impl_res(25.0, 3e-7, first=0.4),
+                # failed correctness: never costed, even with a fast ladder
+                "2d-compile": impl_res(90.0, 2e-3, ok=False, first=95.0)}}
+    ents = mcl.flatten_results([b200])
+    assert [(e["impl"], bool(e["error"])) for e in ents] == [
+        ("ref", False), ("2d", False), ("2d-compile", True)], ents
+    assert ents[2]["error"].startswith("correctness FAILED: fp32 mean max "
+                                       "rel 2.00e-03"), ents[2]
+    rows_b = [mcl.cost_row(e) for e in ents]
+    assert rows_b[2] is None and rows_b[1]["impl"] == "2d", rows_b
+    assert rows_b[1]["fp32_err"] == 3e-7 and rows_b[1]["compile_s"] is None
+    pick = mcl.select_gpu(rows_b)
+    assert (pick["gpu"], pick["impl"]) == ("B200", "2d"), pick
+    md_b = mcl.render_bench_report([b200], rows_b, pick)
+    assert "**Chosen: B200 / 2d**" in md_b, md_b
+    assert "--gpu B200 --containers 4 --batch 16 --cpu " in md_b, md_b
+    assert md_b.rstrip().endswith("--vae-impl 2d"), md_b
+    assert "- B200 2d-compile (NVIDIA B200): correctness FAILED" in md_b, md_b
+    assert "| B200 | 2d | NVIDIA B200 | 16 | 25.00 |" in md_b, md_b
+    # 2d-compile passing and within 5% of 2d: tie -> higher img/s; the
+    # compile time is the first bf16 call
+    b200["impls"]["2d-compile"] = impl_res(26.0, 5e-7, first=95.0)
+    rows_b = [mcl.cost_row(e) for e in mcl.flatten_results([b200])]
+    assert rows_b[2]["compile_s"] == 95.0, rows_b[2]
+    assert close(rows_b[1]["usd_per_1k"] / rows_b[2]["usd_per_1k"],
+                 26.0 / 25.0 * rows_b[1]["usd_h"] / rows_b[2]["usd_h"])
+    pick = mcl.select_gpu(rows_b)
+    assert pick["impl"] == "2d-compile", pick
+    assert mcl.build_command(pick).endswith("--vae-impl 2d-compile")
+    # a GPU-level failure fails all its impls
+    dead = dict(b200, error="Traceback\nRuntimeError: CUDA error")
+    assert all(mcl.cost_row(e) is None
+               for e in mcl.flatten_results([dead]))
+
     # HF token
     assert mcl.pick_hf_token({"HUGGINGFACE_TOKEN": "c",
                               "HUGGING_FACE_HUB_TOKEN": "b"}) == (
@@ -635,10 +700,13 @@ def modal_cache_latents_flow():
     assert mcl.token_can_write({})[0] is None
 
     # worker / finalize commands
+    assert mcl.worker_cmd(2, 4, 16, 12, python="py", vae_impl="2d")[-2:] == [
+        "--vae-impl", "2d"]
     assert mcl.worker_cmd(2, 4, 16, 12, python="py") == [
         "py", "scripts/cache_latents.py", "--out", "/vol/krea2",
         "--num-workers", "4", "--worker-index", "2", "--batch", "16",
-        "--decode-threads", "12", "--download-dir", "/tmp/dl/w2"]
+        "--decode-threads", "12", "--download-dir", "/tmp/dl/w2",
+        "--vae-impl", "ref"]
     assert mcl.finalize_cmd(python="py") == [
         "py", "scripts/cache_latents.py", "--out", "/vol/krea2",
         "--write-manifest", "--download-dir", "/tmp/dl/manifest"]
@@ -694,6 +762,37 @@ def modal_cache_latents_flow():
         assert vol.commits == 2 and len(logs) == 1, (vol.commits, logs)
         assert "commit conflict" in logs[0], logs
         assert any("done: 6 images" in ln for ln in tail), tail
+
+        # cache_latents --vae-impl: informational shard metadata only
+        import cache_latents as cl
+        from safetensors import safe_open
+        with safe_open(str(d / "out/latents/train-0000.safetensors"),
+                       framework="numpy") as f:
+            assert f.metadata()["vae_impl"] == "stub", f.metadata()
+        assert cl.build_parser().parse_args(
+            ["--out", "x"]).vae_impl == "ref"          # default unchanged
+        assert cl.build_parser().parse_args(
+            ["--out", "x", "--vae-impl", "2d-compile"]).vae_impl == "2d-compile"
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cl.build_parser().parse_args(["--out", "x", "--vae-impl", "3d"])
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("--vae-impl 3d accepted")
+        tar0 = d / "src/data/train-0000.tar"
+        for impl, want in ((None, None), ("2d", "2d")):
+            outp = d / f"impl_{impl}.safetensors"
+            with contextlib.redirect_stdout(io.StringIO()):
+                cl.process_shard(tar0, outp, cl.StubEncoder(), 2,
+                                 vae_id="Qwen/Qwen-Image",
+                                 source="data/train-0000.tar",
+                                 decode_threads=1, vae_impl=impl)
+            with safe_open(str(outp), framework="numpy") as f:
+                assert f.metadata().get("vae_impl") == want, f.metadata()
+            # shard_done does not look at vae_impl: built shards stay valid
+            assert cl.shard_done(outp, "Qwen/Qwen-Image",
+                                 "data/train-0000.tar", 3), impl
         ok, lines = mcl.summarize_workers([
             {"worker": 1, "rc": 0, "seconds": 60},
             {"worker": 0, "rc": rc, "shards_written": n, "seconds": 1}])

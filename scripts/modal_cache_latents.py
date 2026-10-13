@@ -2,10 +2,10 @@
 the `krea2-latents-v1` cache (scripts/cache_latents.py) on the chosen type and
 upload it to a private HF dataset repo the training node can `hf download`.
 
-    modal run scripts/modal_cache_latents.py --bench                  # all GPU types
-    modal run scripts/modal_cache_latents.py --bench --gpus L4,L40S,B200 --n-decode 128
+    modal run scripts/modal_cache_latents.py --bench                  # all GPU types x impls
+    modal run scripts/modal_cache_latents.py --bench --gpus B200 --impls ref,2d,2d-compile
     modal run --detach scripts/modal_cache_latents.py --build --gpu B200 \\
-        --containers 4 --batch 16 --cpu 12 --worker-timeout-h 4
+        --containers 4 --batch 16 --cpu 12 --worker-timeout-h 4 --vae-impl 2d
     modal run scripts/modal_cache_latents.py --finalize-only          # manifest + upload again
     modal run scripts/modal_cache_latents.py --finalize-only --reset-upload-cache
 
@@ -15,21 +15,29 @@ HF_HOME=/vol/hf, and reports whether the HF token can write. Then one
 `bench_gpu` container per --gpus type runs concurrently: decode --n-decode
 832x1216 samples (the most common bucket, 32% of the data; every bucket is
 ~1 MP so the per-image cost is near-constant) with cache_latents.decode, time
-single-threaded decode, then a batch ladder 4/8/16/32 of
-cache_latents.vae_encode_batch on the CPU float32 tensors exactly like
-production (stack + H2D + encode + bf16 D2H), each >= max(64 images, 3
-batches) and >= 10 s, stopping at the first OOM. A GPU type that is
-unavailable or fails becomes an error row; the others still report. Locally:
-cost per image (GPU + the CPU cores needed to keep it fed + 32 GiB, Modal
-prices of PRICES_DATE), the selection (lowest $/img; anything within 5% of
-it is a tie, broken by higher img/s) and the exact build command.
+single-threaded decode, then per VAE encode path of --impls
+(scripts/vae_fast.py: ref = diffusers, 2d = single-frame 2D encoder,
+2d-compile = 2d under torch.compile): a correctness check on 2 real images
+against ref (fp32 posterior-mean max rel error < 1e-4 with TF32 off, else
+the impl is skipped; the bf16 error is reported; the first bf16 call of
+2d-compile is its compile time), then a batch ladder 4/8/16/32 of the impl
+on the CPU float32 tensors exactly like production (stack + H2D + encode +
+bf16 D2H, 1 CPU thread), each >= max(64 images, 3 batches) and >= 10 s after
+one warmup call, stopping at the first OOM. A GPU type that is unavailable
+or fails becomes an error row; the others still report. Locally: cost per
+image for every (GPU, impl) (GPU + the CPU cores needed to keep it fed + 32
+GiB, Modal prices of PRICES_DATE), the selection (lowest $/img; anything
+within 5% of it is a tie, broken by higher img/s) and the exact build
+command (incl. --vae-impl). torch.compile artifacts live in /vol/inductor,
+so the build workers reuse the bench's compile.
 Output: /home/mj/krea2-ops/mi350x/results/modal/cache_bench_<ts>/{report.md,bench.json}.
-Rough cost of a full bench: ~5 min per GPU type, ~$3 for all ten.
+Rough cost of a full bench: ~10 min per GPU type with all three impls.
 
 Mode 2 (--build): `prep` (VAE only; aborts before any GPU starts when the
 token is clearly read-only), then --containers `build_worker` containers on
 --gpu (Modal timeout --worker-timeout-h), worker i running `cache_latents.py
---num-workers N --worker-index i` into /vol/krea2 (shards i, i+N, ...), then
+--num-workers N --worker-index i --vae-impl X` into /vol/krea2 (shards i,
+i+N, ...), then
 `finalize` (CPU): HF write check + create the repo FIRST and refuse a repo
 that is not private, `cache_latents.py --write-manifest` (verifies every
 shard, sha256 digests), upload_large_folder to
@@ -112,7 +120,14 @@ MIN_SECONDS = 10.0
 DECODE_TIMING_N = 32     # single-threaded decode timing sample
 DECODE_POOL = 16         # threads decoding the bench set (8 physical cores)
 BENCH_CPU = 8
-BENCH_WAIT_S = 45 * 60   # local wait for all bench containers (incl. queueing)
+BENCH_TIMEOUT_S = 45 * 60   # one bench container: 3 impls incl. 2 compiles
+BENCH_WAIT_S = 75 * 60   # local wait for all bench containers (incl. queueing)
+# VAE encode paths (scripts/vae_fast.py IMPLS; repeated here so this module
+# imports without torch)
+VAE_IMPLS = ("ref", "2d", "2d-compile")
+DEFAULT_IMPLS = ",".join(VAE_IMPLS)
+CHECK_TOL = 1e-4   # fp32 posterior-mean max rel error vs ref on the real VAE
+CHECK_IMAGES = 2
 DEFAULT_GPUS = ("L4,A10,L40S,A100-40GB,A100-80GB,RTX-PRO-6000,H100!,H200,"
                 "B200,B300")
 TIE_FRAC = 0.05
@@ -148,10 +163,19 @@ PIP_PACKAGES = [
     "pillow==12.3.0", "pyarrow==26.0.0", "numpy==2.5.1",
     "huggingface_hub[hf_xet]==1.24.0", "hf_xet==1.5.2",
 ]
+VOL_INDUCTOR = f"{VOL}/inductor"
+# torch.compile artifacts on the volume, so build workers reuse the bench's
+# compiled kernels (keys include the GPU arch / torch version). Concurrency:
+# several containers may write the same cache entry; inductor and triton
+# write entries atomically (tmp file + rename) with deterministic content,
+# so last-write-wins is harmless, and their file locks are only
+# container-local (each container sees its own view until a commit).
 CONTAINER_ENV = {
     "HF_HOME": VOL_HF,
     "HF_XET_CACHE": "/tmp/hf_xet",   # keep xet chunk caches off the volume
     "PYTHONUNBUFFERED": "1",
+    "TORCHINDUCTOR_CACHE_DIR": VOL_INDUCTOR,
+    "TRITON_CACHE_DIR": f"{VOL_INDUCTOR}/triton",
 }
 
 # upload: fnmatch patterns on the path relative to /vol/krea2 (same semantics
@@ -194,6 +218,23 @@ def parse_gpus(s):
     return out
 
 
+def parse_impls(s):
+    """'ref, 2d' -> ['ref', '2d'] (validated against VAE_IMPLS, de-duplicated)."""
+    out = []
+    for i in str(s).split(","):
+        i = i.strip()
+        if not i:
+            continue
+        if i not in VAE_IMPLS:
+            raise SystemExit(f"unknown VAE impl {i!r} (known: "
+                             f"{', '.join(VAE_IMPLS)})")
+        if i not in out:
+            out.append(i)
+    if not out:
+        raise SystemExit(f"--impls is empty: {s!r}")
+    return out
+
+
 def cores_needed(img_s, decode_img_s_per_thread):
     """Physical cores that keep the GPU fed: 1.5x the decode threads needed
     for img_s, +1 for the main/download thread, at least 4."""
@@ -216,10 +257,39 @@ def best_of(ladder):
             "best_peak_gib": b.get("peak_gib")}
 
 
+def flatten_results(results):
+    """bench_gpu results (one per GPU, {"impls": {impl: {...}}}) -> one
+    entry per (gpu, impl) with the GPU-level fields (device, decode rate)
+    and the impl's check / ladder / best_*. The entry's "error" is the GPU's
+    error, else the impl's, else a failed correctness check (such impls are
+    never costed). A result without "impls" is one entry: its own "impl",
+    else "-" when it failed (the container died before the impls ran), else
+    "ref" (a single-impl result)."""
+    out = []
+    for res in results:
+        base = {k: v for k, v in res.items() if k != "impls"}
+        impls = res.get("impls")
+        if not impls:
+            out.append({**base, "impl": res.get("impl") or (
+                "-" if res.get("error") else "ref")})
+            continue
+        for impl, r in impls.items():
+            e = {**base, **r, "impl": impl}
+            check = r.get("check") or {}
+            err = res.get("error") or r.get("error") or check.get("error")
+            if not err and check.get("ok") is False:
+                err = (f"correctness FAILED: fp32 mean max rel "
+                       f"{check.get('fp32_mean_max_rel'):.2e} >= {CHECK_TOL:g}")
+            e["error"] = err
+            out.append(e)
+    return out
+
+
 def cost_row(res, n_images=N_IMAGES, overhead_min=DEFAULT_OVERHEAD_MIN,
              containers=CONTAINER_COUNTS, mem_gib=MEM_GIB):
-    """One bench_gpu result -> cost row, or None when it has no usable
-    measurement (error, no successful batch, no decode rate).
+    """One (gpu, impl) bench entry (flatten_results) -> cost row, or None
+    when it has no usable measurement (error incl. a failed correctness
+    check, no successful batch, no decode rate).
 
     usd_per_1k = hourly / (img_s * 3600) * 1000; for k containers the
     projection is wall = N / img_s / 3600 / k + overhead and usd = hourly *
@@ -231,9 +301,15 @@ def cost_row(res, n_images=N_IMAGES, overhead_min=DEFAULT_OVERHEAD_MIN,
     hourly = hourly_usd(res["gpu_requested"], cores, mem_gib)
     hours = n_images / img_s / 3600
     over = overhead_min / 60
+    check = res.get("check") or {}
     return {
-        "gpu": res["gpu_requested"], "device_name": res.get("device_name"),
+        "gpu": res["gpu_requested"], "impl": res.get("impl", "ref"),
+        "device_name": res.get("device_name"),
         "batch": res.get("best_batch"), "img_s": img_s,
+        "fp32_err": check.get("fp32_mean_max_rel"),
+        "bf16_err": check.get("bf16_mean_max_rel"),
+        "compile_s": check.get("first_call_s")
+        if res.get("impl") == "2d-compile" else None,
         "peak_gib": res.get("best_peak_gib"), "decode": dec, "cores": cores,
         "usd_h": hourly, "usd_per_1k": hourly / (img_s * 3600) * 1000,
         "hours_1": hours, "overhead_h": over,
@@ -244,7 +320,8 @@ def cost_row(res, n_images=N_IMAGES, overhead_min=DEFAULT_OVERHEAD_MIN,
 
 def select_gpu(rows, tie_frac=TIE_FRAC):
     """Lowest $/img wins; every row within tie_frac of the lowest is a tie,
-    broken by the higher img/s. None rows (failed GPUs) are ignored."""
+    broken by the higher img/s. Rows are (gpu, impl); None rows (failed GPUs
+    or impls, incl. a failed correctness check) are ignored."""
     ok = [r for r in rows if r is not None]
     if not ok:
         return None
@@ -275,7 +352,7 @@ def build_command(row, containers=DEFAULT_CONTAINERS):
     return (f"modal run --detach scripts/modal_cache_latents.py --build "
             f"--gpu {row['gpu']} --containers {k} "
             f"--batch {row['batch']} --cpu {row['cores']} "
-            f"--worker-timeout-h {t}")
+            f"--worker-timeout-h {t} --vae-impl {row.get('impl', 'ref')}")
 
 
 def _ladder_str(ladder):
@@ -289,60 +366,74 @@ def _err_line(err):
     return lines[-1].strip() if lines else "?"
 
 
+def _fmt(x, spec, none="-"):
+    return none if x is None else format(x, spec)
+
+
 def render_bench_report(results, rows, choice, prep=None,
                         overhead_min=DEFAULT_OVERHEAD_MIN,
                         containers=CONTAINER_COUNTS, n_images=N_IMAGES):
-    """Markdown report: cost table, failed GPU types, the choice and the
-    exact build command."""
+    """Markdown report over (gpu, impl) rows: cost table, failed GPU types /
+    impls, the choice and the exact build command. `results` are the raw
+    bench_gpu results, `rows` the cost_row of each flatten_results entry."""
+    entries = flatten_results(results)
     out = [f"# VAE latent cache: Modal GPU bench ({time.strftime('%Y-%m-%d %H:%M')})",
            "",
            f"Bucket {BENCH_BUCKET[0]}x{BENCH_BUCKET[1]}, {n_images} images, "
            f"prices of {PRICES_DATE} (cpu ${CPU_CORE_USD_H}/core-h, memory "
            f"{MEM_GIB} GiB at ${MEM_GIB_USD_H}/GiB-h), {overhead_min:g} min "
            "startup + VAE load per container. cores = max(4, ceil(1.5 * "
-           "img/s / decode img/s/thread) + 1).", ""]
+           "img/s / decode img/s/thread) + 1). fp32/bf16 err = max |impl - "
+           "ref fp32| / max |ref fp32| of the posterior mean on "
+           f"{CHECK_IMAGES} real images (an impl needs fp32 err < "
+           f"{CHECK_TOL:g}); compile s = first bf16 call of 2d-compile.", ""]
     if prep:
         out += [f"HF token: user {prep.get('whoami')!r}, can write "
                 f"{prep.get('can_write')} ({prep.get('write_reason')})", ""]
-    head = ["gpu", "device", "batch", "img/s", "peak GiB", "decode img/s/thr",
-            "cores", "$/h", "$/1k img"]
+    head = ["gpu", "impl", "device", "batch", "img/s", "peak GiB",
+            "decode img/s/thr", "cores", "$/h", "$/1k img"]
     for k in containers:
         head += [f"{k} ctr $", f"{k} ctr wall h"]
-    head.append("ladder (batch:img/s)")
+    head += ["fp32 err", "bf16 err", "compile s", "ladder (batch:img/s)"]
     out += ["| " + " | ".join(head) + " |",
             "|" + "---|" * len(head)]
-    by_gpu = {r["gpu"]: r for r in rows if r is not None}
-    ordered = sorted(by_gpu.values(), key=lambda r: r["usd_per_1k"])
-    ladders = {res["gpu_requested"]: res.get("ladder") for res in results}
+    ok = [r for r in rows if r is not None]
+    keys = {(r["gpu"], r["impl"]) for r in ok}
+    ordered = sorted(ok, key=lambda r: r["usd_per_1k"])
+    ladders = {(e["gpu_requested"], e["impl"]): e.get("ladder")
+               for e in entries}
     for r in ordered:
-        peak = "-" if r["peak_gib"] is None else f"{r['peak_gib']:.1f}"
-        cells = [r["gpu"], str(r["device_name"]), str(r["batch"]),
-                 f"{r['img_s']:.2f}", peak, f"{r['decode']:.2f}",
-                 str(r["cores"]), f"{r['usd_h']:.2f}",
+        cells = [r["gpu"], r["impl"], str(r["device_name"]), str(r["batch"]),
+                 f"{r['img_s']:.2f}", _fmt(r["peak_gib"], ".1f"),
+                 f"{r['decode']:.2f}", str(r["cores"]), f"{r['usd_h']:.2f}",
                  f"{r['usd_per_1k']:.4f}"]
         for k in containers:
             p = r["proj"][k]
             cells += [f"{p['usd']:.2f}", f"{p['wall_h']:.2f}"]
-        cells.append(_ladder_str(ladders.get(r["gpu"])))
+        cells += [_fmt(r.get("fp32_err"), ".1e"), _fmt(r.get("bf16_err"), ".1e"),
+                  _fmt(r.get("compile_s"), ".0f"),
+                  _ladder_str(ladders.get((r["gpu"], r["impl"])))]
         out.append("| " + " | ".join(cells) + " |")
-    failed = [res for res in results if res["gpu_requested"] not in by_gpu]
+    failed = [e for e in entries
+              if (e["gpu_requested"], e["impl"]) not in keys]
     if failed:
         out += ["", "Not usable:"]
-        for res in failed:
-            why = (_err_line(res["error"]) if res.get("error")
+        for e in failed:
+            why = (_err_line(e["error"]) if e.get("error")
                    else "no successful batch / decode rate")
-            out.append(f"- {res['gpu_requested']} "
-                       f"({res.get('device_name', '-')}): {why}"
-                       + (f" [ladder {_ladder_str(res.get('ladder'))}]"
-                          if res.get("ladder") else ""))
+            out.append(f"- {e['gpu_requested']} {e['impl']} "
+                       f"({e.get('device_name', '-')}): {why}"
+                       + (f" [ladder {_ladder_str(e.get('ladder'))}]"
+                          if e.get("ladder") else ""))
     out.append("")
     if choice is None:
-        out.append("**No GPU type produced a usable measurement.**")
+        out.append("**No (GPU, impl) produced a usable measurement.**")
     else:
-        lo = min(r["usd_per_1k"] for r in by_gpu.values())
-        ties = [r["gpu"] for r in ordered
+        lo = min(r["usd_per_1k"] for r in ok)
+        ties = [f"{r['gpu']}/{r['impl']}" for r in ordered
                 if r["usd_per_1k"] <= lo * (1 + TIE_FRAC)]
-        out += [f"**Chosen: {choice['gpu']}** ({choice['device_name']}): "
+        out += [f"**Chosen: {choice['gpu']} / {choice['impl']}** "
+                f"({choice['device_name']}): "
                 f"${choice['usd_per_1k']:.4f}/1k img, {choice['img_s']:.2f} "
                 f"img/s at batch {choice['batch']}, {choice['cores']} cores. "
                 f"Lowest $/1k img {lo:.4f}; within {TIE_FRAC:.0%}: "
@@ -427,12 +518,12 @@ def token_can_write(whoami, owner=OUT_OWNER):
 
 # ------------------------------------------------------------- build helpers
 def worker_cmd(i, n, batch, decode_threads, python="python", out=VOL_OUT,
-               dl_root=REMOTE_DL):
+               dl_root=REMOTE_DL, vae_impl="ref"):
     """cache_latents.py command of build worker i of n (run from the repo)."""
     return [python, "scripts/cache_latents.py", "--out", out,
             "--num-workers", str(n), "--worker-index", str(i),
             "--batch", str(batch), "--decode-threads", str(decode_threads),
-            "--download-dir", f"{dl_root}/w{i}"]
+            "--download-dir", f"{dl_root}/w{i}", "--vae-impl", vae_impl]
 
 
 def worker_env(base):
@@ -655,6 +746,7 @@ def _run_ladder(torch, encode, imgs, batches, want_chw, cuda, min_images,
             if cuda is not None:
                 cuda.empty_cache()
                 cuda.reset_peak_memory_stats()
+            t_w = time.perf_counter()
             lat = encode(nxt()).to(torch.bfloat16).cpu()  # warmup
             want = (b, *want_chw)
             if tuple(lat.shape) != want:
@@ -663,6 +755,7 @@ def _run_ladder(torch, encode, imgs, batches, want_chw, cuda, min_images,
                 raise ValueError("non-finite latents")
             if cuda is not None:
                 cuda.synchronize()
+            warmup_s = time.perf_counter() - t_w
             n_img, t0 = 0, time.perf_counter()
             while True:
                 encode(nxt()).to(torch.bfloat16).cpu()
@@ -674,7 +767,7 @@ def _run_ladder(torch, encode, imgs, batches, want_chw, cuda, min_images,
                 cuda.synchronize()
             dt = time.perf_counter() - t0
             row = {"batch": b, "img_s": n_img / dt, "images": n_img,
-                   "seconds": dt}
+                   "seconds": dt, "warmup_s": warmup_s}
             if cuda is not None:
                 row["peak_gib"] = cuda.max_memory_allocated() / 2**30
         except Exception as e:  # noqa: BLE001 - an error row, never a crash
@@ -695,9 +788,84 @@ def import_cache_latents(repo=REMOTE_REPO):
     return cache_latents
 
 
-def bench_gpu_impl(gpu_requested, n_decode):
+def max_rel(a, b):
+    """max |a - b| / max |b| (as float32)."""
+    a, b = a.float(), b.float()
+    return ((a - b).abs().max() / b.abs().max()).item()
+
+
+def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
+    """Correctness of each impl against the diffusers reference on images x
+    (N, 3, H, W): fp32 first (VAE cast to fp32, TF32 off so cuDNN/cuBLAS
+    really compute in fp32), then at the VAE's own (production) dtype.
+    -> (checks {impl: {fp32_mean_max_rel, fp32_std_max_rel,
+    bf16_mean_max_rel (production dtype vs fp32 ref), first_call_s, ok
+    [, error]}}, encoders {impl: FastEncoder at the production dtype} for the
+    impls that passed). first_call_s of 2d-compile is its compile time."""
+    import torch
+    import vae_fast
+
+    def sync():
+        if cuda is not None:
+            cuda.synchronize()
+
+    checks = {i: {} for i in impls}
+    dtype0 = vae.dtype
+    tf32 = (torch.backends.cudnn.allow_tf32,
+            torch.backends.cuda.matmul.allow_tf32)
+    try:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        vae.to_dtype(torch.float32)
+        m_ref, s_ref = vae_fast.make_encoder(vae, "ref").dist(x)
+        for impl in impls:
+            c = checks[impl]
+            if impl == "ref":
+                c.update(fp32_mean_max_rel=0.0, fp32_std_max_rel=0.0)
+                continue
+            try:
+                m, s = vae_fast.make_encoder(vae, impl).dist(x)
+                c.update(fp32_mean_max_rel=max_rel(m, m_ref),
+                         fp32_std_max_rel=max_rel(s, s_ref))
+            except Exception:  # noqa: BLE001
+                c["error"] = traceback.format_exc()[-3000:]
+    finally:
+        torch.backends.cudnn.allow_tf32, \
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+        vae.to_dtype(dtype0)
+    encoders = {}
+    for impl in impls:
+        c = checks[impl]
+        if "error" in c:
+            c["ok"] = False
+            log(f"check {impl}: ERROR {_err_line(c['error'])}")
+            continue
+        c["ok"] = c["fp32_mean_max_rel"] < tol
+        try:
+            enc = vae_fast.make_encoder(vae, impl)
+            sync()
+            t0 = time.perf_counter()
+            m, _ = enc.dist(x)
+            sync()
+            c["first_call_s"] = time.perf_counter() - t0
+            c["bf16_mean_max_rel"] = max_rel(m, m_ref)
+        except Exception:  # noqa: BLE001
+            c.update(ok=False, error=traceback.format_exc()[-3000:])
+        log(f"check {impl}: fp32 mean max rel "
+            f"{c.get('fp32_mean_max_rel', float('nan')):.2e} (std "
+            f"{c.get('fp32_std_max_rel', float('nan')):.2e}), {dtype0} "
+            f"{c.get('bf16_mean_max_rel', float('nan')):.2e}, first call "
+            f"{c.get('first_call_s', float('nan')):.1f}s -> "
+            + ("ok" if c["ok"] else "FAILED"))
+        if c["ok"]:
+            encoders[impl] = enc
+    return checks, encoders
+
+
+def bench_gpu_impl(gpu_requested, n_decode, impls=VAE_IMPLS):
     """Runs in the bench container. Never raises: failures end up in
-    res["error"] (with whatever was measured before)."""
+    res["error"] / res["impls"][impl]["error"] (with whatever was measured
+    before)."""
     res = {"gpu_requested": gpu_requested}
     t_start = time.time()
     try:
@@ -739,12 +907,30 @@ def bench_gpu_impl(gpu_requested, n_decode):
         t0 = time.perf_counter()
         vae = VaeEncoder(VAE_REPO, "cuda", torch.bfloat16)
         res["vae_load_s"] = time.perf_counter() - t0
-        # timed with 1 CPU thread, like production (run_ladder intra_threads)
-        res["ladder"] = run_ladder(
-            lambda x: cl.vae_encode_batch(vae, x), imgs, LADDER,
-            (LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE), cuda=torch.cuda,
-            intra_threads=1)
-        res.update(best_of(res["ladder"]))
+        # correctness on real images first; failed impls are skipped
+        checks, encoders = check_impls(
+            vae, list(impls), torch.stack(imgs[:CHECK_IMAGES]),
+            cuda=torch.cuda)
+        res["impls"] = {i: {"check": checks[i]} for i in impls}
+        for impl in impls:
+            r = res["impls"][impl]
+            if impl not in encoders:
+                continue
+            # production setting: the 2d impls turn cudnn.benchmark on
+            # (vae_fast), the reference path never does
+            torch.backends.cudnn.benchmark = impl != "ref"
+            print(f"--- ladder {impl}", flush=True)
+            try:
+                # timed with 1 CPU thread, like production (intra_threads)
+                r["ladder"] = run_ladder(
+                    encoders.pop(impl), imgs, LADDER,
+                    (LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE),
+                    cuda=torch.cuda, intra_threads=1)
+                r.update(best_of(r["ladder"]))
+            except Exception:  # noqa: BLE001
+                r["error"] = traceback.format_exc()[-4000:]
+                print(r["error"], flush=True)
+            torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001
         res["error"] = traceback.format_exc()[-4000:]
         print(res["error"], flush=True)
@@ -796,14 +982,15 @@ def gpu_name_smi():
         return f"n/a ({e})"
 
 
-def build_worker_impl(i, n, batch, decode_threads, vol):
+def build_worker_impl(i, n, batch, decode_threads, vol, vae_impl="ref"):
     """One cache_latents.py worker; the volume is committed after every
     finished shard (explicitly, on top of Modal's background commits, so a
     killed container loses at most its in-flight shard) and at the end."""
     setup_hf_token()
     env = worker_env(os.environ)
     res = {"worker": i, "device_name": gpu_name_smi()}
-    cmd = worker_cmd(i, n, batch, decode_threads, python=sys.executable)
+    cmd = worker_cmd(i, n, batch, decode_threads, python=sys.executable,
+                     vae_impl=vae_impl)
     print(f"w{i}/{n} on {res['device_name']}: $ {' '.join(cmd)}", flush=True)
     t0 = time.time()
     try:
@@ -957,6 +1144,9 @@ def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
 if modal is not None:
     image = (
         modal.Image.debian_slim(python_version="3.12")
+        # torch.compile: triton builds its launcher stubs with a C compiler
+        # at runtime (inductor's CPU codegen needs one too)
+        .apt_install("build-essential")
         .pip_install(TORCH_PIN, extra_index_url=TORCH_INDEX)
         .pip_install(*PIP_PACKAGES)
         .env(CONTAINER_ENV)
@@ -979,15 +1169,18 @@ if modal is not None:
 
     # gpu is always overridden per call with .with_options(gpu=...)
     @app.function(gpu="L4", cpu=float(BENCH_CPU), memory=MEM_MB,
-                  timeout=20 * 60, **mounts)
-    def bench_gpu(gpu_requested: str, n_decode: int) -> dict:
-        return bench_gpu_impl(gpu_requested, n_decode)
+                  timeout=BENCH_TIMEOUT_S, **mounts)
+    def bench_gpu(gpu_requested: str, n_decode: int, impls: list) -> dict:
+        res = bench_gpu_impl(gpu_requested, n_decode, impls)
+        commit_volume(vol)   # the compile cache (/vol/inductor) for workers
+        return res
 
     # gpu, cpu and timeout are always overridden per build with .with_options
     @app.function(gpu="L4", cpu=8.0, memory=MEM_MB,
                   timeout=DEFAULT_WORKER_TIMEOUT_H * 3600, **mounts)
-    def build_worker(i: int, n: int, batch: int, decode_threads: int) -> dict:
-        return build_worker_impl(i, n, batch, decode_threads, vol)
+    def build_worker(i: int, n: int, batch: int, decode_threads: int,
+                     vae_impl: str = "ref") -> dict:
+        return build_worker_impl(i, n, batch, decode_threads, vol, vae_impl)
 
     @app.function(cpu=4.0, memory=16384, timeout=2 * 3600, **mounts)
     def finalize(reset_upload_cache: bool = False) -> dict:
@@ -998,8 +1191,9 @@ if modal is not None:
               f"{p.get('token_env')}), can write {p.get('can_write')} "
               f"({p.get('write_reason')})")
 
-    def bench_local(gpus, n_decode, overhead_min):
+    def bench_local(gpus, n_decode, overhead_min, impls):
         gl = parse_gpus(gpus)
+        il = parse_impls(impls)
         if n_decode < DECODE_TIMING_N:
             raise SystemExit(f"--n-decode must be >= {DECODE_TIMING_N}")
         p = prep.remote(True)
@@ -1009,10 +1203,11 @@ if modal is not None:
             try:
                 fn = bench_gpu.with_options(gpu=g, cpu=float(BENCH_CPU),
                                             memory=MEM_MB)
-                calls.append((g, fn.spawn(g, n_decode)))
+                calls.append((g, fn.spawn(g, n_decode, il)))
             except Exception as e:  # noqa: BLE001
                 calls.append((g, e))
-        print(f"spawned {len(calls)} bench containers: {', '.join(gl)}")
+        print(f"spawned {len(calls)} bench containers: {', '.join(gl)} "
+              f"(impls {', '.join(il)})")
         deadline = time.time() + BENCH_WAIT_S
         results = []
         for g, c in calls:
@@ -1029,12 +1224,14 @@ if modal is not None:
                     c.cancel()
                 except Exception:  # noqa: BLE001
                     pass
-            print(f"{g}: " + (f"ERROR {_err_line(r['error'])}"
-                              if r.get("error") else
-                              f"{r.get('device_name')} "
-                              f"best {r.get('best_img_s', 0):.2f} img/s"))
+            for e in flatten_results([r]):
+                print(f"{g} {e['impl']}: " + (
+                    f"ERROR {_err_line(e['error'])}" if e.get("error") else
+                    f"{e.get('device_name')} best "
+                    f"{e.get('best_img_s') or 0:.2f} img/s"))
             results.append(r)
-        rows = [cost_row(r, overhead_min=overhead_min) for r in results]
+        rows = [cost_row(e, overhead_min=overhead_min)
+                for e in flatten_results(results)]
         choice = select_gpu(rows)
         md = render_bench_report(results, rows, choice, prep=p,
                                  overhead_min=overhead_min)
@@ -1057,7 +1254,7 @@ if modal is not None:
             raise SystemExit(f"finalize FAILED: {reason} (log: {path})")
 
     def build_local(gpu, containers, batch, cpu, decode_threads,
-                    worker_timeout_h, reset_upload_cache):
+                    worker_timeout_h, reset_upload_cache, vae_impl):
         gpu = gpu.strip().upper()
         if not gpu:
             raise SystemExit("--build needs --gpu (see the bench report)")
@@ -1067,8 +1264,10 @@ if modal is not None:
         if not 0 < worker_timeout_h <= MAX_WORKER_TIMEOUT_H:
             raise SystemExit(f"--worker-timeout-h must be in (0, "
                              f"{MAX_WORKER_TIMEOUT_H}]")
+        parse_impls(vae_impl)
         threads = decode_threads or cpu
-        params = {"gpu": gpu, "containers": containers, "batch": batch,
+        params = {"gpu": gpu, "vae_impl": vae_impl, "containers": containers,
+                  "batch": batch,
                   "cpu": cpu, "decode_threads": threads,
                   "worker_timeout_h": worker_timeout_h,
                   "reset_upload_cache": reset_upload_cache}
@@ -1080,7 +1279,7 @@ if modal is not None:
         fn = build_worker.with_options(
             gpu=gpu, cpu=float(cpu), memory=MEM_MB,
             timeout=int(worker_timeout_h * 3600))
-        calls = [fn.spawn(i, containers, batch, threads)
+        calls = [fn.spawn(i, containers, batch, threads, vae_impl)
                  for i in range(containers)]
         print(f"spawned {containers} workers on {gpu}: {params}")
         workers = []
@@ -1110,7 +1309,8 @@ if modal is not None:
              gpu: str = "", containers: int = DEFAULT_CONTAINERS,
              batch: int = 8, cpu: int = 8, decode_threads: int = 0,
              worker_timeout_h: float = DEFAULT_WORKER_TIMEOUT_H,
-             reset_upload_cache: bool = False):
+             reset_upload_cache: bool = False,
+             impls: str = DEFAULT_IMPLS, vae_impl: str = "ref"):
         modes = [m for m, on in (("--bench", bench), ("--build", build),
                                  ("--finalize-only", finalize_only)) if on]
         if len(modes) != 1:
@@ -1120,10 +1320,10 @@ if modal is not None:
             raise SystemExit("--reset-upload-cache goes with --build or "
                              "--finalize-only")
         if bench:
-            bench_local(gpus, n_decode, overhead_min)
+            bench_local(gpus, n_decode, overhead_min, impls)
         elif build:
             build_local(gpu, containers, batch, cpu, decode_threads,
-                        worker_timeout_h, reset_upload_cache)
+                        worker_timeout_h, reset_upload_cache, vae_impl)
         else:
             fin = finalize.remote(reset_upload_cache=reset_upload_cache)
             path = _write_build_log(
