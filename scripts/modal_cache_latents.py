@@ -7,6 +7,7 @@ upload it to a private HF dataset repo the training node can `hf download`.
     modal run --detach scripts/modal_cache_latents.py --build --gpu B200 \\
         --containers 4 --batch 16 --cpu 12 --worker-timeout-h 4
     modal run scripts/modal_cache_latents.py --finalize-only          # manifest + upload again
+    modal run scripts/modal_cache_latents.py --finalize-only --reset-upload-cache
 
 Mode 1 (--bench): `prep` (CPU) puts metadata.parquet + data/train-0000.tar of
 ricecake/danbooru-curated-v2 into /vol/bench and the Qwen-Image VAE into
@@ -37,7 +38,9 @@ file (shard LFS sha256 == manifest digest; parquet/manifest sha256 or git
 blob id == local). A failed worker stops before finalize. Everything is
 resumable: cache_latents skips finished shards, --write-manifest re-verifies
 the digests, upload_large_folder resumes from its state in
-/vol/krea2/.cache. The orchestration runs in the local entrypoint, so if the
+/vol/krea2/.cache/huggingface (--reset-upload-cache deletes that state
+first, e.g. after a failed remote content check: everything is re-hashed
+and re-sent). The orchestration runs in the local entrypoint, so if the
 laptop disconnects during a --detach run the workers finish but finalize
 does not start: re-run with --finalize-only (or --build, which skips the
 done shards). Never start a second --build while one is still running (two
@@ -64,6 +67,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -256,11 +260,22 @@ def worker_timeout_h(row, containers=DEFAULT_CONTAINERS):
     return max(1, math.ceil(1.5 * per_worker + 0.5))
 
 
+def build_plan(row, containers=DEFAULT_CONTAINERS):
+    """-> (containers, worker timeout h): `containers` unless a worker would
+    need more than Modal's MAX_WORKER_TIMEOUT_H; then the smallest count
+    whose worker_timeout_h fits (the timeout is capped there)."""
+    k = containers
+    while worker_timeout_h(row, k) > MAX_WORKER_TIMEOUT_H:
+        k += 1
+    return k, min(worker_timeout_h(row, k), MAX_WORKER_TIMEOUT_H)
+
+
 def build_command(row, containers=DEFAULT_CONTAINERS):
+    k, t = build_plan(row, containers)
     return (f"modal run --detach scripts/modal_cache_latents.py --build "
-            f"--gpu {row['gpu']} --containers {containers} "
+            f"--gpu {row['gpu']} --containers {k} "
             f"--batch {row['batch']} --cpu {row['cores']} "
-            f"--worker-timeout-h {worker_timeout_h(row, containers)}")
+            f"--worker-timeout-h {t}")
 
 
 def _ladder_str(ladder):
@@ -333,6 +348,12 @@ def render_bench_report(results, rows, choice, prep=None,
                 f"Lowest $/1k img {lo:.4f}; within {TIE_FRAC:.0%}: "
                 f"{', '.join(ties)} (tie -> highest img/s).", "",
                 "Build:", "", "    " + build_command(choice)]
+        k, t = build_plan(choice)
+        if k != DEFAULT_CONTAINERS:
+            out += ["", f"(--containers raised from {DEFAULT_CONTAINERS} to "
+                    f"{k}: with {DEFAULT_CONTAINERS} a worker would need "
+                    f"{worker_timeout_h(choice)} h > Modal's "
+                    f"{MAX_WORKER_TIMEOUT_H} h cap; now {t} h each)"]
     return "\n".join(out)
 
 
@@ -593,16 +614,34 @@ def is_oom(e):
 
 
 def run_ladder(encode, imgs, batches, want_chw, cuda=None,
-               min_images=MIN_IMAGES, min_seconds=MIN_SECONDS, log=print):
+               min_images=MIN_IMAGES, min_seconds=MIN_SECONDS, log=print,
+               intra_threads=1):
     """Throughput of `encode` over `imgs` (list of (3, H, W) CPU float32)
     per batch size: 1 warmup batch (shape + finiteness checked), then a
     timed loop of >= max(min_images, 3 batches) images and >= min_seconds,
     cycling over imgs. Each batch is stacked on the CPU and the latents come
     back as bf16 CPU tensors (as in cache_latents.encode_samples). `cuda` =
     torch.cuda (peak memory + synchronize) or None. Stops at the first
-    failure; an OOM is recorded as error "OOM"."""
+    failure; an OOM is recorded as error "OOM". Runs with `intra_threads`
+    torch CPU threads (restored afterwards; None = unchanged): 1 matches the
+    build workers' OMP_NUM_THREADS=1 (worker_env), which also covers the CPU
+    torch.stack timed here."""
     import torch
 
+    if intra_threads is None:
+        return _run_ladder(torch, encode, imgs, batches, want_chw, cuda,
+                           min_images, min_seconds, log)
+    prev = torch.get_num_threads()
+    torch.set_num_threads(intra_threads)
+    try:
+        return _run_ladder(torch, encode, imgs, batches, want_chw, cuda,
+                           min_images, min_seconds, log)
+    finally:
+        torch.set_num_threads(prev)
+
+
+def _run_ladder(torch, encode, imgs, batches, want_chw, cuda, min_images,
+                min_seconds, log):
     rows, n = [], len(imgs)
     for b in batches:
         k = 0
@@ -693,15 +732,18 @@ def bench_gpu_impl(gpu_requested, n_decode):
                                               / (time.perf_counter() - t0))
         finally:
             torch.set_num_threads(n_threads)
+        # bench setup only (not timed): default threads
         with ThreadPoolExecutor(DECODE_POOL) as pool:
             imgs = [d[0] for d in pool.map(cl.decode, samples)]
         res["n_decoded"] = len(imgs)
         t0 = time.perf_counter()
         vae = VaeEncoder(VAE_REPO, "cuda", torch.bfloat16)
         res["vae_load_s"] = time.perf_counter() - t0
+        # timed with 1 CPU thread, like production (run_ladder intra_threads)
         res["ladder"] = run_ladder(
             lambda x: cl.vae_encode_batch(vae, x), imgs, LADDER,
-            (LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE), cuda=torch.cuda)
+            (LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE), cuda=torch.cuda,
+            intra_threads=1)
         res.update(best_of(res["ladder"]))
     except Exception:  # noqa: BLE001
         res["error"] = traceback.format_exc()[-4000:]
@@ -783,18 +825,34 @@ class NotPrivateError(Exception):
     pass
 
 
-UPLOAD_CACHE = f"{VOL_OUT}/.cache/huggingface/upload"
+UPLOAD_STATE = ".cache/huggingface"   # upload_large_folder state, under out
 CONTENT_HELP = (
     "remote content check FAILED for {n} file(s) in " + OUT_REPO + " (see "
-    "problems). Delete the stale file(s) on the Hub, or the local upload "
-    f"cache {UPLOAD_CACHE} (so upload_large_folder re-hashes and re-sends), "
-    "then re-run --finalize-only.")
+    "problems). Delete the stale file(s) on the Hub AND re-run with "
+    "`--finalize-only --reset-upload-cache` (drops the upload_large_folder "
+    f"state {VOL_OUT}/{UPLOAD_STATE}, so every file is re-hashed and "
+    "re-sent).")
+
+
+def reset_upload_state(out_dir, vol, log=print):
+    """Remove <out_dir>/.cache/huggingface (upload_large_folder's record of
+    what was already uploaded) and commit the volume. -> True if removed."""
+    d = Path(out_dir) / UPLOAD_STATE
+    existed = d.exists()
+    shutil.rmtree(d, ignore_errors=True)
+    if d.exists():
+        raise RuntimeError(f"could not remove {d}")
+    commit_volume(vol, log)
+    log(f"--reset-upload-cache: {'removed' if existed else 'no'} {d}")
+    return existed
 
 
 def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
-                  python=sys.executable, cwd=REMOTE_REPO):
+                  python=sys.executable, cwd=REMOTE_REPO,
+                  reset_upload_cache=False):
     """HF write check + repo creation + privacy check, --write-manifest,
-    upload, remote content check. `api` (an HfApi; default: one with the
+    (--reset-upload-cache: drop the upload state), upload, remote content
+    check. `api` (an HfApi; default: one with the
     secret's token) and `runner` (subprocess.run signature) are injectable
     for tests. Never raises: -> {ok, repo, error, problems, n_files, bytes,
     revision, log}."""
@@ -856,6 +914,8 @@ def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
         if not commit_volume(vol, say):
             say("continuing: the manifest is on the container's mount")
         # 3. upload (resumable; its state lives in /vol/krea2/.cache)
+        if reset_upload_cache:
+            reset_upload_state(out_dir, vol, say)
         t0 = time.time()
         api.upload_large_folder(OUT_REPO, str(out_dir), repo_type="dataset",
                                 private=True, ignore_patterns=UPLOAD_IGNORE,
@@ -930,8 +990,8 @@ if modal is not None:
         return build_worker_impl(i, n, batch, decode_threads, vol)
 
     @app.function(cpu=4.0, memory=16384, timeout=2 * 3600, **mounts)
-    def finalize() -> dict:
-        return finalize_impl(vol)
+    def finalize(reset_upload_cache: bool = False) -> dict:
+        return finalize_impl(vol, reset_upload_cache=reset_upload_cache)
 
     def _print_prep(p):
         print(f"prep: HF user {p.get('whoami')!r} (token from "
@@ -997,7 +1057,7 @@ if modal is not None:
             raise SystemExit(f"finalize FAILED: {reason} (log: {path})")
 
     def build_local(gpu, containers, batch, cpu, decode_threads,
-                    worker_timeout_h):
+                    worker_timeout_h, reset_upload_cache):
         gpu = gpu.strip().upper()
         if not gpu:
             raise SystemExit("--build needs --gpu (see the bench report)")
@@ -1010,7 +1070,8 @@ if modal is not None:
         threads = decode_threads or cpu
         params = {"gpu": gpu, "containers": containers, "batch": batch,
                   "cpu": cpu, "decode_threads": threads,
-                  "worker_timeout_h": worker_timeout_h}
+                  "worker_timeout_h": worker_timeout_h,
+                  "reset_upload_cache": reset_upload_cache}
         p = prep.remote(False)   # VAE once, before N workers would race on it
         _print_prep(p)
         if p.get("can_write") is False:
@@ -1032,7 +1093,8 @@ if modal is not None:
             print(summarize_workers([w])[1][0])
             workers.append(w)
         ok, _ = summarize_workers(workers)
-        fin = finalize.remote() if ok else None
+        fin = (finalize.remote(reset_upload_cache=reset_upload_cache)
+               if ok else None)
         path = _write_build_log(params, p, workers, fin)
         if not ok:
             raise SystemExit(f"build FAILED: a worker failed, finalize not "
@@ -1047,18 +1109,24 @@ if modal is not None:
              build: bool = False, finalize_only: bool = False,
              gpu: str = "", containers: int = DEFAULT_CONTAINERS,
              batch: int = 8, cpu: int = 8, decode_threads: int = 0,
-             worker_timeout_h: float = DEFAULT_WORKER_TIMEOUT_H):
+             worker_timeout_h: float = DEFAULT_WORKER_TIMEOUT_H,
+             reset_upload_cache: bool = False):
         modes = [m for m, on in (("--bench", bench), ("--build", build),
                                  ("--finalize-only", finalize_only)) if on]
         if len(modes) != 1:
             raise SystemExit("choose exactly one of --bench, --build, "
                              f"--finalize-only (got {modes or 'none'})")
+        if bench and reset_upload_cache:
+            raise SystemExit("--reset-upload-cache goes with --build or "
+                             "--finalize-only")
         if bench:
             bench_local(gpus, n_decode, overhead_min)
         elif build:
             build_local(gpu, containers, batch, cpu, decode_threads,
-                        worker_timeout_h)
+                        worker_timeout_h, reset_upload_cache)
         else:
-            fin = finalize.remote()
-            path = _write_build_log({"finalize_only": True}, {}, [], fin)
+            fin = finalize.remote(reset_upload_cache=reset_upload_cache)
+            path = _write_build_log(
+                {"finalize_only": True,
+                 "reset_upload_cache": reset_upload_cache}, {}, [], fin)
             _check_finalize(fin, path)

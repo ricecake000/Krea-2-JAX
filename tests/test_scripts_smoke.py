@@ -548,6 +548,20 @@ def modal_cache_latents_flow():
     assert ("--build --gpu B200 --containers 4 --batch 16 --cpu 31 "
             "--worker-timeout-h 2") in md1, md1
     assert "**Chosen: L4**" in md and "8:2.00 16:OOM" in md, md
+    assert "--containers raised" not in md1, md1
+    # Modal's 24 h cap: at 0.3 img/s a worker of 4 needs 35 h, of 5 28 h,
+    # of 6 23 h -> 6 containers (89.67 h / 6 + 0.05 -> ceil(22.99) = 23)
+    slow = {"gpu_requested": "L4", "device_name": "NVIDIA L4",
+            "decode_img_s_per_thread": 1.0, "ladder": [
+                {"batch": 4, "img_s": 0.3, "peak_gib": 9.0}]}
+    slow.update(mcl.best_of(slow["ladder"]))
+    rows_s = [mcl.cost_row(slow)]
+    assert mcl.worker_timeout_h(rows_s[0]) == 35
+    assert mcl.build_plan(rows_s[0]) == (6, 23), mcl.build_plan(rows_s[0])
+    md_s = mcl.render_bench_report([slow], rows_s, mcl.select_gpu(rows_s))
+    assert "--containers 6 --batch 4 --cpu 4 --worker-timeout-h 23" in md_s
+    assert "--containers raised from 4 to 6" in md_s, md_s
+    assert mcl.build_plan(choice) == (4, 6)   # L4 at 2 img/s fits as is
     assert "- A10 " in md and "- B300 " in md and "no capacity" in md, md
 
     # ladder: stub encoder, OOM at batch 8 stops it, wrong shape -> error
@@ -555,15 +569,31 @@ def modal_cache_latents_flow():
         pass
     stub = __import__("cache_latents").StubEncoder()
 
+    seen_threads = []
+
     def enc(x):
+        seen_threads.append(torch.get_num_threads())
         if x.shape[0] >= 8:
             raise OutOfMemoryError("CUDA out of memory. Tried to allocate")
         return stub(x)
     imgs = [torch.rand(3, 64, 32) * 2 - 1 for _ in range(5)]
     quiet = contextlib.redirect_stdout(io.StringIO())
-    with quiet:
-        lad = mcl.run_ladder(enc, imgs, (2, 4, 8, 16), (16, 8, 4),
-                             min_images=4, min_seconds=0.0)
+    threads0 = torch.get_num_threads()
+    torch.set_num_threads(3)
+    try:
+        with quiet:
+            lad = mcl.run_ladder(enc, imgs, (2, 4, 8, 16), (16, 8, 4),
+                                 min_images=4, min_seconds=0.0)
+        # timed with 1 CPU thread (as the OMP_NUM_THREADS=1 build), restored
+        assert seen_threads and set(seen_threads) == {1}, seen_threads
+        assert torch.get_num_threads() == 3
+        seen_threads.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            mcl.run_ladder(enc, imgs, (2,), (16, 8, 4), min_images=2,
+                           min_seconds=0.0, intra_threads=None)
+        assert set(seen_threads) == {3}, seen_threads
+    finally:
+        torch.set_num_threads(threads0)
     assert [x["batch"] for x in lad] == [2, 4, 8], lad
     assert lad[2] == {"batch": 8, "error": "OOM"}, lad
     assert all(x["img_s"] > 0 and x["images"] >= max(4, 3 * x["batch"])
@@ -737,7 +767,8 @@ def modal_cache_latents_flow():
             "unverifiable latents/x.safetensors: no LFS sha256 on the remote",
             f"size metadata.parquet: remote {e['metadata.parquet']['size'] + 1}"
             f" != local {e['metadata.parquet']['size']}"], probs
-        assert "/vol/krea2/.cache/huggingface/upload" in mcl.CONTENT_HELP
+        assert ("--finalize-only --reset-upload-cache" in mcl.CONTENT_HELP
+                and "/vol/krea2/.cache/huggingface" in mcl.CONTENT_HELP)
 
         # finalize_impl with a fake HfApi: write check, privacy, upload,
         # content check at the commit read after the upload
@@ -777,6 +808,8 @@ def modal_cache_latents_flow():
                 assert kw["ignore_patterns"] == mcl.UPLOAD_IGNORE, kw
                 assert kw["private"] is True, kw
                 self.calls.append("upload")
+                self.state_at_upload = (Path(folder) / ".cache/huggingface"
+                                        ).exists()
                 self.uploaded = mcl.expected_upload(folder)
 
             def list_repo_tree(self, repo, repo_type, recursive, expand,
@@ -798,10 +831,11 @@ def modal_cache_latents_flow():
             man_cmds.append(cmd)
             return SimpleNamespace(returncode=0)   # manifest already written
 
-        def fin(api):
+        def fin(api, vol=None, **kw):
             with contextlib.redirect_stdout(io.StringIO()):
-                return mcl.finalize_impl(FakeVol(), api=api, out_dir=out,
-                                         runner=runner, python="py")
+                return mcl.finalize_impl(vol or FakeVol(), api=api,
+                                         out_dir=out, runner=runner,
+                                         python="py", **kw)
 
         api = FakeApi()
         r = fin(api)
@@ -835,6 +869,22 @@ def modal_cache_latents_flow():
             "sha256 latents/train-0001.safetensors: remote eeee"), r
         assert "--finalize-only" in r["error"], r
         assert len(man_cmds) == 4, man_cmds        # read/auth/public stop early
+
+        # --reset-upload-cache: the upload state is gone (and committed)
+        # before upload_large_folder runs; without it the state is kept
+        state = out / ".cache/huggingface/upload/latents"
+        state.mkdir(parents=True)
+        (state / "train-0000.safetensors.metadata").write_text("stale")
+        api = FakeApi()
+        assert fin(api)["ok"] and api.state_at_upload is True
+        api, vol = FakeApi(), FakeVol()
+        r = fin(api, vol=vol, reset_upload_cache=True)
+        assert r["ok"] and api.state_at_upload is False, r
+        assert not (out / ".cache/huggingface").exists()
+        assert any(ln.startswith("--reset-upload-cache: removed")
+                   for ln in r["log"]), r["log"]
+        # commits: after the manifest, after the reset, after the upload
+        assert vol.commits == 3, vol.commits
     print("    modal_cache_latents: cost math, 5% tie rule, OOM ladder, "
           "token check, worker command/env/timeout, commit per shard, upload "
           "filter + content check")
