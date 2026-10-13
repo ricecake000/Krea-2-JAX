@@ -14,7 +14,9 @@ Checks, for 2 non-square bucket-like shapes x batch 1 and 3:
     latents_mean) / latents_std)
   * make_encoder(.., "ref") is vae_encode_batch exactly
   * the bench's correctness gate (modal_cache_latents.check_impls) passes the
-    2d impl, rejects a wrong one, restores dtype / TF32 flags
+    2d impl, rejects a wrong tap, a doubled std and a bf16-only mean offset,
+    restores dtype / TF32 flags; bench_gpu_impl end to end on CPU returns
+    plain JSON
 """
 
 import os
@@ -25,6 +27,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
+sys.path.insert(0, str(REPO / "tests"))
 
 import torch  # noqa: E402
 
@@ -161,6 +164,59 @@ def check_bench_gate(log):
     assert checks["2d"]["fp32_mean_max_rel"] > mcl.CHECK_TOL, checks
     log(f"  bench gate: wrong tap rejected (fp32 "
         f"{checks['2d']['fp32_mean_max_rel']:.2e})")
+
+    # a doubled std, and a mean offset only in bf16, must fail the gate
+    post = vae_fast.posterior
+
+    def doubled_std(moments):
+        m, sd = post(moments)
+        return m, 2 * sd
+
+    def bf16_mean_offset(moments):
+        m, sd = post(moments)
+        if m.dtype == torch.bfloat16:
+            m = m + 0.1 * m.abs().max()
+        return m, sd
+    for patch, keys in ((doubled_std, ["fp32_std_max_rel",
+                                       "fp32_sample_max_rel",
+                                       "bf16_std_max_rel"]),
+                        (bf16_mean_offset, ["bf16_mean_max_rel"])):
+        vae_fast.posterior = patch
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                checks, encs = mcl.check_impls(enc, ["ref", "2d"], x)
+        finally:
+            vae_fast.posterior = post
+        c = checks["2d"]
+        assert not c["ok"] and "2d" not in encs, c
+        assert [r.split()[0] for r in c["fail_reasons"]] == keys, c
+        assert checks["ref"]["ok"], checks["ref"]
+        log(f"  bench gate: {patch.__name__} rejected: "
+            + "; ".join(c["fail_reasons"]))
+
+    # the bench container's code path end to end on CPU (decode, gate,
+    # ladder): plain JSON result (it is unpickled where torch is missing)
+    import json
+    import tempfile
+
+    from test_cache_latents import make_fake_dataset
+
+    enc = stand_in_encoder(tiny_vae(seed=6))
+    enc.to_dtype(torch.bfloat16)
+    with tempfile.TemporaryDirectory() as d:
+        make_fake_dataset(d)
+        lines = []
+        res = mcl.bench_gpu_impl(
+            "L4", 2, ["ref", "2d"], vae=enc, tar=Path(d) / "data/train-0000.tar",
+            bucket=(32, 64), device="cpu", ladder=(1, 2), min_images=1,
+            min_seconds=0.0, decode_timing_n=2, log=lines.append)
+    assert "error" not in res, res["error"]
+    assert json.loads(json.dumps(res)) == res
+    assert all(res["impls"][i]["check"]["ok"] for i in ("ref", "2d")), res
+    rows = [mcl.cost_row(e) for e in mcl.flatten_results([res])]
+    assert [r["impl"] for r in rows] == ["ref", "2d"], rows
+    log(f"  bench_gpu_impl (CPU, tiny VAE): ref {rows[0]['img_s']:.1f}, 2d "
+        f"{rows[1]['img_s']:.1f} img/s; JSON-plain result")
 
 
 def main():

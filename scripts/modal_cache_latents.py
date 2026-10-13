@@ -17,10 +17,11 @@ HF_HOME=/vol/hf, and reports whether the HF token can write. Then one
 ~1 MP so the per-image cost is near-constant) with cache_latents.decode, time
 single-threaded decode, then per VAE encode path of --impls
 (scripts/vae_fast.py: ref = diffusers, 2d = single-frame 2D encoder,
-2d-compile = 2d under torch.compile): a correctness check on 2 real images
-against ref (fp32 posterior-mean max rel error < 1e-4 with TF32 off, else
-the impl is skipped; the bf16 error is reported; the first bf16 call of
-2d-compile is its compile time), then a batch ladder 4/8/16/32 of the impl
+2d-compile = 2d under torch.compile): a correctness gate on 2 real images
+against ref (gate_check: with TF32 off, fp32 posterior mean, std and seeded
+normalized sample max rel error < 1e-4; in bf16, mean and std error vs the
+fp32 ref <= 1.5 x the ref's own bf16 error + 1e-3; else the impl is skipped;
+the first bf16 call of 2d-compile is its compile time), then a batch ladder 4/8/16/32 of the impl
 on the CPU float32 tensors exactly like production (stack + H2D + encode +
 bf16 D2H, 1 CPU thread), each >= max(64 images, 3 batches) and >= 10 s after
 one warmup call, stopping at the first OOM. A GPU type that is unavailable
@@ -126,7 +127,14 @@ BENCH_WAIT_S = 75 * 60   # local wait for all bench containers (incl. queueing)
 # imports without torch)
 VAE_IMPLS = ("ref", "2d", "2d-compile")
 DEFAULT_IMPLS = ",".join(VAE_IMPLS)
-CHECK_TOL = 1e-4   # fp32 posterior-mean max rel error vs ref on the real VAE
+# correctness gate of an impl vs ref on the real VAE (gate_check):
+#   fp32: posterior mean, std and seeded normalized sample max rel < CHECK_TOL
+#   production dtype (bf16): impl mean/std error vs ref fp32 <=
+#   BF16_SLACK * (ref bf16 vs ref fp32 error) + BF16_ABS
+CHECK_TOL = 1e-4
+BF16_SLACK = 1.5
+BF16_ABS = 1e-3
+CHECK_SEED = 1234
 CHECK_IMAGES = 2
 DEFAULT_GPUS = ("L4,A10,L40S,A100-40GB,A100-80GB,RTX-PRO-6000,H100!,H200,"
                 "B200,B300")
@@ -278,8 +286,8 @@ def flatten_results(results):
             check = r.get("check") or {}
             err = res.get("error") or r.get("error") or check.get("error")
             if not err and check.get("ok") is False:
-                err = (f"correctness FAILED: fp32 mean max rel "
-                       f"{check.get('fp32_mean_max_rel'):.2e} >= {CHECK_TOL:g}")
+                err = ("correctness FAILED: "
+                       + "; ".join(check.get("fail_reasons") or ["?"]))
             e["error"] = err
             out.append(e)
     return out
@@ -385,8 +393,10 @@ def render_bench_report(results, rows, choice, prep=None,
            "startup + VAE load per container. cores = max(4, ceil(1.5 * "
            "img/s / decode img/s/thread) + 1). fp32/bf16 err = max |impl - "
            "ref fp32| / max |ref fp32| of the posterior mean on "
-           f"{CHECK_IMAGES} real images (an impl needs fp32 err < "
-           f"{CHECK_TOL:g}); compile s = first bf16 call of 2d-compile.", ""]
+           f"{CHECK_IMAGES} real images. Gate: fp32 mean, std and seeded "
+           f"normalized sample < {CHECK_TOL:g}, bf16 mean and std <= "
+           f"{BF16_SLACK:g} x the ref's own bf16 error + {BF16_ABS:g}. "
+           "compile s = first bf16 call of 2d-compile.", ""]
     if prep:
         out += [f"HF token: user {prep.get('whoami')!r}, can write "
                 f"{prep.get('can_write')} ({prep.get('write_reason')})", ""]
@@ -794,20 +804,78 @@ def max_rel(a, b):
     return ((a - b).abs().max() / b.abs().max()).item()
 
 
+def to_plain(x):
+    """Plain JSON types only (str/int/float/bool/None/list/dict): Modal
+    returns are unpickled on the laptop, where torch is not installed (e.g.
+    torch.__version__ is a torch.TorchVersion str subclass). Tensors / numpy
+    scalars become numbers or lists, anything else its str()."""
+    if x is None or type(x) in (bool, int, float, str):
+        return x
+    if isinstance(x, dict):
+        return {str(k): to_plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [to_plain(v) for v in x]
+    if isinstance(x, bool):
+        return bool(x)
+    if isinstance(x, str):
+        return "".join([x])   # exact str, not the subclass
+    if isinstance(x, int):
+        return int(x)
+    if isinstance(x, float):
+        return float(x)
+    if hasattr(x, "tolist"):   # torch / numpy tensors and scalars
+        return to_plain(x.tolist())
+    return str(x)
+
+
+def gate_check(c, tol=CHECK_TOL, slack=BF16_SLACK, abs_tol=BF16_ABS):
+    """Correctness verdict of one impl's check dict (check_impls) -> (ok,
+    reasons). fp32 mean, std and seeded normalized sample max rel < tol;
+    production-dtype mean and std error (vs ref fp32) <= slack * the ref's own
+    production-dtype error + abs_tol. A missing measurement fails."""
+    reasons = []
+    if c.get("error"):
+        return False, [f"error: {_err_line(c['error'])}"]
+    for k in ("fp32_mean_max_rel", "fp32_std_max_rel",
+              "fp32_sample_max_rel"):
+        v = c.get(k)
+        if v is None or not v < tol:
+            reasons.append(f"{k} {v if v is None else format(v, '.2e')} "
+                           f">= {tol:g}")
+    for q in ("mean", "std"):
+        v, ref = c.get(f"bf16_{q}_max_rel"), c.get(f"ref_bf16_{q}_max_rel")
+        if v is None or ref is None:
+            reasons.append(f"bf16_{q}_max_rel not measured")
+            continue
+        lim = slack * ref + abs_tol
+        if not v <= lim:
+            reasons.append(f"bf16_{q}_max_rel {v:.2e} > {slack:g} * ref "
+                           f"{ref:.2e} + {abs_tol:g} = {lim:.2e}")
+    return not reasons, reasons
+
+
 def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
     """Correctness of each impl against the diffusers reference on images x
-    (N, 3, H, W): fp32 first (VAE cast to fp32, TF32 off so cuDNN/cuBLAS
-    really compute in fp32), then at the VAE's own (production) dtype.
-    -> (checks {impl: {fp32_mean_max_rel, fp32_std_max_rel,
-    bf16_mean_max_rel (production dtype vs fp32 ref), first_call_s, ok
-    [, error]}}, encoders {impl: FastEncoder at the production dtype} for the
-    impls that passed). first_call_s of 2d-compile is its compile time."""
+    (N, 3, H, W), gated by gate_check:
+      fp32 (VAE cast to fp32, TF32 off so cuDNN/cuBLAS really compute fp32):
+        posterior mean/std max rel vs ref, and the normalized sample with the
+        same torch seed (same noise draw);
+      production dtype (the VAE's own, bf16): impl mean/std vs the fp32 ref,
+        compared with the ref's own bf16 error (ref_bf16_*).
+    -> (checks {impl: {fp32_*_max_rel, bf16_*_max_rel, ref_bf16_*_max_rel,
+    first_call_s, ok, fail_reasons[, error]}}, encoders {impl: FastEncoder
+    at the production dtype} for the impls that passed). first_call_s is the
+    first production-dtype call (2d-compile: its compile time)."""
     import torch
     import vae_fast
 
     def sync():
         if cuda is not None:
             cuda.synchronize()
+
+    def seeded(enc):
+        torch.manual_seed(CHECK_SEED)
+        return enc(x)
 
     checks = {i: {} for i in impls}
     dtype0 = vae.dtype
@@ -817,100 +885,129 @@ def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cuda.matmul.allow_tf32 = False
         vae.to_dtype(torch.float32)
-        m_ref, s_ref = vae_fast.make_encoder(vae, "ref").dist(x)
+        ref32 = vae_fast.make_encoder(vae, "ref")
+        m_ref, s_ref = ref32.dist(x)
+        z_ref = seeded(ref32)
         for impl in impls:
             c = checks[impl]
             if impl == "ref":
-                c.update(fp32_mean_max_rel=0.0, fp32_std_max_rel=0.0)
+                c.update(fp32_mean_max_rel=0.0, fp32_std_max_rel=0.0,
+                         fp32_sample_max_rel=0.0)
                 continue
             try:
-                m, s = vae_fast.make_encoder(vae, impl).dist(x)
+                enc = vae_fast.make_encoder(vae, impl)
+                m, s = enc.dist(x)
                 c.update(fp32_mean_max_rel=max_rel(m, m_ref),
-                         fp32_std_max_rel=max_rel(s, s_ref))
+                         fp32_std_max_rel=max_rel(s, s_ref),
+                         fp32_sample_max_rel=max_rel(seeded(enc), z_ref))
+                del enc
             except Exception:  # noqa: BLE001
                 c["error"] = traceback.format_exc()[-3000:]
     finally:
         torch.backends.cudnn.allow_tf32, \
             torch.backends.cuda.matmul.allow_tf32 = tf32
         vae.to_dtype(dtype0)
+    # production dtype: the ref's own error is the yardstick
+    m16, s16 = vae_fast.make_encoder(vae, "ref").dist(x)
+    ref_err = {"ref_bf16_mean_max_rel": max_rel(m16, m_ref),
+               "ref_bf16_std_max_rel": max_rel(s16, s_ref)}
     encoders = {}
     for impl in impls:
         c = checks[impl]
-        if "error" in c:
-            c["ok"] = False
-            log(f"check {impl}: ERROR {_err_line(c['error'])}")
-            continue
-        c["ok"] = c["fp32_mean_max_rel"] < tol
-        try:
-            enc = vae_fast.make_encoder(vae, impl)
-            sync()
-            t0 = time.perf_counter()
-            m, _ = enc.dist(x)
-            sync()
-            c["first_call_s"] = time.perf_counter() - t0
-            c["bf16_mean_max_rel"] = max_rel(m, m_ref)
-        except Exception:  # noqa: BLE001
-            c.update(ok=False, error=traceback.format_exc()[-3000:])
-        log(f"check {impl}: fp32 mean max rel "
-            f"{c.get('fp32_mean_max_rel', float('nan')):.2e} (std "
-            f"{c.get('fp32_std_max_rel', float('nan')):.2e}), {dtype0} "
-            f"{c.get('bf16_mean_max_rel', float('nan')):.2e}, first call "
-            f"{c.get('first_call_s', float('nan')):.1f}s -> "
-            + ("ok" if c["ok"] else "FAILED"))
+        c.update(ref_err)
+        if "error" not in c:
+            try:
+                enc = vae_fast.make_encoder(vae, impl)
+                sync()
+                t0 = time.perf_counter()
+                m, s = enc.dist(x)
+                sync()
+                c["first_call_s"] = time.perf_counter() - t0
+                c["bf16_mean_max_rel"] = max_rel(m, m_ref)
+                c["bf16_std_max_rel"] = max_rel(s, s_ref)
+            except Exception:  # noqa: BLE001
+                c["error"] = traceback.format_exc()[-3000:]
+        c["ok"], c["fail_reasons"] = gate_check(c, tol)
+        nan = float("nan")
+        log(f"check {impl}: fp32 mean/std/sample "
+            f"{c.get('fp32_mean_max_rel', nan):.2e}/"
+            f"{c.get('fp32_std_max_rel', nan):.2e}/"
+            f"{c.get('fp32_sample_max_rel', nan):.2e}, {dtype0} mean/std "
+            f"{c.get('bf16_mean_max_rel', nan):.2e}/"
+            f"{c.get('bf16_std_max_rel', nan):.2e} (ref "
+            f"{ref_err['ref_bf16_mean_max_rel']:.2e}/"
+            f"{ref_err['ref_bf16_std_max_rel']:.2e}), first call "
+            f"{c.get('first_call_s', nan):.1f}s -> "
+            + ("ok" if c["ok"] else "FAILED: " + "; ".join(c["fail_reasons"])))
         if c["ok"]:
             encoders[impl] = enc
     return checks, encoders
 
 
-def bench_gpu_impl(gpu_requested, n_decode, impls=VAE_IMPLS):
+def bench_gpu_impl(gpu_requested, n_decode, impls=VAE_IMPLS, *, vae=None,
+                   tar=None, bucket=BENCH_BUCKET, device="cuda",
+                   ladder=LADDER, min_images=MIN_IMAGES,
+                   min_seconds=MIN_SECONDS, decode_timing_n=DECODE_TIMING_N,
+                   log=print):
     """Runs in the bench container. Never raises: failures end up in
     res["error"] / res["impls"][impl]["error"] (with whatever was measured
-    before)."""
+    before). Returns plain JSON types only (to_plain). `vae` (a
+    cache_dataset.VaeEncoder-like object), `tar`, `bucket`, `device` and the
+    ladder sizes are injectable for CPU tests."""
     res = {"gpu_requested": gpu_requested}
     t_start = time.time()
     try:
         from concurrent.futures import ThreadPoolExecutor
 
-        import diffusers
         import torch
 
         cl = import_cache_latents()
-        from cache_dataset import VaeEncoder
-
-        res.update(device_name=torch.cuda.get_device_name(0),
-                   torch=torch.__version__, torch_cuda=torch.version.cuda,
-                   diffusers=diffusers.__version__)
-        print(f"{gpu_requested}: {res['device_name']} torch {torch.__version__}"
-              f" (cuda {torch.version.cuda})", flush=True)
-        w, h = BENCH_BUCKET
-        samples = [s for s in cl.read_tar(Path(VOL_BENCH) / BENCH_TAR)
+        cuda = torch.cuda if device == "cuda" else None
+        res.update(device_name=(torch.cuda.get_device_name(0) if cuda
+                                else str(device)),
+                   torch=torch.__version__, torch_cuda=torch.version.cuda)
+        try:
+            import diffusers
+            res["diffusers"] = diffusers.__version__
+        except ImportError:
+            res["diffusers"] = None
+        log(f"{gpu_requested}: {res['device_name']} torch {torch.__version__}"
+            f" (cuda {torch.version.cuda})")
+        w, h = bucket
+        tar = Path(VOL_BENCH) / BENCH_TAR if tar is None else Path(tar)
+        samples = [s for s in cl.read_tar(tar)
                    if (s["w"], s["h"]) == (w, h)][:n_decode]
-        if len(samples) < DECODE_TIMING_N:
-            raise RuntimeError(f"only {len(samples)} {w}x{h} samples in "
-                               f"{BENCH_TAR}")
+        if len(samples) < max(decode_timing_n, CHECK_IMAGES):
+            raise RuntimeError(f"only {len(samples)} {w}x{h} samples in {tar}")
         # one intra-op thread: the build runs every decode thread with
         # OMP_NUM_THREADS=1 (worker_env), so this is the per-core rate
         n_threads = torch.get_num_threads()
         torch.set_num_threads(1)
         try:
             t0 = time.perf_counter()
-            for s in samples[:DECODE_TIMING_N]:
+            for s in samples[:decode_timing_n]:
                 cl.decode(s)
-            res["decode_img_s_per_thread"] = (DECODE_TIMING_N
+            res["decode_img_s_per_thread"] = (decode_timing_n
                                               / (time.perf_counter() - t0))
         finally:
             torch.set_num_threads(n_threads)
+        log(f"decode: {res['decode_img_s_per_thread']:.2f} img/s per thread "
+            f"({decode_timing_n} {w}x{h} samples, 1 intra-op thread)")
         # bench setup only (not timed): default threads
         with ThreadPoolExecutor(DECODE_POOL) as pool:
             imgs = [d[0] for d in pool.map(cl.decode, samples)]
         res["n_decoded"] = len(imgs)
-        t0 = time.perf_counter()
-        vae = VaeEncoder(VAE_REPO, "cuda", torch.bfloat16)
-        res["vae_load_s"] = time.perf_counter() - t0
+        if vae is None:
+            from cache_dataset import VaeEncoder
+
+            t0 = time.perf_counter()
+            vae = VaeEncoder(VAE_REPO, "cuda", torch.bfloat16)
+            res["vae_load_s"] = time.perf_counter() - t0
+        res["vae_dtype"] = vae.dtype
         # correctness on real images first; failed impls are skipped
         checks, encoders = check_impls(
-            vae, list(impls), torch.stack(imgs[:CHECK_IMAGES]),
-            cuda=torch.cuda)
+            vae, list(impls), torch.stack(imgs[:CHECK_IMAGES]), cuda=cuda,
+            log=log)
         res["impls"] = {i: {"check": checks[i]} for i in impls}
         for impl in impls:
             r = res["impls"][impl]
@@ -919,23 +1016,25 @@ def bench_gpu_impl(gpu_requested, n_decode, impls=VAE_IMPLS):
             # production setting: the 2d impls turn cudnn.benchmark on
             # (vae_fast), the reference path never does
             torch.backends.cudnn.benchmark = impl != "ref"
-            print(f"--- ladder {impl}", flush=True)
+            log(f"--- ladder {impl}")
             try:
                 # timed with 1 CPU thread, like production (intra_threads)
                 r["ladder"] = run_ladder(
-                    encoders.pop(impl), imgs, LADDER,
+                    encoders.pop(impl), imgs, ladder,
                     (LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE),
-                    cuda=torch.cuda, intra_threads=1)
+                    cuda=cuda, min_images=min_images,
+                    min_seconds=min_seconds, log=log, intra_threads=1)
                 r.update(best_of(r["ladder"]))
             except Exception:  # noqa: BLE001
                 r["error"] = traceback.format_exc()[-4000:]
-                print(r["error"], flush=True)
-            torch.cuda.empty_cache()
+                log(r["error"])
+            if cuda is not None:
+                cuda.empty_cache()
     except Exception:  # noqa: BLE001
         res["error"] = traceback.format_exc()[-4000:]
-        print(res["error"], flush=True)
+        log(res["error"])
     res["seconds"] = time.time() - t_start
-    return res
+    return to_plain(res)
 
 
 def prep_impl(bench_files):
@@ -970,7 +1069,7 @@ def prep_impl(bench_files):
     out["vae_s"] = time.time() - t0
     print(f"VAE {VAE_REPO} at {out['vae_dir']} ({out['vae_s']:.0f}s)",
           flush=True)
-    return out
+    return to_plain(out)
 
 
 def gpu_name_smi():
@@ -1001,7 +1100,7 @@ def build_worker_impl(i, n, batch, decode_threads, vol, vae_impl="ref"):
         res.update(rc=None, error=traceback.format_exc()[-4000:])
     res["final_commit"] = commit_volume(vol)
     res["seconds"] = time.time() - t0
-    return res
+    return to_plain(res)
 
 
 class WriteAccessError(Exception):
@@ -1137,7 +1236,7 @@ def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
     except Exception:  # noqa: BLE001
         res["error"] = traceback.format_exc()[-4000:]
         say(res["error"])
-    return res
+    return to_plain(res)
 
 
 # ------------------------------------------------------------------ Modal app

@@ -623,9 +623,13 @@ def modal_cache_latents_flow():
         else:
             raise AssertionError(f"parse_impls accepted {bad!r}")
 
-    def impl_res(img_s, fp32, ok=True, first=None, ladder=True):
-        r = {"check": {"fp32_mean_max_rel": fp32, "bf16_mean_max_rel": 4e-3,
-                       "ok": ok, "first_call_s": first}}
+    def impl_res(img_s, fp32, first=None, ladder=True):
+        c = {"fp32_mean_max_rel": fp32, "fp32_std_max_rel": 1e-7,
+             "fp32_sample_max_rel": 1e-7, "bf16_mean_max_rel": 4e-3,
+             "bf16_std_max_rel": 2e-3, "ref_bf16_mean_max_rel": 4e-3,
+             "ref_bf16_std_max_rel": 2e-3, "first_call_s": first}
+        c["ok"], c["fail_reasons"] = mcl.gate_check(c)
+        r = {"check": c}
         if ladder:
             r["ladder"] = [{"batch": 16, "img_s": img_s, "peak_gib": 30.0},
                            {"batch": 32, "error": "OOM"}]
@@ -636,12 +640,12 @@ def modal_cache_latents_flow():
                 "ref": impl_res(10.0, 0.0),
                 "2d": impl_res(25.0, 3e-7, first=0.4),
                 # failed correctness: never costed, even with a fast ladder
-                "2d-compile": impl_res(90.0, 2e-3, ok=False, first=95.0)}}
+                "2d-compile": impl_res(90.0, 2e-3, first=95.0)}}
     ents = mcl.flatten_results([b200])
     assert [(e["impl"], bool(e["error"])) for e in ents] == [
         ("ref", False), ("2d", False), ("2d-compile", True)], ents
-    assert ents[2]["error"].startswith("correctness FAILED: fp32 mean max "
-                                       "rel 2.00e-03"), ents[2]
+    assert ents[2]["error"] == ("correctness FAILED: fp32_mean_max_rel "
+                                "2.00e-03 >= 0.0001"), ents[2]
     rows_b = [mcl.cost_row(e) for e in ents]
     assert rows_b[2] is None and rows_b[1]["impl"] == "2d", rows_b
     assert rows_b[1]["fp32_err"] == 3e-7 and rows_b[1]["compile_s"] is None
@@ -667,6 +671,46 @@ def modal_cache_latents_flow():
     dead = dict(b200, error="Traceback\nRuntimeError: CUDA error")
     assert all(mcl.cost_row(e) is None
                for e in mcl.flatten_results([dead]))
+
+    # correctness gate (all of fp32 mean/std/sample, bf16 mean/std vs the
+    # ref's own bf16 error)
+    good = {"fp32_mean_max_rel": 1e-6, "fp32_std_max_rel": 2e-6,
+            "fp32_sample_max_rel": 3e-6, "bf16_mean_max_rel": 0.011,
+            "bf16_std_max_rel": 0.004, "ref_bf16_mean_max_rel": 0.010,
+            "ref_bf16_std_max_rel": 0.003}
+    assert mcl.gate_check(good) == (True, [])
+    # 1.5 * 0.010 + 1e-3 = 0.016: at the limit passes, above fails
+    assert mcl.gate_check(dict(good, bf16_mean_max_rel=0.016))[0]
+    for bad, why in (
+            ({"fp32_std_max_rel": 1.0}, "fp32_std_max_rel"),   # doubled std
+            ({"bf16_mean_max_rel": 0.1}, "bf16_mean_max_rel"),  # bf16 offset
+            ({"bf16_std_max_rel": 0.02}, "bf16_std_max_rel"),
+            ({"fp32_sample_max_rel": 2e-4}, "fp32_sample_max_rel"),
+            ({"fp32_mean_max_rel": None}, "fp32_mean_max_rel None")):
+        ok, reasons = mcl.gate_check(dict(good, **bad))
+        assert not ok and len(reasons) == 1 and why in reasons[0], reasons
+    ok, reasons = mcl.gate_check({k: v for k, v in good.items()
+                                  if k != "bf16_std_max_rel"})
+    assert not ok and reasons == ["bf16_std_max_rel not measured"], reasons
+    assert mcl.gate_check(dict(good, error="Tb\nOOM"))[1] == ["error: OOM"]
+    failed = {"gpu_requested": "B200", "decode_img_s_per_thread": 1.0,
+              "impls": {"2d": {"check": dict(good, fp32_std_max_rel=1.0,
+                                             ok=False, fail_reasons=[
+                                                 "fp32_std_max_rel 1.00e+00 "
+                                                 ">= 0.0001"])}}}
+    assert mcl.flatten_results([failed])[0]["error"] == (
+        "correctness FAILED: fp32_std_max_rel 1.00e+00 >= 0.0001")
+
+    # plain return types (the laptop has no torch to unpickle torch objects)
+    import numpy as np
+    from torch.torch_version import TorchVersion
+    plain = mcl.to_plain({"torch": TorchVersion("2.13.0"),
+                          "dtype": torch.bfloat16, 3: (np.float32(0.5),
+                                                       torch.tensor(2.0)),
+                          "t": torch.ones(2), "n": np.int64(4), "b": True})
+    assert plain == {"torch": "2.13.0", "dtype": "torch.bfloat16",
+                     "3": [0.5, 2.0], "t": [1.0, 1.0], "n": 4, "b": True}
+    assert type(plain["torch"]) is str and type(plain["n"]) is int
 
     # HF token
     assert mcl.pick_hf_token({"HUGGINGFACE_TOKEN": "c",
@@ -762,6 +806,50 @@ def modal_cache_latents_flow():
         assert vol.commits == 2 and len(logs) == 1, (vol.commits, logs)
         assert "commit conflict" in logs[0], logs
         assert any("done: 6 images" in ln for ln in tail), tail
+
+        # bench_gpu_impl, real code path (decode, check_impls gate, ladder)
+        # on CPU with a stub VAE (diffusers-free, impl "ref"): the result
+        # must be plain JSON (it is unpickled on the laptop without torch)
+        class StubLatentDist:
+            def __init__(self, mean):
+                self.mean = mean
+                self.std = torch.full_like(mean, 0.1)
+
+            def sample(self):
+                return self.mean + self.std * torch.randn(
+                    self.mean.shape, dtype=self.mean.dtype)
+
+        class StubVae:   # cache_dataset.VaeEncoder-like
+            def __init__(self):
+                self.device, self.dtype = "cpu", torch.bfloat16
+                self.mean = torch.zeros(1, 16, 1, 1, 1)
+                self.std = torch.full((1, 16, 1, 1, 1), 2.0)
+                stub_enc = cl_stub()
+                self.vae = SimpleNamespace(encode=lambda x: SimpleNamespace(
+                    latent_dist=StubLatentDist(
+                        stub_enc(x[:, :, 0]).to(x.dtype)[:, :, None])))
+
+            def to_dtype(self, dtype):
+                self.dtype = dtype
+
+        def cl_stub():
+            return __import__("cache_latents").StubEncoder()
+        logs_b = []
+        res = mcl.bench_gpu_impl(
+            "L4", 2, ["ref"], vae=StubVae(), tar=d / "src/data/train-0000.tar",
+            bucket=(32, 64), device="cpu", ladder=(1, 2), min_images=1,
+            min_seconds=0.0, decode_timing_n=2, log=logs_b.append)
+        assert "error" not in res, res.get("error")
+        assert json.loads(json.dumps(res)) == res, res      # plain JSON
+        assert type(res["torch"]) is str and res["vae_dtype"] == (
+            "torch.bfloat16"), res
+        assert any(ln.startswith("decode: ") and "img/s per thread" in ln
+                   for ln in logs_b), logs_b
+        chk = res["impls"]["ref"]["check"]
+        assert chk["ok"] and chk["fail_reasons"] == [], chk
+        assert [x["batch"] for x in res["impls"]["ref"]["ladder"]] == [1, 2]
+        row = mcl.cost_row(mcl.flatten_results([res])[0])
+        assert row["impl"] == "ref" and row["batch"] in (1, 2), row
 
         # cache_latents --vae-impl: informational shard metadata only
         import cache_latents as cl
