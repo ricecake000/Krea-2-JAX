@@ -531,6 +531,7 @@ def drift_report(base_path, files, log=print):
     import math
     from contextlib import ExitStack
 
+    import ml_dtypes  # noqa: F401 - registers numpy's 'bfloat16' (safe_open numpy)
     from safetensors import safe_open
 
     t0 = time.time()
