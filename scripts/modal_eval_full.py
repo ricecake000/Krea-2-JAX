@@ -1145,7 +1145,7 @@ if modal is not None:
         finally:
             vol.commit()   # latents + the persistent compile cache
 
-    @app.function(image=cpu_image, cpu=float(DECODE_CPU), memory=32 * 1024,
+    @app.function(image=cpu_image, cpu=float(DECODE_CPU),
                   timeout=DECODE_TIMEOUT_S, volumes={VOL: vol})
     def decode(items: list, run_id: str) -> list:
         _remote_path()
