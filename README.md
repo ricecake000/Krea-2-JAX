@@ -512,6 +512,7 @@ Useful knobs:
 | `--save-every` / `--keep` | 1000 / 3 | orbax checkpoints of params + optimizer + EMA |
 | `--save-steps` | – | comma-separated extra save steps on top of `--save-every` (e.g. `20`: an early save that proves the checkpoint path); counted against `--keep`, not part of the resume config |
 | `--export-every` | 0 | extra `model_stepNNNNNN.safetensors` exports (0 = only at the end) |
+| `--export-steps` | – | comma-separated extra export steps on top of `--export-every` (e.g. `1500,3000`); only steps below `--steps` (the final `model.safetensors` always happens), not part of the resume config |
 | `--max-hours` | – | stop cleanly (checkpoint + export) after a wall-clock budget; counts only the train loop (see below) |
 | `--resume` | off | continue the newest checkpoint in `--output-dir/ckpt`; without it the script refuses to reuse a directory that already holds checkpoints |
 | `--resume-step N` | – | resume from an older step N; newer step dirs are renamed `<step>.superseded` |
@@ -610,8 +611,9 @@ Older checkpoints without a recorded configuration resume with a warning.
 The run writes `<output-dir>/model.safetensors` (EMA weights when enabled,
 else the raw params; bf16, official keys; metadata `step`, `base`, `source`,
 `resolution: bucketed`, `img_tokens`) at the end, plus
-`model_stepNNNNNN.safetensors` every `--export-every` steps. Any orbax step
-can also be exported afterwards, on CPU, next to a running job:
+`model_stepNNNNNN.safetensors` every `--export-every` steps and at each
+`--export-steps` step. Any orbax step can also be exported afterwards, on
+CPU, next to a running job:
 
 ```bash
 python scripts/export_full.py --ckpt-dir ./full_out/ckpt --step 10000 \
@@ -645,6 +647,42 @@ modal run scripts/modal_eval_full.py --limit 2        # smoke run
 modal run scripts/modal_eval_full.py                  # full eval (rough: ~35 min, ~$3 on H100)
 ```
 
+Any two R2 checkpoints can be compared: `--ft-key KEY` picks the "ft" side
+(default `krea2-fullft/run1/model.safetensors`), `--base-key KEY` takes the
+"base" side from R2 instead of HF, and `--labels A,B` names the two sides on
+the pair images, `index.html` and `prompts.json` (files stay
+`NN_base.png` / `NN_ft.png`). Each object is cached on the volume under a
+path derived from its key (`krea2-fullft/<rest>` -> `/vol/ft/<rest>`, other
+keys -> `/vol/r2/<key>`) with the same ETag/size/LastModified sidecar check:
+
+```bash
+modal run scripts/modal_eval_full.py \
+  --base-key krea2-fullft/run1/model.safetensors \
+  --ft-key krea2-fullft/run1/exports/model_step1513_params.safetensors \
+  --labels run1-ema,run1-raw
+```
+
+### Export a checkpoint tree on Modal + weight drift
+
+`scripts/modal_export_full.py` (one CPU container, 98 GiB RAM, volume
+`krea2-eval-cache`) exports the raw params or the EMA of an orbax step on R2
+without the training node: it downloads only what restoring that one tree
+needs (`<run>/ckpt/<step>/{<source>/, meta/, top-level files}`, never
+`opt_state/`; ETag/size-checked, resumable), runs `scripts/export_full.py`,
+uploads `krea2-fullft/<run>/exports/model_step<step>_<source>.safetensors`,
+and prints a weight-drift report vs the base (`||W - W_base|| / ||W_base||`:
+global, median / p90 / max over tensors, per DiT block, per tensor kind),
+also written to `/home/mj/krea2-ops/eval/drift_<run>_<step>.json`. The base
+`raw.safetensors` comes from `modal_eval_full.py`'s prepare (run that once
+first).
+
+```bash
+modal run scripts/modal_export_full.py --run run1 --step 1513 --source params \
+  --compare /vol/ft/run1/model.safetensors        # raw params vs the R2 EMA export
+modal run scripts/modal_export_full.py --run run1 --step 1513 --drift-only \
+  --compare /vol/ft/run1/model.safetensors        # report only (no R2 transfers)
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -673,6 +711,8 @@ python tests/test_layer_loop.py    # --layer-loop unroll == scan (outputs + grad
                                    # checkpoint I/O + shardings, no slice/DUS in the HLO
 python tests/test_modal_eval_full.py  # Modal eval: prompt selection, caption format, tiny
                                       # generate path, decode/index writing (no Modal)
+python tests/test_modal_export_full.py  # Modal export: minimal orbax download (fake R2),
+                                        # export_full + upload flow, weight-drift report
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -691,6 +731,7 @@ krea2_jax/
   text_template.py  # Qwen3-VL conditioner prompt template / caption tokenization
   fullft_ckpt.py # orbax train-state checkpoints (full fine-tuning)
   sampling.py    # Euler flow sampler + resolution-shifted timestep schedule
+  r2.py          # Cloudflare R2 helpers of the Modal scripts (identity-checked downloads)
 scripts/
   cache_dataset.py  # torch: VAE latents + Qwen3-VL states -> cache (LoRA)
   cache_latents.py  # torch: bucketed VAE latents of the HF dataset (full FT)
@@ -704,6 +745,7 @@ scripts/
   node_attention_parity.py  # jax-aiter attention vs reference (node check)
   sample.py         # jax DiT + torch encode/decode
   modal_eval_full.py  # Modal: full FT vs base side-by-side images + contact sheet
+  modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
