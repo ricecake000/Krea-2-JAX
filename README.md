@@ -718,10 +718,12 @@ a frame line + mat) and builds a review page to pick images for removal.
 CPU only, Modal default resources (a 950-image shard peaks at ~90 MiB RSS).
 
 Metric (`border_metrics`, numpy, full resolution): canvas colour candidates
-are the medians of the 2 px outer ring and of each side strip
-(de-duplicated within `TOL`); each goes through the full margin geometry and
-the best score wins (`bg_src`), so bars on only two sides work even when the
-picture's own edges cover more of the ring. Canvas pixels are within `TOL` =
+are the medians of the 2 px outer ring and of each side strip (only
+identical colours merged; a colour covering < 49% of every side strip is
+skipped, which provably cannot give a margin); each goes through the full
+margin geometry and the best score wins (`bg_src`), so bars on only two
+sides work even when the picture's own edges cover more of the ring or sit
+within `TOL` of the bars. Canvas pixels are within `TOL` =
 18 (max abs channel difference: survives WebP noise/ringing, still separates
 near-white picture highlights). Margins are leading rows/columns that are
 >= 98% canvas; `fill` = non-canvas fraction of the remaining box; per-side
@@ -737,7 +739,13 @@ inset scores like the inset); a frame line around a full-bleed picture only
 sets `thin_frame`. All intermediate numbers are stored, so the ranking can
 be re-weighted from `scores.parquet` without re-running.
 
-Flow: pass 1, one container per tar (`.starmap`): download, score every
+Flow: `prepare` resolves the dataset repo's commit sha once (`--revision`,
+default the default branch head); metadata.parquet and both tar passes are
+downloaded at that commit (the local parquet copy is used only when
+byte-identical to the commit's file), and the sha is recorded in
+`summary.json`, the `scores.parquet` schema metadata (`dataset_revision`)
+and the review page / its export. Pass 1, one container per tar
+(`.starmap`): download, score every
 image, thumbnails (512 px JPEG) of the always-review ids. Tar members must
 be `<id>.{webp,png,jpg,jpeg,json,txt}` and the image ids of every tar must
 equal the parquet's ids for it (missing / extra / duplicate ids, a failed

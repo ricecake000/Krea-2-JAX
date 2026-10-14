@@ -17,6 +17,12 @@
     written); global two-pass thumbnail selection (exactly the review
     page's ids, a missing one fails); localStorage key scoped to the review
     id, foreign ids dropped on load / export (the page's logic run in node)
+  * review round 2: canvas candidates within TOL of each other are all
+    scored (Codex's grey letterbox repro), the side-strip pruning never
+    changes the best score (brute force over every median, random fuzz);
+    the dataset commit is resolved once and pinned for metadata.parquet and
+    both tar passes (fake HfApi / download), recorded in summary.json,
+    the scores.parquet schema metadata and the review page / export
   * tag / caption flags, the always-thumb plan (watermark,
     border-uncaptioned, seeded white-background control)
   * dry run: a fake tar of synthetic WebPs (+ json/txt members) through the
@@ -191,6 +197,204 @@ def test_letterbox_with_flat_picture_sides():
     assert m["bg_black"] and m["pillar_or_letter"], m
     assert m["ring_uniform"] < 0.5, m      # the bars are the ring's minority
     assert abs(m["margin_top"] - 60 / H) < 3 / H and m["score"] > 0.08, m
+
+
+def test_close_candidates_all_scored():
+    """Codex repro: 1216x832, grey-240 letterbox bars, grey-211 picture with
+    2 px grey-225 side edges, WebP q80. The whole-ring median (~226) is
+    within TOL of 240 and makes the picture canvas (blank); the bar colour
+    must still be scored and win."""
+    a = np.full((1216, 832, 3), 240, np.uint8)
+    a[60:1216 - 60] = 211
+    a[60:1216 - 60, :2] = 225
+    a[60:1216 - 60, 830:] = 225
+    img = webp(a, 80)
+    cands = msb._bg_candidates(img)
+    ring = [c for n, c, _ in cands if n == "ring"][0]
+    assert abs(int(ring[0]) - 240) <= msb.TOL and int(ring[0]) != 240, cands
+    assert any(int(c[0]) == 240 for n, c, _ in cands), cands
+    m = msb.border_metrics(img)
+    assert m["bg_r"] == 240 and m["bg_src"] == "top", m
+    assert m["pillar_or_letter"] and abs(m["score"] - 0.1007) < 0.005, m
+    assert not m["blank"], m
+
+
+def _brute_best_score(rgb):
+    """Best score over EVERY ring / side-strip median, no pruning, no
+    merging (border_metrics' step 1-6 without the peel)."""
+    h, w = rgb.shape[:2]
+    k = max(1, min(msb.RING_PX, h // 2, w // 2))
+    sides = [rgb[:k].reshape(-1, 3), rgb[h - k:].reshape(-1, 3),
+             rgb[:, :k].reshape(-1, 3), rgb[:, w - k:].reshape(-1, 3)]
+    ring = np.concatenate([sides[0], sides[1],
+                           rgb[k:h - k, :k].reshape(-1, 3),
+                           rgb[k:h - k, w - k:].reshape(-1, 3)]).astype(np.int16)
+    best = 0.0
+    for px in [ring] + sides:
+        cand = np.round(np.median(px, axis=0)).astype(np.int16)
+        ru = float((np.abs(ring - cand).max(axis=1) <= msb.TOL).mean())
+        mm = msb._measure(rgb, cand.astype(np.uint8))
+        res = msb._finish(h, w, mm["px"], mm["fill"], mm["straight"], ru,
+                          mm["blank"])
+        best = max(best, res["score"])
+    return best
+
+
+def test_candidate_pruning_never_changes_the_best():
+    imgs = [inset(0.05, 0.05), inset(0.1, 0.02, (200, 200, 200)),
+            silhouette(1, False), silhouette(2, True), webp(photo(H, W, 3))]
+    lb = canvas((0, 0, 0), 2.0)
+    lb[60:H - 60] = photo(H - 120, W, 4)
+    lb[60:H - 60, :60] = (120, 170, 220)
+    lb[60:H - 60, W - 60:] = (120, 170, 220)
+    imgs.append(webp(lb))
+    rng = np.random.default_rng(7)
+    for _ in range(60):     # small random bar / box layouts with close greys
+        h, w = int(rng.integers(40, 120)), int(rng.integers(40, 120))
+        a = np.full((h, w, 3), int(rng.integers(150, 256)), np.uint8)
+        for _ in range(int(rng.integers(1, 5))):
+            y0, x0 = int(rng.integers(0, h)), int(rng.integers(0, w))
+            y1 = int(rng.integers(y0 + 1, h + 1))
+            x1 = int(rng.integers(x0 + 1, w + 1))
+            a[y0:y1, x0:x1] = int(rng.integers(150, 256))
+        if rng.random() < 0.5:
+            a = a + rng.integers(0, 4, a.shape).astype(np.uint8)
+        imgs.append(a)
+    for i, img in enumerate(imgs):
+        got = msb._best(img)[0]["score"]
+        want = _brute_best_score(img)
+        assert got == want, (i, got, want)
+
+
+class FakeApi:
+    """HfApi stand-in: dataset_info -> sha; get_paths_info -> RepoFile."""
+
+    def __init__(self, sha, data, lfs=True):
+        from types import SimpleNamespace as NS
+
+        self.sha, self.calls = sha, []
+        import hashlib
+
+        if lfs:
+            self.info = NS(path="metadata.parquet", size=len(data), blob_id="x",
+                           lfs=NS(sha256=hashlib.sha256(data).hexdigest()))
+        else:
+            blob = b"blob %d\0" % len(data) + data
+            self.info = NS(path="metadata.parquet", size=len(data), lfs=None,
+                           blob_id=hashlib.sha1(blob).hexdigest())
+
+    def dataset_info(self, repo, revision=None):
+        from types import SimpleNamespace as NS
+
+        self.calls.append(("dataset_info", repo, revision))
+        return NS(sha=self.sha)
+
+    def get_paths_info(self, repo, paths, revision=None, repo_type=None):
+        self.calls.append(("get_paths_info", repo, tuple(paths), revision,
+                           repo_type))
+        return [self.info]
+
+
+def _tiny_parquet(path, ids, tar="data/train-0000.tar"):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    n = len(ids)
+    pq.write_table(pa.table({
+        "id": ids, "long": ["a girl"] * n, "tags": ["1girl, border"] * n,
+        "bucket_w": [W] * n, "bucket_h": [H] * n, "tar": [tar] * n}), path)
+    return Path(path).read_bytes()
+
+
+def test_revision_pinned_everywhere():
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        good = _tiny_parquet(d / "good.parquet", [1, 2, 3])
+        other = _tiny_parquet(d / "other.parquet", [1, 2])
+        downloads = []
+
+        def download(filename, dest, token, revision):
+            downloads.append((filename, revision))
+            Path(dest).mkdir(parents=True, exist_ok=True)
+            out = Path(dest) / filename
+            out.write_bytes(good)
+            return out
+
+        for lfs in (True, False):
+            # local copy identical to the commit's file: used, no download
+            api = FakeApi(sha, good, lfs)
+            downloads.clear()
+            r = msb.prepare_impl(good, 0, 1, "", "tok", api=api,
+                                 download=download, tmp=d / f"a{lfs}",
+                                 log=lambda *_: None)
+            assert r["revision"] == sha and downloads == [], r["source"]
+            assert ("dataset_info", msb.DATASET_REPO, None) in api.calls
+            assert api.calls[1][3] == sha and sorted(r["meta"]) == [1, 2, 3]
+            # local copy differs -> downloaded at the pinned sha
+            r = msb.prepare_impl(other, 0, 1, "v1.0", "tok", api=api,
+                                 download=download, tmp=d / f"b{lfs}",
+                                 log=lambda *_: None)
+            assert downloads == [("metadata.parquet", sha)], downloads
+            assert ("dataset_info", msb.DATASET_REPO, "v1.0") in api.calls
+            assert "differs" in r["source"] and sorted(r["meta"]) == [1, 2, 3]
+        # no local copy -> downloaded at the pinned sha
+        downloads.clear()
+        r = msb.prepare_impl(b"", 0, 1, "", "tok", api=FakeApi(sha, good),
+                             download=download, tmp=d / "c",
+                             log=lambda *_: None)
+        assert downloads == [("metadata.parquet", sha)]
+        assert r["parquet_sha256"] == __import__("hashlib").sha256(good).hexdigest()
+        # tar passes: the download gets the pinned revision; file removed
+        img = webp_bytes(np.full((64, 48, 3), 128, np.uint8))
+        _tar(d / "src.tar", [("7.webp", img), ("7.json", b"{}")])
+        seen = []
+
+        def dl_tar(tar, dest, token, revision):
+            seen.append((tar, revision))
+            Path(dest).mkdir(parents=True, exist_ok=True)
+            out = Path(dest) / Path(tar).name
+            shutil.copy(d / "src.tar", out)
+            return out
+
+        res = msb.run_on_tar("data/train-0000.tar", sha, "tok",
+                             lambda p: msb.score_shard_impl(p, [7], log=lambda *_: None),
+                             download=dl_tar, dl_dir=d / "dl")
+        res2 = msb.run_on_tar("data/train-0000.tar", sha, "tok",
+                              lambda p: msb.thumb_shard_impl(p, [7], log=lambda *_: None),
+                              download=dl_tar, dl_dir=d / "dl")
+        assert seen == [("data/train-0000.tar", sha)] * 2
+        assert res["revision"] == res2["revision"] == sha
+        assert set(res2["thumbs"]) == {7} and not (d / "dl" / "train-0000.tar").exists()
+        try:
+            msb.fetch_dataset_file("x", d, None, "")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unpinned download allowed")
+        # recorded in summary.json, scores.parquet metadata, review page
+        import pyarrow.parquet as pq
+
+        rows = [{"id": 7, **msb.border_metrics(np.full((64, 48, 3), 128, np.uint8))}]
+        meta = {7: {"tar": "t", "bucket_w": 48, "bucket_h": 64,
+                    **msb.flags_of("", "x"), "cap": "x"}}
+        plan = {"shards": {"t": 1}, "ids": {"t": [7]}, "always": {},
+                "watermark": [], "uncaptioned": [], "control": []}
+        s = msb.write_outputs(d / "out", rows, {}, meta, plan, {},
+                              revision=sha)
+        assert s["dataset_revision"] == sha
+        assert json.loads((d / "out" / "summary.json").read_text())[
+            "dataset_revision"] == sha
+        md = pq.read_schema(d / "out" / "scores.parquet").metadata
+        assert md[b"dataset_revision"] == sha.encode()
+        assert md[b"dataset_repo"] == msb.DATASET_REPO.encode()
+        page = (d / "out" / "review" / "index.html").read_text()
+        data = json.loads(re.search(
+            r'<script id="data" type="application/json">(.*?)</script>',
+            page, re.S).group(1))
+        assert data["revision"] == sha and sha in page
+        assert data["review_id"] == s["review_id"] != msb.review_id(
+            data["tabs"], data["generated"], "other")
 
 
 def bust(cut, seed=0):
@@ -572,6 +776,7 @@ eq(loadSel(null,D),{},'empty');
 sel['77']={tab:'A',score:2};
 var ex=exportObj(sel,D,'NOW');
 eq(ex.review_id,D.review_id,'export id');eq(ex.generated,D.generated,'gen');
+eq(ex.dataset_revision,D.revision,'export revision');
 eq(ex.items.map(function(x){return x.id}).sort(),[1,3],'export ids');
 console.log('ok');
 """ % json.dumps(data)

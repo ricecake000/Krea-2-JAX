@@ -6,17 +6,17 @@ images for removal.
     modal run scripts/modal_score_borders.py --shards 2       # smoke run (2 tars)
     modal run scripts/modal_score_borders.py                  # all ~100 shards
     modal run scripts/modal_score_borders.py --top-n 1500 --control-n 150 \\
-        --seed 0 --out DIR
+        --seed 0 --out DIR --revision SHA     # default: the default branch head
 
     python scripts/modal_score_borders.py --tar-dir DIR --parquet P --out OUT
                        # the same pipeline locally on tars already on disk (no Modal)
 
 Metric (border_metrics, pure numpy on the full-resolution RGB image):
   1. canvas colour candidates: the per-channel median of the outer RING_PX
-     ring and of each side strip (top/bottom/left/right), de-duplicated (a
-     candidate within TOL of an earlier one is dropped) and pruned (a colour
-     that covers < SIDE_MATCH_MIN of every side strip cannot produce a
-     margin). Every remaining candidate goes through steps 2-6; the one with
+     ring and of each side strip (top/bottom/left/right); only identical
+     colours are merged, and a colour covering < SIDE_MATCH_MIN (49%) of
+     every side strip is skipped (provably cannot produce a margin). Every
+     remaining candidate goes through steps 2-6; the one with
      the highest score wins (the whole-ring median on ties; `bg_src`,
      `n_bg_candidates`). ring_uniform = fraction of ring pixels whose
      max-abs-channel difference to the colour is <= TOL; bg luminance,
@@ -47,9 +47,12 @@ Metric (border_metrics, pure numpy on the full-resolution RGB image):
 
 Stages (Modal; the local entrypoint is stdlib-only, like the other Modal
 scripts, so everything that needs numpy/pyarrow/PIL runs in containers):
-  1. `prepare` (CPU): reads metadata.parquet (the local copy LOCAL_PARQUET is
-     sent when it exists, else it is downloaded from the private dataset
-     repo with the HF token) -> per id: tar, tags of interest, caption flags
+  1. `prepare` (CPU): resolves the dataset repo's commit sha ONCE (--revision,
+     default the default branch); every download of the run is pinned to it
+     and it is recorded in summary.json, the scores.parquet schema metadata
+     and the review page. metadata.parquet at that commit: the local copy
+     LOCAL_PARQUET is used only when byte-identical to the commit's file
+     (LFS sha256 / git blob id), else it is downloaded -> per id: tar, tags of interest, caption flags
      (long caption mentions border|frame|margin|letterbox|pillarbox|inset /
      watermark), caption snippet; the expected ids of every tar; the ids
      that always get a thumbnail (sample watermark, border-tagged without a
@@ -139,8 +142,13 @@ EDGE_PX = 4               # straightness: best of the first 4 rows/cols inside
 FILL_FULL = 0.85          # fill at which the fill factor saturates
 RING_UNIFORM_MIN = 0.9
 PILLAR_STRAIGHT = 0.9
-SIDE_MATCH_MIN = 0.9      # a canvas candidate must cover >= 90% of one side
-#                           strip (else no row/col can be >= 98% canvas)
+# A side-strip candidate must cover >= 49% of one full side strip. Safe: any
+# margin needs pass 1 of _measure to find one (later passes only refine
+# pass 1's box), and pass 1's first test is a FULL outer row (top/bottom)
+# or, when those fail, a FULL outer column; >= 98% canvas there covers
+# >= 0.98 / RING_PX = 49% of that side's strip. A pruned candidate would
+# have scored 0.
+SIDE_MATCH_MIN = 0.98 / RING_PX
 PEEL_PAD = 2              # px skipped inside a thin frame (antialiased edge)
 PEEL_MIN_PX = 32          # no peel when the inside is smaller than this
 NEAR_WHITE_MIN = 235      # bg_white: every channel >= this
@@ -228,9 +236,11 @@ def _bg_mask(rgb, bg, tol=TOL):
 
 def _bg_candidates(rgb, tol=TOL, k=RING_PX):
     """-> [(source, colour uint8[3], ring_uniform)]: the medians of the whole
-    ring and of each side strip, de-duplicated within tol (first kept), the
-    whole ring always first, the others only when they cover >=
-    SIDE_MATCH_MIN of at least one side strip."""
+    ring and of each side strip; only identical colours are merged (two
+    medians within tol can still give different masks, and only one of them
+    may be the canvas). The whole ring always comes first; a side-strip
+    median is skipped only when it covers < SIDE_MATCH_MIN of every side
+    strip, which provably cannot give a margin (see SIDE_MATCH_MIN)."""
     import numpy as np
 
     h, w = rgb.shape[:2]
@@ -251,8 +261,7 @@ def _bg_candidates(rgb, tol=TOL, k=RING_PX):
     out = []
     for name, px in (("ring", ring), *sides.items()):
         cand = np.round(np.median(px, axis=0)).astype(np.int16)
-        if any(int(np.abs(cand - c.astype(np.int16)).max()) <= tol
-               for _, c, _ in out):
+        if any(np.array_equal(cand, c.astype(np.int16)) for _, c, _ in out):
             continue
         if name != "ring" and max(cover(sides16[s], cand)
                                   for s in SIDES) < SIDE_MATCH_MIN:
@@ -672,9 +681,10 @@ def check_thumbs(selected, have):
 
 
 # ------------------------------------------------------------------ outputs
-def table_bytes(joined):
+def table_bytes(joined, revision=None):
     """Joined rows -> scores.parquet bytes (pyarrow; columns = the union of
-    the row keys, missing values null)."""
+    the row keys, missing values null; schema metadata dataset_repo /
+    dataset_revision)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -684,6 +694,8 @@ def table_bytes(joined):
             if k not in keys:
                 keys.append(k)
     t = pa.Table.from_pydict({k: [r.get(k) for r in joined] for k in keys})
+    t = t.replace_schema_metadata({"dataset_repo": DATASET_REPO,
+                                   "dataset_revision": str(revision)})
     buf = io.BytesIO()
     pq.write_table(t, buf, compression="zstd")
     return buf.getvalue()
@@ -698,7 +710,7 @@ def quantiles(xs, qs=(0.5, 0.9, 0.95, 0.97, 0.99, 0.995, 0.999, 1.0)):
             for q in qs}
 
 
-def summarize(joined, tabs, have_thumbs, plan, seconds):
+def summarize(joined, tabs, have_thumbs, plan, seconds, revision=None):
     ok = [r for r in joined if "error" not in r]
     scores = [r["score"] for r in ok]
     top = set(tabs["A"])
@@ -712,6 +724,7 @@ def summarize(joined, tabs, have_thumbs, plan, seconds):
     overlap["any border tag"] = {"tagged": len(anyb),
                                  "in_top": len(anyb & top)}
     return {
+        "dataset_repo": DATASET_REPO, "dataset_revision": revision,
         "images": len(joined), "errors": len(joined) - len(ok),
         "error_ids": sorted(r["id"] for r in joined if "error" in r)[:50],
         "expected": sum(plan["shards"].values()),
@@ -731,6 +744,7 @@ def summarize(joined, tabs, have_thumbs, plan, seconds):
 
 
 def print_summary(s, log=print):
+    log(f"dataset {s['dataset_repo']}@{s['dataset_revision']}")
     log(f"images scored: {s['images']} (expected {s['expected']}, "
         f"{s['shards']} shards), errors {s['errors']}"
         + (f" {s['error_ids'][:10]}" if s["errors"] else ""))
@@ -770,19 +784,23 @@ def review_items(joined, tabs, meta, have_thumbs):
     return items
 
 
-def review_id(tabs, generated):
-    """Identity of one review page: hash of its tab id lists + generation
-    time (scopes the localStorage selection and the export)."""
-    blob = json.dumps({"tabs": tabs, "generated": generated},
+def review_id(tabs, generated, revision=None):
+    """Identity of one review page: hash of its tab id lists, generation
+    time and dataset revision (scopes the localStorage selection and the
+    export)."""
+    blob = json.dumps({"tabs": tabs, "generated": generated,
+                       "revision": revision},
                       sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
-def render_review(tabs, items, generated, title="datafilter review", info=""):
+def render_review(tabs, items, generated, title="datafilter review", info="",
+                  revision=None):
     """Self-contained review page (inline JSON, thumbs at ../thumbs/<id>.jpg)."""
     data = json.dumps({"tabs": tabs, "items": items, "names": dict(TABS),
-                       "review_id": review_id(tabs, generated),
-                       "generated": generated}, separators=(",", ":"))
+                       "review_id": review_id(tabs, generated, revision),
+                       "generated": generated, "dataset_repo": DATASET_REPO,
+                       "revision": revision}, separators=(",", ":"))
     data = data.replace("</", "<\\/")
     return (REVIEW_HTML.replace("__TITLE__", html.escape(title))
             .replace("__INFO__", html.escape(info))
@@ -802,7 +820,7 @@ if(Object.prototype.hasOwnProperty.call(D.items,id)&&sel[id]&&
 typeof sel[id]==='object')out[id]={tab:String(sel[id].tab),
 score:sel[id].score==null?null:+sel[id].score}});return out}
 function exportObj(sel,D,now){return {review_id:D.review_id,
-generated:D.generated,exported:now,
+generated:D.generated,dataset_revision:D.revision,exported:now,
 items:Object.keys(sel).filter(function(id){
 return Object.prototype.hasOwnProperty.call(D.items,id)}).map(function(id){
 return {id:+id,tab:sel[id].tab,score:sel[id].score}})}}
@@ -905,7 +923,7 @@ tabs();grid();
 
 
 def write_outputs(out_dir, rows, thumbs, meta, plan, seconds, top_n=TOP_N,
-                  table=None, info="", generated=None):
+                  table=None, info="", generated=None, revision=None):
     """Write thumbs/<id>.jpg, scores.parquet, review/index.html and
     summary.json under out_dir. `thumbs` must cover select_thumbs(tabs)
     (check_thumbs). `table`: scores.parquet bytes made elsewhere (the
@@ -920,18 +938,20 @@ def write_outputs(out_dir, rows, thumbs, meta, plan, seconds, top_n=TOP_N,
         (out_dir / "thumbs" / f"{int(sid)}.jpg").write_bytes(jpg)
     have = {int(i) for i in thumbs}
     if table is None:
-        table = table_bytes(joined)
+        table = table_bytes(joined, revision)
     (out_dir / "scores.parquet").write_bytes(table)
     items = review_items(joined, tabs, meta, have)
-    s = summarize(joined, tabs, have, plan, seconds)
+    s = summarize(joined, tabs, have, plan, seconds, revision)
     generated = generated or datetime.now(timezone.utc).isoformat(
         timespec="seconds")
-    info = info or (f"{s['images']} images, generated {generated}, score "
-                    "quantiles " + ", ".join(f"{k} {v:.3f}" for k, v in
-                                             s["score_quantiles"].items()))
+    info = info or (f"{DATASET_REPO}@{revision}: {s['images']} images, "
+                    f"generated {generated}, score quantiles "
+                    + ", ".join(f"{k} {v:.3f}" for k, v in
+                                s["score_quantiles"].items()))
     (out_dir / "review" / "index.html").write_text(
-        render_review(tabs, items, generated, info=info), encoding="utf-8")
-    s["review_id"] = review_id(tabs, generated)
+        render_review(tabs, items, generated, info=info, revision=revision),
+        encoding="utf-8")
+    s["review_id"] = review_id(tabs, generated, revision)
     (out_dir / "summary.json").write_text(json.dumps(s, indent=1))
     return s
 
@@ -946,11 +966,88 @@ def pick_hf_token(env):
     return None, None
 
 
-def fetch_dataset_file(filename, dest_dir, token):
+def fetch_dataset_file(filename, dest_dir, token, revision):
+    """One file of the dataset repo at a pinned commit (a real file in
+    dest_dir, deletable after use)."""
     from huggingface_hub import hf_hub_download
 
+    if not revision:
+        raise ValueError("fetch_dataset_file needs a pinned revision")
     return Path(hf_hub_download(DATASET_REPO, filename, repo_type="dataset",
-                                local_dir=str(dest_dir), token=token))
+                                revision=revision, local_dir=str(dest_dir),
+                                token=token))
+
+
+def resolve_revision(api, revision=None):
+    """The dataset repo's commit sha for `revision` (branch, tag or sha;
+    None = the default branch), resolved once per run."""
+    sha = api.dataset_info(DATASET_REPO, revision=revision or None).sha
+    if not sha:
+        raise RuntimeError(f"{DATASET_REPO}: no commit sha for revision "
+                           f"{revision!r}")
+    return sha
+
+
+def file_matches(data, info):
+    """True if `data` is the repo file described by `info` (huggingface_hub
+    RepoFile: LFS sha256 when stored in LFS, else the git blob sha1)."""
+    if len(data) != info.size:
+        return False
+    if info.lfs is not None:
+        return hashlib.sha256(data).hexdigest() == info.lfs.sha256
+    blob = b"blob %d\0" % len(data) + data
+    return hashlib.sha1(blob).hexdigest() == info.blob_id
+
+
+def prepare_impl(parquet=b"", seed=0, control_n=CONTROL_N, revision="",
+                 token=None, api=None, download=fetch_dataset_file,
+                 tmp="/tmp", log=print):
+    """Resolve the dataset commit once, then metadata.parquet AT that commit:
+    the sent local copy when it is byte-identical to the commit's file, else
+    a download pinned to it -> {meta, plan, revision, source,
+    parquet_sha256}."""
+    if api is None:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+    sha = resolve_revision(api, revision)
+    infos = [i for i in api.get_paths_info(DATASET_REPO, [PARQUET],
+                                           revision=sha, repo_type="dataset")
+             if getattr(i, "path", None) == PARQUET]
+    if not infos:
+        raise RuntimeError(f"{DATASET_REPO}@{sha} has no {PARQUET}")
+    tmp = Path(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
+    if parquet and file_matches(parquet, infos[0]):
+        path = tmp / PARQUET
+        path.write_bytes(parquet)
+        src = "local copy (identical to the commit's file)"
+    else:
+        path = download(PARQUET, tmp / "meta", token, sha)
+        src = "downloaded" + (" (the local copy differs from the commit's "
+                              "file)" if parquet else "")
+    log(f"{DATASET_REPO}@{sha}: {PARQUET} {src}")
+    meta = load_meta(path)
+    return {"meta": meta, "plan": plan_job(meta, seed, control_n),
+            "revision": sha, "source": src,
+            "parquet_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def run_on_tar(tar, revision, token, fn, download=fetch_dataset_file,
+               dl_dir=REMOTE_DL):
+    """Download one tar at the pinned revision, run fn(path), delete it."""
+    t0 = time.time()
+    path = Path(download(tar, dl_dir, token, revision))
+    dl = time.time() - t0
+    try:
+        res = fn(path)
+    finally:
+        path.unlink(missing_ok=True)
+    res["tar"] = tar
+    res["revision"] = revision
+    res["seconds"]["download"] = round(dl, 2)
+    res["peak_rss_mib"] = round(peak_rss_mib(), 1)
+    return res
 
 
 def peak_rss_mib():
@@ -975,65 +1072,50 @@ if modal is not None:
     hf_secret = modal.Secret.from_name("huggingface")
     app = modal.App("krea2-score-borders", image=image)
 
-    def _with_tar(tar, fn):
-        name, token = pick_hf_token(os.environ)
-        t0 = time.time()
-        path = fetch_dataset_file(tar, REMOTE_DL, token)
-        dl = time.time() - t0
-        try:
-            res = fn(path)
-        finally:
-            path.unlink(missing_ok=True)
-        res["tar"] = tar
-        res["seconds"]["download"] = round(dl, 2)
-        res["peak_rss_mib"] = round(peak_rss_mib(), 1)
-        return res
+    def _token():
+        return pick_hf_token(os.environ)[1]
 
     @app.function(secrets=[hf_secret], timeout=30 * 60,
                   memory=META_MEM_MIB)
     def prepare(parquet: bytes = b"", seed: int = 0,
-                control_n: int = CONTROL_N) -> dict:
-        """metadata.parquet (sent bytes, else downloaded) -> meta + plan."""
-        if parquet:
-            path = Path("/tmp") / PARQUET
-            path.write_bytes(parquet)
-            src = "local copy"
-        else:
-            name, token = pick_hf_token(os.environ)
-            print(f"HF token from {name or 'nowhere (anonymous)'}")
-            path = fetch_dataset_file(PARQUET, "/tmp/meta", token)
-            src = f"hf {DATASET_REPO}"
-        meta = load_meta(path)
-        return {"meta": meta, "plan": plan_job(meta, seed, control_n),
-                "source": src}
+                control_n: int = CONTROL_N, revision: str = "") -> dict:
+        """Pin the dataset commit; metadata.parquet at it -> meta + plan."""
+        name, token = pick_hf_token(os.environ)
+        print(f"HF token from {name or 'nowhere (anonymous)'}")
+        return prepare_impl(parquet, seed, control_n, revision, token)
 
     @app.function(secrets=[hf_secret], timeout=SHARD_TIMEOUT_S, retries=2)
-    def score_shard(tar: str, thumb_ids: list) -> dict:
-        return _with_tar(tar, lambda p: score_shard_impl(p, thumb_ids))
+    def score_shard(tar: str, thumb_ids: list, revision: str) -> dict:
+        return run_on_tar(tar, revision, _token(),
+                          lambda p: score_shard_impl(p, thumb_ids))
 
     @app.function(secrets=[hf_secret], timeout=SHARD_TIMEOUT_S, retries=2)
-    def thumb_shard(tar: str, ids: list) -> dict:
-        return _with_tar(tar, lambda p: thumb_shard_impl(p, ids))
+    def thumb_shard(tar: str, ids: list, revision: str) -> dict:
+        return run_on_tar(tar, revision, _token(),
+                          lambda p: thumb_shard_impl(p, ids))
 
     @app.function(timeout=30 * 60, memory=META_MEM_MIB)
-    def finalize(joined: list) -> bytes:
-        return table_bytes(joined)
+    def finalize(joined: list, revision: str) -> bytes:
+        return table_bytes(joined, revision)
 
     def _secs(res):
         return ", ".join(f"{k} {v:.0f}s" for k, v in res["seconds"].items())
 
     @app.local_entrypoint()
     def main(shards: int = 0, top_n: int = TOP_N, control_n: int = CONTROL_N,
-             seed: int = 0, out: str = "", parquet: str = str(LOCAL_PARQUET)):
+             seed: int = 0, out: str = "", parquet: str = str(LOCAL_PARQUET),
+             revision: str = ""):
         if shards < 0 or top_n < 0 or control_n < 0:
             raise SystemExit("--shards/--top-n/--control-n must be >= 0")
         out_dir = Path(out) if out else LOCAL_OUT
         t_start = time.time()
         pq_bytes = (Path(parquet).read_bytes() if Path(parquet).is_file()
                     else b"")
-        print(f"prepare: metadata from "
-              f"{parquet if pq_bytes else 'HF (no local copy)'}")
-        prep = prepare.remote(pq_bytes, seed, control_n)
+        print(f"prepare: local copy {parquet if pq_bytes else '(none)'}, "
+              f"revision {revision or 'default branch'}")
+        prep = prepare.remote(pq_bytes, seed, control_n, revision)
+        rev = prep["revision"]   # every download below is pinned to it
+        print(f"dataset {DATASET_REPO}@{rev}; {PARQUET}: {prep['source']}")
         meta = {int(k): v for k, v in prep["meta"].items()}
         plan = prep["plan"]
         tars = list(plan["shards"])[:shards] if shards else list(plan["shards"])
@@ -1049,7 +1131,7 @@ if modal is not None:
         # pass 1: metrics of every image + thumbnails of the always ids
         t1 = time.time()
         rows, thumbs, failed, per = [], {}, [], []
-        args = [(t, plan["always"].get(t, [])) for t in tars]
+        args = [(t, plan["always"].get(t, []), rev) for t in tars]
         for tar, res in zip(tars, score_shard.starmap(
                 args, return_exceptions=True, order_outputs=True)):
             if isinstance(res, BaseException):
@@ -1058,6 +1140,8 @@ if modal is not None:
                 failed.append(msg)
                 continue
             err = check_shard_result(tar, res, plan)
+            if err is None and res.get("revision") != rev:
+                err = f"{tar}: scored at {res.get('revision')}, not {rev}"
             if err:
                 failed.append(err)
                 continue
@@ -1076,10 +1160,14 @@ if modal is not None:
         print(f"pass 2: {sum(map(len, jobs.values()))} thumbnails from "
               f"{len(jobs)} shards")
         for tar, res in zip(jobs, thumb_shard.starmap(
-                list(jobs.items()), return_exceptions=True,
-                order_outputs=True)):
+                [(t, ids, rev) for t, ids in jobs.items()],
+                return_exceptions=True, order_outputs=True)):
             if isinstance(res, BaseException):
                 failed.append(f"{tar}: {type(res).__name__}: {res}")
+                continue
+            if res.get("revision") != rev:
+                failed.append(f"{tar}: thumbnails at {res.get('revision')}, "
+                              f"not {rev}")
                 continue
             thumbs.update(res["thumbs"])
             print(f"  {tar}: {len(res['thumbs'])}/{len(jobs[tar])} thumbs, "
@@ -1092,7 +1180,7 @@ if modal is not None:
         table = None
         if importlib.util.find_spec("pyarrow") is None:
             # Modal's own CLI env has no pyarrow: build it in a container
-            table = finalize.remote(join_rows(rows, meta))
+            table = finalize.remote(join_rows(rows, meta), rev)
         seconds = {"total": time.time() - t_start, "pass1": t2 - t1,
                    "pass2": t3 - t2}
         if per:
@@ -1100,7 +1188,7 @@ if modal is not None:
                 sum(r["seconds"].values()) for r in per) / len(per)
             seconds["shard_max"] = max(sum(r["seconds"].values()) for r in per)
         s = write_outputs(out_dir, rows, thumbs, meta, plan, seconds, top_n,
-                          table)
+                          table, revision=rev)
         print_summary(s)
         print(f"wrote {out_dir}/scores.parquet, {len(thumbs)} thumbs, "
               f"{out_dir}/review/index.html (review id {s['review_id']})")
@@ -1113,7 +1201,7 @@ def build_arg_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Modal: modal run scripts/modal_score_borders.py [--shards N "
                "--top-n 1500 --control-n 150 --seed 0 --out DIR --parquet "
-               "PATH]")
+               "PATH --revision SHA]")
     ap.add_argument("--tar-dir", required=True,
                     help="directory with the dataset tars (by their parquet "
                          "`tar` path or basename)")
@@ -1125,6 +1213,9 @@ def build_arg_parser():
     ap.add_argument("--control-n", type=int, default=CONTROL_N)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=SHARD_THREADS)
+    ap.add_argument("--revision", default=None,
+                    help="dataset commit the local tars + parquet come from "
+                         "(recorded only; default: unknown)")
     return ap
 
 
@@ -1167,7 +1258,8 @@ def local_main(argv=None):
         thumbs.update(thumb_shard_impl(tars[tar], ids)["thumbs"])
     check_thumbs(select_thumbs(tabs), thumbs)
     s = write_outputs(a.out, rows, thumbs, meta, plan,
-                      {"total": time.time() - t0}, a.top_n)
+                      {"total": time.time() - t0}, a.top_n,
+                      revision=a.revision)
     print_summary(s)
     return s
 
