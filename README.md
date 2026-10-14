@@ -806,6 +806,68 @@ python scripts/modal_score_borders.py --tar-dir DIR --out OUT   # same, tars alr
 python scripts/modal_score_borders.py --rerender /home/mj/krea2-ops/eval/datafilter  # page only
 ```
 
+### Dataset filter: apply the review (patch directory)
+
+`scripts/datafilter_apply.py` turns the review export
+(`datafilter_actions.json`) into a **patch directory** that the latent patch
+builder consumes; local CPU only, no Modal / HF / network. Inputs:
+the actions json, `metadata.parquet`, the review run's `scores.parquet`
+(its `dataset_revision` must equal the export's), the originals
+(`/home/mj/.cache/krea2-orig/img/<id>.webp`, from the Drive fetch) and the
+Qwen3-VL tokenizer of the local HF cache. Unknown / duplicate ids, unknown
+actions or a revision mismatch fail before anything is written.
+
+* **crop**: the original (alpha composited on white, a non-sRGB ICC profile
+  converted to sRGB) is measured with `border_metrics` (box-downscaled to a
+  long side <= 2048 for the measurement, margins mapped back so that no
+  canvas survives the downscale, then every side with a margin inset 1 px),
+  cropped, put in the bucket of the nearest aspect ratio (log space) among
+  the dataset's 19 buckets and cover-resized + center-cropped by
+  `cache_dataset.load_image` (Lanczos, the dataset path), saved as WebP q95.
+  Border phrases are stripped from long / medium / short. A crop that would
+  need upscaling -> `crop_too_small` (no image, old bucket + captions kept,
+  planned strip in `notes`); an original whose score is 0 or < 0.5x the
+  dataset image's, or a box keeping >= 98% of the original -> `crop_unsure`
+  (image produced, flagged); a missing / undecodable original -> `error`.
+* **caption**: a phrase from the dataset image's measurement + tags is
+  appended to every caption that does not already mention a border:
+  `<colour> border` (white / black / simple colour names from the canvas
+  colour; `white` from the `white border` tag when nothing was measured;
+  `border around the image` without either), `<colour> bars on the left and
+  right` / `on the top and bottom` for 2 opposite sides (or the
+  `pillarboxed` tag), plus `character extending outside the border` for
+  `outside border`.
+* **remove**: recorded only.
+
+Stripping is phrase level (comma split, sentences inside a phrase one by
+one): a phrase goes as a whole only when every word is border vocabulary
+(border, letterbox, pillarbox, "white/thin/... frame", "white/... margins",
+"bars at top and bottom", ...) or a colour / modifier / position word
+("thin white border framing the image"); a `with` / `framed by` /
+`surrounded by` ... tail of pure border words is cut from a real head
+("plain grey background with white border" -> "plain grey background");
+"framed / bordered background" loses the adjective. Phrases with other
+content ("border collie", "mirror bordered with bulbs", "chibi inset",
+"signature in the right margin", quoted text) are kept and listed in
+`notes` for review. Token counts are recounted like the dataset's own
+`*_tok` columns (caption + `, drawn by {artist}`, `CaptionTemplate`); a
+caption that an edit pushes past the 251-token budget -> `over_budget`.
+
+Output: `<out>/images/<id>.webp` (crops with an image only),
+`<out>/patch.parquet` (id, action, bucket_w/h, long/medium/short + `_old` +
+`_tok`, crop_box_orig `[x0, y0, x1, y1]` in original px, orig_w/h, status
+`ok | crop_too_small | crop_unsure | over_budget | error`, notes),
+`<out>/patch.json` (dataset revision, review id, counts, parameters,
+tokenizer sha256, tool versions) and `<out>/report.html` (self-contained:
+original with the crop box + final image, caption diffs with removed red /
+added green, status badges and filters). Written to a temp dir and renamed;
+exit 2 when any row is `error` (patch still written).
+
+```bash
+python scripts/datafilter_apply.py --actions ~/다운로드/datafilter_actions.json \
+    --out /home/mj/krea2-ops/eval/datafilter/patch    # [--overwrite] [--workers 4]
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -842,6 +904,9 @@ python tests/test_score_borders.py      # dataset border score: synthetic insets
                                         # silhouettes (WebP), shard id validation, two-pass
                                         # thumbnails, fake-tar run + review page (node),
                                         # side patterns, 4-state review logic, --rerender
+python tests/test_datafilter_apply.py   # review -> patch dir: crop geometry on synthetic
+                                        # originals, bucket choice, dataset resize reuse,
+                                        # caption phrase add / strip, token budget, e2e
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -877,6 +942,7 @@ scripts/
   modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
   modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
   modal_score_borders.py  # Modal: inset/border score of the dataset + review page
+  datafilter_apply.py  # review actions -> patch dir (crops from originals, captions)
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
