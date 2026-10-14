@@ -511,7 +511,6 @@ def analyze(state, base_path, cfg, T, workers=COH_WORKERS,
     would not fit. -> {"schedule", "groups", "tensors", "global", "by_kind",
     "by_block", ...}."""
     import ml_dtypes  # noqa: F401 - numpy 'bfloat16' for safe_open
-    import numpy as np
     from safetensors import safe_open
 
     from krea2_jax.checkpoint import _official_entries
@@ -551,24 +550,10 @@ def analyze(state, base_path, cfg, T, workers=COH_WORKERS,
                     f"{sorted(base_keys - want)[:5]}")
             for gi, (g, keys) in enumerate(groups.items()):
                 tg = time.time()
-                arrs = state.restore_group(keys)
-                tr = time.time() - tg
-                for k in keys:
-                    p, e = arrs["params"][k], arrs["ema"][k]
-                    m, v = arrs["mu"][k], arrs["nu"][k]
-                    for name, layer, shape in by_leaf[k]:
-                        sl = (lambda x: x) if layer is None else (
-                            lambda x, i=layer: x[i])
-                        b = base.get_tensor(name)
-                        if tuple(b.shape) != tuple(shape):
-                            raise ValueError(f"{name}: base {b.shape}, "
-                                             f"checkpoint {shape}")
-                        b = b.astype(np.float32)
-                        tensors[name] = tensor_sums(
-                            sl(p), sl(e), sl(m), sl(v), b, c1, c2, eps,
-                            pool=pool)
-                        del b
-                del arrs
+                # every array of the group lives only inside _group_sums:
+                # none survives into the next group's restore
+                tr = _group_sums(state, keys, by_leaf, base, tensors,
+                                 (c1, c2, eps), pool)
                 log(f"group {gi + 1}/{len(groups)} {g}: "
                     f"{sizes[g] / 2**30:.2f} GiB, restore {tr:.0f} s, "
                     f"metrics {time.time() - tg - tr:.0f} s "
@@ -588,6 +573,31 @@ def analyze(state, base_path, cfg, T, workers=COH_WORKERS,
         "seconds": time.time() - t0,
         "peak_rss_gib": peak_rss_gib(),
     }
+
+
+def _group_sums(state, keys, by_leaf, base, tensors, consts, pool):
+    """Restore one leaf group (params / ema / mu / nu) and add the sums of
+    each of its official tensors to `tensors`. All references to the
+    group's arrays are locals of this function, so they are released when
+    it returns -- before the caller restores the next group (two groups of
+    a scan checkpoint, 42 GiB each, must never be alive together).
+    -> seconds spent restoring."""
+    import numpy as np
+
+    t0 = time.time()
+    arrs = state.restore_group(keys)
+    tr = time.time() - t0
+    for k in keys:
+        trees = [arrs[t][k] for t in ("params", "ema", "mu", "nu")]
+        for name, layer, shape in by_leaf[k]:
+            b = base.get_tensor(name)
+            if tuple(b.shape) != tuple(shape):
+                raise ValueError(f"{name}: base {b.shape}, checkpoint "
+                                 f"{shape}")
+            views = trees if layer is None else [x[layer] for x in trees]
+            tensors[name] = tensor_sums(*views, b.astype(np.float32),
+                                        *consts, pool=pool)
+    return tr
 
 
 def peak_rss_gib():
@@ -653,19 +663,43 @@ def null_cos_u(lrs, b1=0.9):
 
 def invert(rows, metric, x):
     """The s (and coherent fraction) at which the simulated `metric`
-    equals x: linear interpolation on the first grid segment that brackets
-    x. Outside the simulated range: clamped to the nearest end, flagged."""
+    equals x, by linear interpolation on the grid segments that bracket x.
+      one solution        -> range "inside", s / coherent_frac
+      several solutions   -> range "ambiguous" (a non-monotone curve, e.g.
+                             ||De||/||D|| near saturation, or a flat
+                             segment equal to x): s / coherent_frac None,
+                             "candidates" [{s, coherent_frac}] and their
+                             s_min / s_max / coherent_frac_min / _max
+      outside the curve   -> range "below" / "above", clamped to the
+                             nearest end."""
     if x is None:
         return None
     pts = [(r["s"], r[metric], r["coherent_frac"]) for r in rows
            if r[metric] is not None]
+    cands = []
     for (s0, y0, f0), (s1, y1, f1) in zip(pts, pts[1:]):
         if min(y0, y1) <= x <= max(y0, y1):
-            w = 0.0 if y1 == y0 else (x - y0) / (y1 - y0)
-            return {"metric": metric, "measured": x,
-                    "s": s0 + w * (s1 - s0),
-                    "coherent_frac": f0 + w * (f1 - f0),
-                    "range": "inside"}
+            if y1 == y0:   # flat at x: every s of the segment fits
+                cands += [(s0, f0), (s1, f1)]
+            else:
+                w = (x - y0) / (y1 - y0)
+                cands.append((s0 + w * (s1 - s0), f0 + w * (f1 - f0)))
+    uniq = []   # x on a grid point is bracketed by both its segments
+    for s, f in sorted(cands):
+        if not uniq or abs(s - uniq[-1][0]) > 1e-12 * max(1.0, abs(s)):
+            uniq.append((s, f))
+    out = {"metric": metric, "measured": x}
+    if len(uniq) == 1:
+        return {**out, "s": uniq[0][0], "coherent_frac": uniq[0][1],
+                "range": "inside"}
+    if uniq:
+        fs = [f for _, f in uniq]
+        return {**out, "s": None, "coherent_frac": None,
+                "range": "ambiguous",
+                "candidates": [{"s": s, "coherent_frac": f}
+                               for s, f in uniq],
+                "s_min": uniq[0][0], "s_max": uniq[-1][0],
+                "coherent_frac_min": min(fs), "coherent_frac_max": max(fs)}
     ys = [y for _, y, _ in pts]
     lo, hi = min(range(len(ys)), key=ys.__getitem__), max(
         range(len(ys)), key=ys.__getitem__)
@@ -776,8 +810,8 @@ def report_table(rep):
 def implied_table(imp):
     lines = ["implied effective SNR / coherent fraction of ||D||^2 (from the "
              "simulation):",
-             f"{'':<12}{'cos(-u,D)':>10}{'s':>8}{'coh':>8}"
-             f"{'|De|/|D|':>10}{'s':>8}{'coh':>8}"]
+             f"{'':<12}{'cos(-u,D)':>10}{'s':>15}{'coh':>15}"
+             f"{'|De|/|D|':>10}{'s':>15}{'coh':>15}"]
     for name, v in imp.items():
         if name == "note":
             continue
@@ -785,15 +819,21 @@ def implied_table(imp):
         for m in ("cos_u", "ema_ratio"):
             r = v.get(m)
             if r is None:
-                row += f"{'-':>10}{'-':>8}{'-':>8}"
+                row += f"{'-':>10}{'-':>15}{'-':>15}"
                 continue
-            flag = "" if r["range"] == "inside" else (
-                "<" if r["range"] == "below" else ">")
-            row += (f"{r['measured']:>10.4f}{flag + format(r['s'], '.4f'):>8}"
-                    f"{r['coherent_frac']:>8.4f}")
+            if r["range"] == "ambiguous":
+                s = f"?{r['s_min']:.4f}-{r['s_max']:.4f}"
+                f = (f"{r['coherent_frac_min']:.4f}-"
+                     f"{r['coherent_frac_max']:.4f}")
+            else:
+                flag = {"inside": "", "below": "<", "above": ">"}[r["range"]]
+                s, f = flag + format(r["s"], ".4f"), format(
+                    r["coherent_frac"], ".4f")
+            row += f"{r['measured']:>10.4f}{s:>15}{f:>15}"
         lines.append(row)
     lines.append("(< / >: measured value outside the simulated range, "
-                 "clamped) " + imp["note"])
+                 "clamped; ?a-b: ambiguous, the simulated curve reaches it "
+                 "at several s) " + imp["note"])
     return "\n".join(lines)
 
 

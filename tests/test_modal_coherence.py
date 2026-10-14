@@ -17,11 +17,15 @@ weights (tiny train states saved with the repo's own save path):
     chunked / threaded sums == one chunk, undefined values -> None
   * analyze() on the tiny state == a direct numpy computation (global,
     per kind); the scan and unroll layouts give identical per-tensor sums;
-    official keys / kinds / blocks; memory-budget refusal
+    official keys / kinds / blocks; memory-budget refusal; every array of
+    a leaf group is released (weakref probe, no gc) before the next group
+    is restored
   * schedule == train_full.make_schedule (optax) for warmup / constant /
     cosine configs; the simulation's Adam == optax.adam on the same
     gradients; s = 0: cos(-u, D) ~ 10/sqrt(19 T_eff), ||De||/||D|| ~ 0.51
     (T 1513, warmup 150); large s: rms(D)/lr_sum -> 1, cos -> 1; inversion
+    (unique, clamped, and "ambiguous" for a non-monotone or flat curve,
+    incl. the real run1 ||De||/||D|| tail)
   * coherence_impl end to end against a fake R2 (the S3 fake of
     tests/test_modal_export_full.py, with the s3transfer download
     allowlist): params already on the volume -> only ema / opt_state
@@ -450,6 +454,30 @@ def test_analyze(tmp_path):
         for k in mc.SUM_KEYS:
             assert math.isclose(tu[key][k], ts[key][k], rel_tol=1e-12,
                                 abs_tol=1e-30), (key, k)
+    # a group's arrays are all released before the next group is restored
+    # (weakref probe on every array restore_group hands out)
+    import weakref
+
+    class Probe:
+        def __init__(self, st):
+            self.st, self.leaves = st, st.leaves
+            self.params_tree = st.params_tree
+            self.prev, self.calls, self.alive = [], 0, []
+
+        def restore_group(self, keys):
+            # no gc.collect(): the arrays must go by refcount alone
+            self.alive.append(sum(r() is not None for r in self.prev))
+            got = self.st.restore_group(keys)
+            self.prev = [weakref.ref(a) for t in got.values()
+                         for a in t.values()]
+            self.calls += 1
+            return got
+    probe = Probe(mc.TrainState(*item_dirs(tmp_path / "ckpt_scan")))
+    rep = mc.analyze(probe, _base(tmp_path), RUN_CFG, STEPS, workers=2,
+                     log=lambda *_: None)
+    assert probe.calls == len(mc.plan_groups(probe.leaves)) > 1
+    assert probe.alive == [0] * probe.calls, probe.alive
+    assert rep["tensors"] == reps["scan"]["tensors"]
     # memory budget refusal (before anything is read)
     st = mc.TrainState(*item_dirs(tmp_path / "ckpt_scan"))
     try:
@@ -565,6 +593,33 @@ def test_sim_limits(tmp_path=None):
     assert math.isclose(r["coherent_frac"], 0.45)
     r = mc.invert(grid, "ema_ratio", 0.49)
     assert math.isclose(r["s"], 0.05) and r["range"] == "inside"
+    r = mc.invert(grid, "cos_u", 0.4)   # on a grid point: one solution
+    assert r["range"] == "inside" and math.isclose(r["s"], 0.1)
+    # ambiguous: the flat ||De||/||D|| tail equals x for every s in it
+    r = mc.invert(grid, "ema_ratio", 0.47)
+    assert r["range"] == "ambiguous" and r["s"] is None, r
+    assert (r["s_min"], r["s_max"]) == (0.1, 1.0)
+    assert (r["coherent_frac_min"], r["coherent_frac_max"]) == (0.9, 1.0)
+    # ambiguous: the real (non-monotone) curve of the run1 --sim-only table;
+    # the s = 1.0 row's own ||De||/||D|| is also reached near s = 0.45
+    sim = [(0.0, 0.0545, 0.5148, 0.0), (0.003, 0.0668, 0.5112, 0.0122),
+           (0.01, 0.0733, 0.5056, 0.1314), (0.02, 0.0977, 0.4987, 0.3690),
+           (0.03, 0.1342, 0.4903, 0.5644), (0.05, 0.2162, 0.4790, 0.7884),
+           (0.1, 0.4055, 0.4724, 0.9377), (0.2, 0.6605, 0.4707, 0.9838),
+           (0.5, 0.9113, 0.4701, 0.9979), (1.0, 0.9748, 0.4702, 0.9996)]
+    rows = [{"s": s, "cos_u": c, "ema_ratio": er, "coherent_frac": f}
+            for s, c, er, f in sim]
+    r = mc.invert(rows, "ema_ratio", 0.4702)
+    assert r["range"] == "ambiguous" and r["s"] is None, r
+    assert len(r["candidates"]) == 2 and r["s_max"] == 1.0
+    assert 0.2 < r["s_min"] < 0.5, r
+    assert mc.invert(rows, "ema_ratio", 0.49)["range"] == "inside"
+    r = mc.invert(rows, "cos_u", 0.9748)    # monotone metric: unique
+    assert r["range"] == "inside" and r["s"] == 1.0
+    table = mc.implied_table({"note": "n", "global": {
+        "cos_u": mc.invert(rows, "cos_u", 0.3),
+        "ema_ratio": mc.invert(rows, "ema_ratio", 0.4702)}})
+    assert "?0.4" in table and "-1.0000" in table, table
     assert mc.invert(grid, "cos_u", 0.01)["range"] == "below"
     assert mc.invert(grid, "cos_u", 0.01)["s"] == 0.0
     assert mc.invert(grid, "ema_ratio", 0.6)["range"] == "above"
