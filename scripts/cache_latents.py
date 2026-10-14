@@ -431,6 +431,25 @@ def check_digests(old, new):
             sorted(old.keys() - new.keys()))
 
 
+PATCH_KEYS = ("superseded", "patches")  # scripts/modal_patch_latents.py
+
+
+def refuse_patched(mpath):
+    """SystemExit if `mpath` is the manifest of a patched version (written
+    by scripts/modal_patch_latents.py build): --write-manifest would replace
+    its metadata.parquet with the source dataset's and drop the patch."""
+    try:
+        old = json.loads(Path(mpath).read_text())
+    except (OSError, ValueError):
+        return
+    if isinstance(old, dict) and any(k in old for k in PATCH_KEYS):
+        raise SystemExit(
+            f"{mpath} belongs to a patched version (has "
+            f"{[k for k in PATCH_KEYS if k in old]}): --write-manifest would "
+            "overwrite its metadata.parquet and drop the patch. Patched "
+            "versions are built by scripts/modal_patch_latents.py build.")
+
+
 def write_manifest(out_dir, parquet_src, log=print, verify_digests=None):
     """Verify every shard against `parquet_src`, hash every shard file
     (sha256), then copy the parquet to out/metadata.parquet and write
@@ -444,6 +463,7 @@ def write_manifest(out_dir, parquet_src, log=print, verify_digests=None):
     out_dir = Path(out_dir)
     lat_dir = out_dir / "latents"
     mpath = lat_dir / "manifest.json"
+    refuse_patched(mpath)
     cols = read_metadata(parquet_src)
     names = sorted({shard_name(t) for t in cols["tar"]})
     t0 = time.time()
