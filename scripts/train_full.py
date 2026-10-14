@@ -20,6 +20,8 @@ h_tok x w_tok grid first, zero padding after); padded rows are masked out of
 attention and of the loss, which is the per-sample mean squared error over
 the valid image tokens, averaged over the batch. The timestep shift mu is
 derived per sample from its image-token count (or --timestep-mu for all).
+--resume-new-dataset continues a checkpoint's train state on a new dataset
+version, whose data order starts at its own epoch 0 (data_step_offset).
 
 Outputs under --output-dir:
     ckpt/<step>/                   orbax train state (params, opt_state, ema)
@@ -201,9 +203,12 @@ RESUME_SOFT_KEYS = (
 # Soft keys that do not touch the optimizer or LR schedule (same math up to
 # kernel rounding, or a name only).
 _COMPUTE_SOFT_KEYS = ("act_sharding", "attn", "text_encoder")
+# The hard keys that identify the dataset version: --resume-new-dataset lets
+# exactly these differ (every other hard key is still enforced).
+DATASET_KEYS = ("dataset_fingerprint", "n_samples")
 
 
-def check_resume_config(saved, current, step):
+def check_resume_config(saved, current, step, new_dataset=False):
     """Compare a checkpoint's run config with the current one.
 
     Raises SystemExit listing every differing RESUME_HARD_KEYS entry (and an
@@ -211,7 +216,9 @@ def check_resume_config(saved, current, step):
     RESUME_SOFT_KEYS entries. A checkpoint without a config (older format)
     only warns, except that the historical defaults of _RESUME_KEY_DEFAULTS
     (keys every such checkpoint used, e.g. layer_loop "scan") are still
-    enforced as hard keys. Returns the list of warning lines printed.
+    enforced as hard keys. new_dataset (--resume-new-dataset) exempts
+    DATASET_KEYS from the comparison (resume_data_position handles them).
+    Returns the list of warning lines printed.
     """
     if saved is None:
         hard = [f"  {k}: checkpoint {v!r}, now {current[k]!r}"
@@ -231,8 +238,11 @@ def check_resume_config(saved, current, step):
         print(msg, flush=True)
         return [msg]
     hard, soft, unrecorded, soft_changed = [], [], [], []
+    dataset_changed = False
     for keys, out in ((RESUME_HARD_KEYS, hard), (RESUME_SOFT_KEYS, soft)):
         for k in keys:
+            if new_dataset and k in DATASET_KEYS:
+                continue
             if k not in saved and k not in _RESUME_KEY_DEFAULTS:
                 unrecorded.append(k)
                 continue
@@ -241,6 +251,7 @@ def check_resume_config(saved, current, step):
                 out.append(f"  {k}: checkpoint {old!r}, now {current[k]!r}")
                 if out is soft:
                     soft_changed.append(k)
+                dataset_changed |= k in DATASET_KEYS
     old_ema = saved.get("ema_decay")
     if old_ema is not None and (old_ema > 0) != (current["ema_decay"] > 0):
         hard.append(
@@ -255,6 +266,9 @@ def check_resume_config(saved, current, step):
             "objective or train-state shape and cannot change mid-run:\n"
             + "\n".join(hard)
             + "\nRerun with the checkpoint's values, or use a fresh --output-dir."
+            + ("\nTo continue this train state on a new dataset version "
+               "(its data order restarts at epoch 0), pass "
+               "--resume-new-dataset." if dataset_changed else "")
         )
     lines = []
     if soft:
@@ -276,6 +290,63 @@ def check_resume_config(saved, current, step):
     for line in lines:
         print(line, flush=True)
     return lines
+
+
+def resume_data_position(saved, current, step, new_dataset):
+    """Data position of a resume from checkpoint `step` (after
+    check_resume_config passed): returns (data_step_offset, switch).
+
+    The loader starts at `step - data_step_offset`. A normal resume keeps
+    the checkpoint's offset (0 for checkpoints that predate the key); with
+    new_dataset (--resume-new-dataset) and a checkpoint whose DATASET_KEYS
+    differ from `current`, the offset becomes `step`, so the new dataset
+    starts at its own epoch 0, and `switch` is the record of that switch
+    (else None). new_dataset with the checkpoint's own dataset is a no-op
+    (e.g. run2 resuming its own newer checkpoint with the flag still set).
+    With new_dataset, prints a NOTE either way.
+    """
+    if saved is None:
+        if new_dataset:
+            raise SystemExit(
+                f"--resume-new-dataset: checkpoint step {step} has no saved "
+                "run configuration, so the dataset it was trained on is "
+                "unknown; cannot tell whether this is a new dataset version"
+            )
+        return 0, None
+    offset = int(saved.get("data_step_offset", 0))
+    if not new_dataset:
+        return offset, None
+    if any(k not in saved for k in DATASET_KEYS):
+        raise SystemExit(
+            f"--resume-new-dataset: checkpoint step {step}'s run "
+            "configuration does not record "
+            + ", ".join(k for k in DATASET_KEYS if k not in saved)
+            + "; cannot tell whether this is a new dataset version"
+        )
+    if all(saved[k] == current[k] for k in DATASET_KEYS):
+        print(f"NOTE: --resume-new-dataset: checkpoint step {step} was "
+              "trained on this same dataset (fingerprint "
+              f"{current['dataset_fingerprint'][:12]}, "
+              f"{current['n_samples']} samples); nothing to switch, the data "
+              f"order continues (data_step_offset {offset})", flush=True)
+        return offset, None
+    switch = {
+        "step": int(step),
+        "from_fingerprint": saved["dataset_fingerprint"],
+        "to_fingerprint": current["dataset_fingerprint"],
+        "from_n_samples": saved["n_samples"],
+        "to_n_samples": current["n_samples"],
+    }
+    print(f"NOTE: --resume-new-dataset: continuing the train state of step "
+          f"{step} (params, optimizer, EMA, LR schedule position) on a new "
+          "dataset version:\n"
+          f"  dataset_fingerprint {switch['from_fingerprint'][:12]} -> "
+          f"{switch['to_fingerprint'][:12]}\n"
+          f"  n_samples {switch['from_n_samples']} -> "
+          f"{switch['to_n_samples']}\n"
+          f"  its data order starts at epoch 0 (data_step_offset {step})",
+          flush=True)
+    return int(step), switch
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +602,15 @@ def parse_args(argv=None):
                          "newest; implies --resume. Newer step directories "
                          "are renamed to <step>.superseded so they no longer "
                          "shadow the resumed run")
+    ap.add_argument("--resume-new-dataset", action="store_true",
+                    help="allow resuming a checkpoint that was trained on a "
+                         "different dataset version (only the dataset "
+                         "fingerprint and sample count may differ); the full "
+                         "train state and the LR schedule position carry "
+                         "over and the new dataset starts at its own epoch 0 "
+                         "at the resumed step. Needs --resume / --resume-step "
+                         "and an existing checkpoint; a no-op when the "
+                         "checkpoint already used this dataset")
     ap.add_argument("--export-every", type=int, default=0,
                     help="also write model_stepNNNNNN.safetensors every N "
                          "steps (0: export only at the end)")
@@ -703,6 +783,13 @@ def main(argv=None):
         raise SystemExit(
             f"{ckpt_dir} already holds checkpoint step {resume_step}; pass "
             "--resume to continue it, or use a fresh --output-dir"
+        )
+    if args.resume_new_dataset and resume_step is None:
+        # the flag means a continuation: never silently start from the base
+        raise SystemExit(
+            "--resume-new-dataset continues an existing checkpoint, but "
+            + (f"there is no checkpoint in {ckpt_dir}" if args.resume else
+               "neither --resume nor --resume-step was given")
         )
     if args.resume and resume_step is None:
         print(f"no checkpoint in {ckpt_dir}; starting fresh")
@@ -887,6 +974,11 @@ def main(argv=None):
         "act_sharding": args.act_sharding,
         "attn": args.attn,
         "layer_loop": args.layer_loop,
+        # derived, not flags (never compared on resume): the loader reads
+        # data step `step - data_step_offset`, and the dataset-version
+        # switches (--resume-new-dataset) that led to this train state
+        "data_step_offset": 0,
+        "dataset_switches": [],
     }
     if resume_step is not None:
         # before the (slow) base load and before --resume-step renames
@@ -896,7 +988,14 @@ def main(argv=None):
                 saved_meta = fullft_ckpt.read_meta_at(str(ckpt_dir), resume_step)
             except Exception as e:
                 raise _unreadable_step(resume_step, ckpt_dir, e) from e
-        check_resume_config(saved_meta.get("config"), run_config, resume_step)
+        saved_config = saved_meta.get("config")
+        check_resume_config(saved_config, run_config, resume_step,
+                            new_dataset=args.resume_new_dataset)
+        run_config["data_step_offset"], switch = resume_data_position(
+            saved_config, run_config, resume_step, args.resume_new_dataset)
+        run_config["dataset_switches"] = (
+            list((saved_config or {}).get("dataset_switches", []))
+            + ([switch] if switch else []))
         do_renames()
     manager = fullft_ckpt.make_manager(str(ckpt_dir), max_to_keep=args.keep)
 
@@ -1008,11 +1107,20 @@ def main(argv=None):
               f"in {time.time() - t_exp:.0f}s")
 
     # --- loop ---
+    # the per-step RNG (noise, timesteps) and the LR schedule follow the
+    # global step; only the data order (epoch permutation, per-epoch caption
+    # and artist draws) follows the data step, which restarts at 0 when
+    # --resume-new-dataset switches the dataset version
     rng = jax.random.PRNGKey(args.seed)
+    data_step = start_step - run_config["data_step_offset"]
     loader = BucketBatchLoader(
-        dataset, args.batch_size, args.seed, start_step=start_step,
+        dataset, args.batch_size, args.seed, start_step=data_step,
         prefetch=args.prefetch, workers=args.loader_workers,
     )
+    epoch, k = divmod(data_step, loader.steps_per_epoch)
+    print(f"data: step {start_step + 1} reads data step {data_step} (epoch "
+          f"{epoch}, batch {k}/{loader.steps_per_epoch}; data_step_offset "
+          f"{run_config['data_step_offset']})")
     batches = iter(loader)
     ema_loss, t_log, n_log = None, time.time(), 0
     t_train, last_step = time.time(), start_step
