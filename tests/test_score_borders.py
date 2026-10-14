@@ -25,6 +25,15 @@
     the dataset commit is resolved once and pinned for metadata.parquet and
     both tar passes (fake HfApi / download), recorded in summary.json,
     the scores.parquet schema metadata and the review page / export
+  * review v2: side_pattern (4 / 3 / 2-opp / 2-adj / 1 / 0, stored on new
+    rows, recovered exactly from an old row's rounded margins + h / w); tab A
+    = score > 0 AND a border pattern (4 / 3 / 2-opp); the 4-state click
+    cycle (keep -> caption -> crop -> remove), v2 localStorage key, foreign /
+    malformed entries dropped, datafilter_actions.json export (node);
+    --rerender of a v1 run (synthetic): default tab A exact by construction,
+    only review/index.html written (v1 page backed up), a tab id without a
+    thumbnail / lists that disagree with scores.parquet fail; the real run's
+    outputs re-rendered from a temp copy (read-only, skipped if absent)
   * tag / caption flags, the always-thumb plan (watermark,
     border-uncaptioned, seeded white-background control)
   * dry run: a fake tar of synthetic WebPs (+ json/txt members) through the
@@ -585,11 +594,94 @@ def test_blank_and_input_checks():
 
 
 # ------------------------------------------------------------------ selection
+MARGINS = {"4": (0.1, 0.1, 0.1, 0.1), "3": (0.1, 0.0, 0.05, 0.05),
+           "2-opp": (0.0, 0.0, 0.2, 0.2), "2-adj": (0.1, 0.0, 0.1, 0.0),
+           "1": (0.0, 0.3, 0.0, 0.0), "0": (0.01, 0.0, 0.0, 0.0)}
+
+
+def _margins(pattern):
+    return {f"margin_{s}": v for s, v in zip(msb.SIDES, MARGINS[pattern])}
+
+
+def test_side_pattern():
+    sp = msb.side_pattern
+    for want, m in MARGINS.items():
+        assert sp(m) == want, (want, m)
+        assert sp(dict(zip(msb.SIDES, m))) == want
+        assert sp(_margins(want)) == want
+    assert sp((0.1, 0.1, 0.0, 0.0)) == "2-opp"          # letterbox
+    assert sp((0.0, 0.1, 0.0, 0.1)) == "2-adj"
+    assert sp((0.0, 0.1, 0.1, 0.0)) == "2-adj"
+    assert sp((0.0, 0.1, 0.1, 0.1)) == "3"
+    # >= MIN_SIDE_FRAC counts, just below does not
+    assert sp((msb.MIN_SIDE_FRAC,) * 4) == "4"
+    assert sp((msb.MIN_SIDE_FRAC - 1e-9,) * 4) == "0"
+    assert sp((None, 0.1, None, 0.1)) == "2-adj"
+    try:
+        sp((0.1, 0.1))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("2 margins accepted")
+    assert set(msb.SIDE_PATTERN_LABELS) == {"4", "3", "2-opp", "2-adj", "1", "0"}
+    assert msb.BORDER_PATTERNS == ("4", "3", "2-opp")
+    # stored on new rows; the same from an old row's rounded margins
+    pb = canvas((0, 0, 0), 2.0, h=832, w=1216)
+    pb[:, 304:1216 - 304] = photo(832, 608, 3)
+    cases = {"4": inset(0.08, 0.08), "2-opp": webp(pb),
+             "0": webp(photo(H, W, 5))}
+    c = canvas()
+    c[int(H * 0.1):, int(W * 0.1):] = photo(H - int(H * 0.1), W - int(W * 0.1), 2)
+    cases["2-adj"] = webp(c)
+    c = canvas()
+    c[int(H * 0.1):, int(W * 0.05):W - int(W * 0.05)] = photo(
+        H - int(H * 0.1), W - 2 * int(W * 0.05), 2)
+    cases["3"] = webp(c)
+    for want, img in cases.items():
+        m = msb.border_metrics(img)
+        assert m["side_pattern"] == want, (want, m)
+        assert msb.PATTERN_SIDES[want] == m["n_sides"], m
+        old = {k: v for k, v in m.items() if k != "side_pattern"}
+        assert msb.row_side_pattern(old) == want, (want, old)
+    # an old row: 30 px of 2001 = 0.014993 (< MIN_SIDE_FRAC) is stored as
+    # 0.015; the px recovered from h gives the unrounded answer
+    row = {"margin_top": 0.015, "margin_bottom": 0.015, "margin_left": 0.1,
+           "margin_right": 0.1, "h": 2001, "w": 1000}
+    assert round(30 / 2001, msb.ROUND) == 0.015 and 30 / 2001 < msb.MIN_SIDE_FRAC
+    assert msb.row_side_pattern(row) == "2-opp"
+    assert msb.row_side_pattern({k: v for k, v in row.items()
+                                 if k not in ("h", "w")}) == "4"
+    assert msb.row_side_pattern(dict(row, side_pattern="1")) == "1"
+
+
+def test_tab_a_border_patterns_only():
+    joined = []
+    for i, (pat, sc) in enumerate([("2-adj", 0.9), ("4", 0.8), ("1", 0.7),
+                                   ("2-opp", 0.6), ("0", 0.5), ("3", 0.4),
+                                   ("4", 0.3), ("4", 0.0)], start=1):
+        joined.append({"id": i, "score": sc, **_margins(pat)})
+    joined.append({"id": 20, "error": "broken"})
+    plan = {"watermark": [], "uncaptioned": [], "control": []}
+    assert msb.build_tabs(joined, plan, top_n=3)["A"] == [2, 4, 6]
+    assert msb.build_tabs(joined, plan, top_n=10)["A"] == [2, 4, 6, 7]
+    # a stored side_pattern column wins over the margins
+    joined[0]["side_pattern"] = "4"
+    assert msb.build_tabs(joined, plan, top_n=2)["A"] == [1, 2]
+    s = msb.summarize(joined[1:], msb.build_tabs(joined[1:], plan, 10), set(),
+                      {"shards": {}}, {})
+    assert s["side_patterns_A"] == {"4": 2, "3": 1, "2-opp": 1, "2-adj": 0,
+                                    "1": 0, "0": 0}, s["side_patterns_A"]
+    assert s["side_patterns_score_gt0"]["1"] == 1
+
+
 def test_thumb_selection():
-    joined = [{"id": i, "score": sc, "pillar_or_letter": pl}
-              for i, sc, pl in [(1, 0.5, False), (2, 0.04, False),
-                                (3, 0.0, True), (4, 0.01, False),
-                                (5, 0.0, False)]]
+    joined = [{"id": i, "score": sc, "pillar_or_letter": pl, **_margins(pat)}
+              for i, sc, pl, pat in [(1, 0.5, False, "4"),
+                                     (2, 0.04, False, "3"),
+                                     (3, 0.0, True, "2-opp"),
+                                     (4, 0.01, False, "4"),
+                                     (5, 0.0, False, "0"),
+                                     (8, 0.3, False, "2-adj")]]
     joined.append({"id": 6, "error": "broken"})
     plan = {"watermark": [5], "uncaptioned": [], "control": [7]}
     tabs = msb.build_tabs(joined, plan, top_n=2)
@@ -784,7 +876,13 @@ def _check_outputs(out, truth, s):
     assert data["items"][str(insets[0])]["cap"] == f"image {insets[0]} </script> \"quoted\""
     assert not re.search(r'(src|href)\s*=\s*["\']?https?:', page), "external URL"
     assert "@import" not in page and "prefers-color-scheme: dark" in page
-    assert "localStorage" in page and "datafilter_remove.json" in page
+    assert "localStorage" in page and "datafilter_actions.json" in page
+    assert "datafilter_review_v2:" in page and "datafilter_remove" not in page
+    for i in data["tabs"]["A"]:      # tab A: border side patterns only
+        assert data["items"][str(i)]["sp"] in msb.BORDER_PATTERNS
+    for r in t:                      # stored column == the margin-derived one
+        assert r["side_pattern"] == msb.row_side_pattern(
+            {k: v for k, v in r.items() if k != "side_pattern"}), r
     js = json.loads((out / "summary.json").read_text())
     assert set(js["missing_thumbs"].values()) == {0}, js["missing_thumbs"]
 
@@ -839,50 +937,85 @@ def test_dry_run_shard_and_outputs():
         assert (out2 / "scores.parquet").read_bytes() == tb
 
 
-def test_review_identity_and_storage_logic():
-    tabs = {"A": [1, 2], "B": [3], "C": [], "D": [], "E": []}
-    gen = "2026-10-14T00:00:00+00:00"
-    rid = msb.review_id(tabs, gen)
-    assert rid == msb.review_id(tabs, gen)
-    assert rid != msb.review_id(tabs, "2026-10-14T00:00:01+00:00")
-    assert rid != msb.review_id(dict(tabs, A=[1, 4]), gen)
-    items = {str(i): {"s": 0.1 * i} for i in (1, 2, 3)}
-    page = msb.render_review(tabs, items, gen)
-    data = json.loads(re.search(
-        r'<script id="data" type="application/json">(.*?)</script>', page,
-        re.S).group(1))
-    assert data["review_id"] == rid and data["generated"] == gen
-    assert "storeKey(D)" in page and "loadSel(localStorage.getItem(KEY),D)" in page
+def _run_node(js):
     node = shutil.which("node")
     if node is None:
-        print("node not found: storage logic not executed")
-        return
-    logic = re.search(r'<script id="logic">(.*?)</script>', page, re.S).group(1)
-    js = logic + """
-var D=%s;
-function eq(a,b,m){if(JSON.stringify(a)!==JSON.stringify(b)){
-  throw new Error(m+': '+JSON.stringify(a)+' != '+JSON.stringify(b))}}
-eq(storeKey(D),'datafilter_remove_v1:'+D.review_id,'key');
-var raw=JSON.stringify({'1':{tab:'A',score:0.1},'99':{tab:'A',score:1},
-  '3':{tab:'B',score:null},'2':'junk'});
-var sel=loadSel(raw,D);
-eq(Object.keys(sel).sort(),['1','3'],'foreign / malformed ids dropped');
-eq(loadSel('not json',D),{},'bad json');
-eq(loadSel('[1,2]',D),{},'array');
-eq(loadSel(null,D),{},'empty');
-sel['77']={tab:'A',score:2};
-var ex=exportObj(sel,D,'NOW');
-eq(ex.review_id,D.review_id,'export id');eq(ex.generated,D.generated,'gen');
-eq(ex.dataset_revision,D.revision,'export revision');
-eq(ex.items.map(function(x){return x.id}).sort(),[1,3],'export ids');
-console.log('ok');
-""" % json.dumps(data)
+        print("node not found: page logic not executed")
+        return None
     with tempfile.TemporaryDirectory() as d:
         f = Path(d) / "t.js"
         f.write_text(js)
         p = subprocess.run([node, str(f)], capture_output=True, text=True,
                            timeout=60)
     assert p.returncode == 0 and p.stdout.strip() == "ok", p.stderr
+    return p
+
+
+def test_review_identity_and_storage_logic():
+    tabs = {"A": [1, 2], "B": [3, 1], "C": [], "D": [], "E": [2]}
+    gen = "2026-10-14T00:00:00+00:00"
+    rid = msb.review_id(tabs, gen)
+    assert rid == msb.review_id(tabs, gen)
+    assert rid != msb.review_id(tabs, "2026-10-14T00:00:01+00:00")
+    assert rid != msb.review_id(dict(tabs, A=[1, 4]), gen)
+    items = {"1": {"s": 0.1, "sp": "4"}, "2": {"s": 0.2, "sp": "2-opp"},
+             "3": {"s": None, "sp": None}}
+    page = msb.render_review(tabs, items, gen, revision="abc")
+    data = json.loads(re.search(
+        r'<script id="data" type="application/json">(.*?)</script>', page,
+        re.S).group(1))
+    assert data["review_id"] == msb.review_id(tabs, gen, "abc") != rid
+    assert data["generated"] == gen and data["revision"] == "abc"
+    assert data["patterns"] == msb.SIDE_PATTERN_LABELS
+    assert data["border_patterns"] == ["4", "3", "2-opp"]
+    assert "storeKey(D)" in page and "loadSel(localStorage.getItem(KEY),D)" in page
+    assert "datafilter_actions.json" in page and "datafilter_remove" not in page
+    for label in ("캡션 보완", "자르기", "제거", "id=\"legend\""):
+        assert label in page, label
+    logic = re.search(r'<script id="logic">(.*?)</script>', page, re.S).group(1)
+    js = logic + """
+var D=%s;
+function eq(a,b,m){if(JSON.stringify(a)!==JSON.stringify(b)){
+  throw new Error(m+': '+JSON.stringify(a)+' != '+JSON.stringify(b))}}
+eq(storeKey(D),'datafilter_review_v2:'+D.review_id,'key');
+eq(STATES,['keep','caption','crop','remove'],'states');
+// 4-state cycle keep -> caption -> crop -> remove -> keep
+var sel={}, seen=[];
+for(var i=0;i<5;i++){seen.push(cycle(sel,1))}
+eq(seen,['caption','crop','remove','keep','caption'],'cycle');
+eq(sel,{'1':'caption'},'cycle state');
+cycle(sel,1);cycle(sel,1);cycle(sel,1);eq(sel,{},'keep = absent');
+eq(nextState(undefined),'caption','unknown -> caption');
+eq(nextState('bogus'),'caption','bogus -> caption');
+setState(sel,2,'crop');setState(sel,3,'remove');setState(sel,1,'caption');
+eq(stateCounts(sel,D),{keep:0,caption:1,crop:1,remove:1},'counts');
+setState(sel,3,'keep');setState(sel,1,'bogus');
+eq(sel,{'2':'crop'},'setState keep / bogus deletes');
+eq(stateCounts(sel,D),{keep:2,caption:0,crop:1,remove:0},'counts 2');
+// load: foreign ids, keep, unknown states, the v1 object format dropped
+var raw=JSON.stringify({'1':'caption','99':'remove','2':'keep','3':'crop',
+  '__proto__':'remove','x':'crop'});
+eq(loadSel(raw,D),{'1':'caption','3':'crop'},'foreign / keep dropped');
+eq(loadSel(JSON.stringify({'1':{tab:'A',score:0.1},'2':'bogus','3':5}),D),{},
+   'malformed');
+eq(loadSel('not json',D),{},'bad json');
+eq(loadSel('[1,2]',D),{},'array');
+eq(loadSel('null',D),{},'null');
+eq(loadSel(null,D),{},'empty');
+// export: only non-keep ids of this page, every tab of the id
+var s2={'2':'remove','1':'caption','3':'crop','77':'remove'};
+var ex=exportObj(s2,D);
+eq(Object.keys(ex),['review_id','generated','dataset_revision','items'],'keys');
+eq(ex.review_id,D.review_id,'export id');eq(ex.generated,D.generated,'gen');
+eq(ex.dataset_revision,'abc','export revision');
+eq(ex.items,[
+  {id:1,action:'caption',tabs:['A','B'],score:0.1,side_pattern:'4'},
+  {id:2,action:'remove',tabs:['A','E'],score:0.2,side_pattern:'2-opp'},
+  {id:3,action:'crop',tabs:['B'],score:null,side_pattern:null}],'items');
+eq(exportObj({},D).items,[],'empty export');
+console.log('ok');
+""" % json.dumps(data)
+    _run_node(js)
 
 
 def test_local_cli_end_to_end():
@@ -944,6 +1077,250 @@ def test_local_cli_end_to_end():
                                             "modal_score_borders.py"), "--help"],
                        capture_output=True, text=True, timeout=60)
     assert h.returncode == 0 and "modal run" in h.stdout
+
+
+# ------------------------------------------------------------------ re-render
+REV = "05a9a13d4159363a5f5a5258ff3ae904506267bb"
+PX = {"4": (100, 100, 80, 80), "3": (100, 0, 60, 60), "2-opp": (0, 0, 120, 120),
+      "2-adj": (90, 0, 70, 0), "1": (0, 150, 0, 0), "0": (10, 0, 0, 0)}
+PATS = list(PX)
+
+
+def _old_run(root, old_n=12, control_n=4):
+    """A finished v1 run: scores.parquet WITHOUT side_pattern (rounded
+    margins, h / w), summary.json, thumbs of every v1 tab id and a v1 page
+    (its inline data; no `patterns`). -> (root, info)."""
+    root = Path(root)
+    (root / "thumbs").mkdir(parents=True)
+    (root / "review").mkdir()
+    rows = []
+    for i in range(1, 41):
+        pat = PATS[i % 6]
+        t, b, l, r = PX[pat]
+        row = {"id": i, "margin_top": round(t / H, 4),
+               "margin_bottom": round(b / H, 4), "margin_left": round(l / W, 4),
+               "margin_right": round(r / W, 4), "n_sides": msb.PATTERN_SIDES[pat],
+               "score": round(0.5 - 0.01 * i, 4) if i <= 30 else 0.0,
+               "pillar_or_letter": pat == "2-opp" and i % 2 == 0,
+               "h": H, "w": W, "tar": "data/t.tar", **msb.flags_of("", "x")}
+        row.update(tag_sample_watermark=i % 7 == 0,
+                   tag_white_background=i % 3 == 0,
+                   border_uncaptioned=i % 5 == 0)
+        rows.append(row)
+    rows.append({"id": 50, "error": "broken", "tar": "data/t.tar"})
+    rows.sort(key=lambda r: (-(r.get("score") or 0.0), r["id"]))
+    ok = [r for r in rows if "error" not in r]
+    white = sorted(r["id"] for r in rows if r.get("tag_white_background"))
+    tabs = {
+        "A": [r["id"] for r in ok if r["score"] > 0][:old_n],
+        "B": sorted(r["id"] for r in rows if r.get("tag_sample_watermark")),
+        "C": sorted(r["id"] for r in rows if r.get("border_uncaptioned")),
+        "D": sorted(__import__("random").Random(0).sample(white, control_n)),
+        "E": [r["id"] for r in ok if r["pillar_or_letter"]],
+    }
+    (root / "scores.parquet").write_bytes(msb.table_bytes(rows, REV))
+    (root / "summary.json").write_text(json.dumps({
+        "dataset_revision": REV, "tabs": {k: len(v) for k, v in tabs.items()}}))
+    ids = {i for v in tabs.values() for i in v}
+    for i in ids:
+        (root / "thumbs" / f"{i}.jpg").write_bytes(b"jpg%d" % i)
+    data = {"tabs": tabs, "items": {str(i): {"cap": f"cap {i}"} for i in ids},
+            "names": {}, "review_id": "0" * 16, "dataset_repo": msb.DATASET_REPO,
+            "generated": "2026-10-13T00:00:00+00:00", "revision": REV}
+    (root / "review" / "index.html").write_text(
+        '<!doctype html><script id="data" type="application/json">'
+        + json.dumps(data) + "</script><script>var STORE='datafilter_remove_v1:'"
+        "</script>", encoding="utf-8")
+    pat = {r["id"]: PATS[r["id"] % 6] for r in ok}
+    return root, {"tabs": tabs, "pat": pat, "rows": rows}
+
+
+def _snapshot(root):
+    return {str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(Path(root).rglob("*")) if p.is_file()}
+
+
+def _page(root, name="index.html"):
+    return msb.page_data(Path(root) / "review" / name)
+
+
+def _expect_fail(fn, *needles):
+    try:
+        fn()
+    except SystemExit as e:
+        for n in needles:
+            assert n in str(e), (n, str(e))
+        return str(e)
+    raise AssertionError("did not fail")
+
+
+def test_rerender_default_exact():
+    with tempfile.TemporaryDirectory() as d:
+        root, info = _old_run(Path(d) / "run")
+        before = _snapshot(root)
+        lines = []
+        res = msb.rerender(root, generated="2026-10-14T00:00:00+00:00",
+                           log=lines.append)
+        old = info["tabs"]
+        want_a = [i for i in old["A"] if info["pat"][i] in msb.BORDER_PATTERNS]
+        assert len(want_a) < len(old["A"]) and res["top_n"] == len(want_a)
+        assert any(l.startswith(f"default --top-n {len(want_a)}") for l in lines)
+        data = _page(root)
+        assert data["tabs"]["A"] == want_a, (data["tabs"]["A"], want_a)
+        for k in "BCDE":
+            assert data["tabs"][k] == old[k], k
+        assert data["patterns"] == msb.SIDE_PATTERN_LABELS
+        assert data["review_id"] == res["review_id"] == msb.review_id(
+            data["tabs"], "2026-10-14T00:00:00+00:00", REV)
+        assert data["revision"] == REV
+        for k, ids in data["tabs"].items():
+            for i in ids:
+                it = data["items"][str(i)]
+                assert it["sp"] == info["pat"][i] and it["th"], (k, i, it)
+                assert it["cap"] == f"cap {i}"
+        assert res["side_patterns_A"] == {
+            p: sum(info["pat"][i] == p for i in want_a)
+            for p in msb.SIDE_PATTERN_LABELS}
+        assert res["tabs"] == {k: len(v) for k, v in data["tabs"].items()}
+        # only review/index.html changed; the v1 page is backed up as is
+        after = _snapshot(root)
+        assert after["review/index.v1.html"] == before["review/index.html"]
+        assert {k for k in after if after[k] != before.get(k)} == {
+            "review/index.html", "review/index.v1.html"}
+        # a second re-render reads the backup (D, captions), keeps it
+        v2 = after["review/index.html"]
+        res2 = msb.rerender(root, log=lambda *_: None)
+        assert _page(root)["tabs"] == data["tabs"]
+        assert res2["control_from"].startswith("index.v1.html")
+        assert _snapshot(root)["review/index.v1.html"] == before["review/index.html"]
+        assert _snapshot(root)["review/index.html"] != v2   # new generation time
+
+
+def test_rerender_missing_thumbs_fail():
+    with tempfile.TemporaryDirectory() as d:
+        root, info = _old_run(Path(d) / "run")
+        before = _snapshot(root)
+        eligible = [r["id"] for r in info["rows"] if "error" not in r
+                    and r["score"] > 0
+                    and info["pat"][r["id"]] in msb.BORDER_PATTERNS]
+        n_def = sum(i in info["tabs"]["A"] for i in eligible)
+        # a larger tab A reaches eligible rows below the run's cutoff that
+        # were never thumbnailed -> count + ids, nothing written
+        beyond = [i for i in eligible[n_def:n_def + 3]
+                  if not (root / "thumbs" / f"{i}.jpg").exists()]
+        assert beyond
+        _expect_fail(lambda: msb.rerender(root, top_n=n_def + 3,
+                                          log=lambda *_: None),
+                     f"{len(beyond)} tab ids have no thumbnail",
+                     f"A {len(beyond)} {sorted(beyond)}")
+        assert _snapshot(root) == before            # no backup, no page
+        # an eligible id inside the old top-N lost its thumbnail -> the
+        # default fails rather than dropping it
+        gone = eligible[1]
+        (root / "thumbs" / f"{gone}.jpg").unlink()
+        _expect_fail(lambda: msb.rerender(root, log=lambda *_: None),
+                     f"A 1 [{gone}]")
+        (root / "thumbs" / f"{gone}.jpg").write_bytes(b"x")
+        # an id of another tab without a thumbnail
+        b0 = info["tabs"]["B"][0]
+        (root / "thumbs" / f"{b0}.jpg").unlink()
+        _expect_fail(lambda: msb.rerender(root, log=lambda *_: None),
+                     f"B 1 [{b0}]")
+        (root / "thumbs" / f"{b0}.jpg").write_bytes(b"x")
+        assert not (root / "review" / "index.v1.html").exists()
+        # a previous page whose lists disagree with scores.parquet
+        page = (root / "review" / "index.html").read_text()
+        data = msb.page_data(root / "review" / "index.html")
+        bad = dict(data, tabs=dict(data["tabs"], C=data["tabs"]["C"][1:]))
+        (root / "review" / "index.html").write_text(page.replace(
+            json.dumps(data), json.dumps(bad)))
+        _expect_fail(lambda: msb.rerender(root, log=lambda *_: None),
+                     "tabs ['C']", "disagree")
+        (root / "review" / "index.html").write_text(page)
+        # summary.json from another run (tab D size)
+        s = json.loads((root / "summary.json").read_text())
+        (root / "summary.json").write_text(json.dumps(
+            dict(s, tabs=dict(s["tabs"], D=99))))
+        _expect_fail(lambda: msb.rerender(root, log=lambda *_: None),
+                     "tab D", "summary.json says 99")
+        (root / "summary.json").write_text(json.dumps(s))
+        # no previous page: D re-drawn (seed 0) == the run's, no captions
+        (root / "review" / "index.html").unlink()
+        res = msb.rerender(root, control_n=4, log=lambda *_: None)
+        assert res["control_from"].startswith("re-drawn")
+        data = _page(root)
+        assert data["tabs"]["D"] == info["tabs"]["D"]
+        assert res["no_caption_snippet"] == len(
+            {i for v in data["tabs"].values() for i in v})
+        assert not (root / "review" / "index.v1.html").exists()
+
+
+def test_rerender_cli():
+    script = str(REPO / "scripts" / "modal_score_borders.py")
+    with tempfile.TemporaryDirectory() as d:
+        root, info = _old_run(Path(d) / "run")
+        p = subprocess.run([sys.executable, script, "--rerender", str(root)],
+                           capture_output=True, text=True, timeout=120)
+        assert p.returncode == 0, p.stderr[-2000:]
+        assert "default --top-n" in p.stdout and "review id" in p.stdout
+        assert (root / "review" / "index.v1.html").exists()
+        p = subprocess.run([sys.executable, script, "--rerender", str(root),
+                            "--top-n", "30"],
+                           capture_output=True, text=True, timeout=120)
+        assert p.returncode != 0 and "have no thumbnail" in p.stderr, p.stderr
+        for extra in (["--out", str(root)], ["--top-n", "-1"]):
+            p = subprocess.run([sys.executable, script, "--rerender",
+                                str(root)] + extra,
+                               capture_output=True, text=True, timeout=120)
+            assert p.returncode == 2, (extra, p.stderr)
+        p = subprocess.run([sys.executable, script, "--out", str(root)],
+                           capture_output=True, text=True, timeout=120)
+        assert p.returncode == 2 and "--tar-dir and --out" in p.stderr
+
+
+def test_rerender_real_run_copy():
+    """The finished full run (read-only): a copy of its parquet / summary /
+    page(s) + its thumbs (symlinked) re-renders exactly; the originals are
+    not touched."""
+    src = msb.LOCAL_OUT
+    if not (src / "scores.parquet").is_file():
+        print(f"{src} not found: real-run re-render not tested")
+        return
+    import hashlib
+
+    def digest():
+        return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in [src / "scores.parquet", src / "summary.json",
+                          *sorted((src / "review").glob("*.html"))]}
+
+    before = digest()
+    n_thumbs = len(list((src / "thumbs").glob("*.jpg")))
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "review").mkdir()
+        shutil.copy(src / "scores.parquet", d)
+        shutil.copy(src / "summary.json", d)
+        for p in (src / "review").glob("index*.html"):
+            shutil.copy(p, d / "review" / p.name)
+        (d / "thumbs").symlink_to(src / "thumbs")
+        res = msb.rerender(d, log=lambda *_: None)
+        data = _page(d)
+        old = _page(d, "index.v1.html")
+        s = json.loads((src / "summary.json").read_text())
+        assert res["top_n"] == res["exact_default_top_n"] == len(data["tabs"]["A"])
+        assert set(data["tabs"]["A"]) <= set(old["tabs"]["A"])
+        assert all(data["items"][str(i)]["sp"] in msb.BORDER_PATTERNS
+                   for i in data["tabs"]["A"])
+        rows = {r["id"]: r for r in msb.load_score_rows(d / "scores.parquet")[0]}
+        dropped = [i for i in old["tabs"]["A"] if i not in set(data["tabs"]["A"])]
+        assert dropped and all(msb.row_side_pattern(rows[i]) not in
+                               msb.BORDER_PATTERNS for i in dropped)
+        assert data["tabs"]["A"] == [i for i in old["tabs"]["A"]
+                                     if i not in set(dropped)]
+        for k in "BCDE":
+            assert data["tabs"][k] == old["tabs"][k] and len(old["tabs"][k]) == s["tabs"][k]
+    assert digest() == before
+    assert len(list((src / "thumbs").glob("*.jpg"))) == n_thumbs
 
 
 if __name__ == "__main__":

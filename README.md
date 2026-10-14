@@ -737,7 +737,10 @@ two opposite sides, straightness >= 0.9), else 0. For every candidate whose
 margins are a thin frame line (all < 1.5%) the image is also measured
 inside the line (`peeled`: frame + mat + inset scores like the inset), and
 the final winner is chosen over all peeled / unpeeled results; a frame line
-around a full-bleed picture only sets `thin_frame`. All intermediate numbers are stored, so the ranking can
+around a full-bleed picture only sets `thin_frame`. `side_pattern` records
+which sides carry a margin >= 1.5%: `4`, `3`, `2-opp` (top+bottom or
+left+right), `2-adj`, `1`, `0`; a border is 4, 3 or 2 opposite sides.
+All intermediate numbers are stored, so the ranking can
 be re-weighted from `scores.parquet` without re-running.
 
 Flow: `prepare` resolves the dataset repo's commit sha once (`--revision`,
@@ -751,7 +754,8 @@ image, thumbnails (512 px JPEG) of the always-review ids. Tar members must
 be `<id>.{webp,png,jpg,jpeg,json,txt}` and the image ids of every tar must
 equal the parquet's ids for it (missing / extra / duplicate ids, a failed
 container or an odd member fail the run with exit != 0 and nothing
-written). Then the global selection (top `--top-n` by score, every
+written). Then the global selection (top `--top-n` by score among the
+border side patterns, every
 pillar/letterbox, every `sample watermark` image, every `border` /
 `white border` / `outside border` / `pillarboxed` image whose long caption
 does not mention border/frame/margin/letterbox/pillarbox/inset, and
@@ -761,16 +765,34 @@ id without a thumbnail fails the run.
 
 Output in `/home/mj/krea2-ops/eval/datafilter/`: `scores.parquet` (every
 image: metrics + tag/caption flags), `thumbs/<id>.jpg`, `summary.json` and
-`review/index.html` (self-contained; tabs A top `--top-n` by score, B sample
+`review/index.html` (self-contained; tabs A top `--top-n` by score among
+images with score > 0 and side pattern 4 / 3 / 2 opposite, B sample
 watermark, C border tag without a border caption, D white-background
-control, E pillar/letterbox; click = mark for removal, kept in localStorage
-under a key scoped to this page's review id with foreign ids dropped;
-"export" downloads `datafilter_remove.json` with the review id).
+control, E pillar/letterbox; every card carries its side-pattern badge, e.g.
+"2면(마주봄)"). A click cycles keep -> 캡션 보완 (caption, amber) -> 자르기
+(crop, blue) -> 제거 (remove, red) -> keep; the header shows the legend with
+per-state counts. States are kept in localStorage under
+`datafilter_review_v2:<review id>` as `{id: state}` (foreign ids and
+malformed entries dropped); "export" downloads `datafilter_actions.json`:
+`{review_id, generated, dataset_revision, items: [{id, action, tabs, score,
+side_pattern}]}` for the non-keep images.
+
+`--rerender DIR` rebuilds only `DIR/review/index.html` of a finished run,
+locally and without tars: rows from `scores.parquet` (an old one without
+`side_pattern` gets it from the margins, with the integer px recovered from
+the rounded fractions and h/w), the revision and the run's tab A size from
+`summary.json`, captions and list D from the previous page (a v1 page is
+first copied to `review/index.v1.html`); B/C/E are re-derived and must equal
+the previous page's lists. By default tab A = the border-pattern rows inside
+the run's own top-N by score, which were all thumbnailed, so it is exact by
+construction (the count is printed); any tab id without a thumbnail (e.g. a
+larger `--top-n`) fails with the count and ids, nothing written.
 
 ```bash
 modal run scripts/modal_score_borders.py --shards 2   # smoke run (2 tars)
 modal run scripts/modal_score_borders.py              # all 100 tars (rough: a few min, < $0.5)
 python scripts/modal_score_borders.py --tar-dir DIR --out OUT   # same, tars already on disk
+python scripts/modal_score_borders.py --rerender /home/mj/krea2-ops/eval/datafilter  # page only
 ```
 
 ## Tests
@@ -807,7 +829,8 @@ python tests/test_modal_coherence.py    # Modal coherence: partial restore == fu
                                         # metrics, null-model simulation, fake-R2 flow
 python tests/test_score_borders.py      # dataset border score: synthetic insets vs
                                         # silhouettes (WebP), shard id validation, two-pass
-                                        # thumbnails, fake-tar run + review page (node)
+                                        # thumbnails, fake-tar run + review page (node),
+                                        # side patterns, 4-state review logic, --rerender
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
