@@ -10,6 +10,9 @@ images for removal.
 
     python scripts/modal_score_borders.py --tar-dir DIR --parquet P --out OUT
                        # the same pipeline locally on tars already on disk (no Modal)
+    python scripts/modal_score_borders.py --rerender DIR [--top-n N]
+                       # rebuild only DIR/review/index.html from a finished
+                       # run (scores.parquet, summary.json, thumbs; no tars)
 
 Metric (border_metrics, pure numpy on the full-resolution RGB image):
   1. canvas colour candidates: the per-channel median of the outer RING_PX
@@ -26,7 +29,7 @@ Metric (border_metrics, pure numpy on the full-resolution RGB image):
      >= ROW_BG_FRAC, then columns from the left/right measured inside those
      rows, then rows again inside the columns (2 passes). Fractions of H/W;
      content bbox = the rest; margin_area_frac = 1 - bbox area / image area;
-     n_sides = sides with margin >= MIN_SIDE_FRAC.
+     n_sides = sides with margin >= MIN_SIDE_FRAC (score / pillar only).
   4. fill = non-bg fraction inside the bbox.
   5. per-side straightness = max over the first EDGE_PX rows/cols inside the
      bbox of their non-bg fraction; edge_straightness = GEOMETRIC mean over
@@ -47,6 +50,10 @@ Metric (border_metrics, pure numpy on the full-resolution RGB image):
      results of all candidates.
      A thin frame line around a full-bleed picture keeps its tiny score
      (margin_area_frac ~ the line) and is only flagged `thin_frame`.
+  8. side_pattern ("4", "3", "2-opp" = top+bottom or left+right, "2-adj",
+     "1", "0"): the sides whose margin is >= SIDE_MIN_PX (3) px AND whose
+     straightness is >= SIDE_STRAIGHT (0.25). A border is 4, 3 or 2
+     opposite sides (BORDER_PATTERNS); see SIDE_MIN_PX for the thresholds.
 
 Stages (Modal; the local entrypoint is stdlib-only, like the other Modal
 scripts, so everything that needs numpy/pyarrow/PIL runs in containers):
@@ -69,7 +76,8 @@ scripts, so everything that needs numpy/pyarrow/PIL runs in containers):
      checked against the tar's expected ids from the parquet (missing,
      extra and duplicate ids); a failed or mismatching shard fails the run
      (exit != 0, nothing written).
-  3. global selection: top --top-n by score (score > 0) + every
+  3. global selection: top --top-n by score (score > 0, border side
+     pattern) + every
      pillar_or_letter + the always-thumb ids; pass 2, `thumb_shard` over the
      tars that hold selected ids without a thumbnail, returning exactly
      those. A selected id still without a thumbnail fails the run.
@@ -78,14 +86,29 @@ scripts, so everything that needs numpy/pyarrow/PIL runs in containers):
      locally), <out>/review/index.html (self-contained, inline JSON, thumbs
      by relative path), <out>/summary.json and a printed summary.
 
-Review page tabs: (A) top --top-n by score (score > 0 only), (B) sample
-watermark (all), (C) border-tagged but the long caption does not mention a
-border, (D) --control-n random `white background` images (false-positive
-check), (E) pillar/letterbox. Click a thumbnail = toggle "remove" (red
-outline). Selections live in localStorage under a key scoped to the page's
-review id (hash of its tabs + generation time), only ids of this page are
-kept; "export" downloads datafilter_remove.json (review id, generation time,
-id + tab + score per selected image).
+Review page tabs: (A) top --top-n by score among rows with score > 0 and a
+border side pattern (4 / 3 / 2 opposite sides), (B) sample watermark
+(all), (C) border-tagged but the long caption does not mention a border,
+(D) --control-n random `white background` images (false-positive check),
+(E) pillar/letterbox. Every card shows its side pattern as a badge. A click
+cycles keep (no outline) -> caption ("캡션 보완", amber) -> crop ("자르기",
+blue) -> remove ("제거", red) -> keep; the header shows a legend with the
+per-state counts. States live in localStorage under
+datafilter_review_v2:<review id> (hash of the tabs + generation time +
+revision) as {id: state}; foreign ids and malformed entries are dropped.
+"export" downloads datafilter_actions.json {review_id, generated,
+dataset_revision, items: [{id, action, tabs, score, side_pattern}]} (non-
+keep images only).
+
+--rerender DIR rebuilds only the review page of a finished run (see
+`rerender`): side patterns are recomputed under the current rule from the
+rounded margin / straightness columns (exact integer px and coverage
+counts recovered with h / w), the other tabs keep their membership, and by
+default tab A holds every border-pattern row within the run's score-rank
+cutoff (summary.json `a_rule`; a legacy run: its unfiltered top-N, all
+thumbnailed); a tab id without a thumbnail fails it. summary.json and the
+page record the tab A rule (`a_rule`: name, version, thresholds, top_n,
+rank_cutoff).
 
 Secrets: Modal secret `huggingface` (HF_TOKEN, HUGGING_FACE_HUB_TOKEN or
 HUGGINGFACE_TOKEN); the value is never printed.
@@ -189,8 +212,31 @@ CAPTION_BORDER_RE = re.compile(
     r"\b(border|frame|margin|letterbox|pillarbox|inset)", re.IGNORECASE)
 CAPTION_WATERMARK_RE = re.compile(r"watermark", re.IGNORECASE)
 SNIPPET_CHARS = 240
+# side_pattern: which sides carry a band. A border = solid bands on 4 sides,
+# 3 sides or 2 OPPOSITE sides; 2 adjacent sides, 1 side or none are not.
+# A side counts when its margin is >= SIDE_MIN_PX pixels AND its straightness
+# (non-canvas coverage of the first content lines on that side) is >=
+# SIDE_STRAIGHT. Independent of MIN_SIDE_FRAC / n_sides (score only):
+#  * px, not a fraction: a thin but real band (12 px of 1024, 1.2%) counts.
+#    3 px: a true k px band on a WebP q80 canvas measures k-1 px (ringing
+#    eats ~1 px; 3 px -> 1-2), plain full-bleed WebPs give 0 px, and the
+#    real run's 1-12 px straight margins are flat (no noise spike at 1-2 px)
+#  * 0.25: a backdrop panel behind a character covers only part of the
+#    content box side (~0.7 when the head / legs stick out; 0.26-0.49 when
+#    it is faint or occluded), a rounded-corner inset ~0.4; a round
+#    silhouette tip gives ~0.1. A silhouette may reach 0.25 on one side (a
+#    flat cut), but the border patterns need 3+ sides or an opposite pair
+SIDE_MIN_PX = 3
+SIDE_STRAIGHT = 0.25
+SIDE_PATTERN_LABELS = {"4": "4면", "3": "3면", "2-opp": "2면(마주봄)",
+                       "2-adj": "2면(이웃)", "1": "1면", "0": "0면"}
+BORDER_PATTERNS = ("4", "3", "2-opp")
+# The tab A selection rule, recorded in summary.json and on the page (the
+# re-render derives its default cutoff from it).
+A_RULE = {"name": "side-pattern", "version": 2, "patterns": list(BORDER_PATTERNS),
+          "side_min_px": SIDE_MIN_PX, "side_straight": SIDE_STRAIGHT}
 TABS = (
-    ("A", "top by score"),
+    ("A", "top by score, border sides (4 / 3 / 2 opposite)"),
     ("B", "sample watermark"),
     ("C", "border tag, no border caption"),
     ("D", "white background control"),
@@ -328,6 +374,71 @@ def _measure(rgb, bg, tol=TOL):
             "straight": straight}
 
 
+def _per_side(v, what):
+    """Mapping keyed by SIDES or a (top, bottom, left, right) sequence ->
+    list in SIDES order."""
+    if hasattr(v, "keys"):
+        return [v.get(s) for s in SIDES]
+    v = list(v)
+    if len(v) != 4:
+        raise ValueError(f"want 4 {what} (t, b, l, r), got {v!r}")
+    return v
+
+
+def side_pattern(px, straight):
+    """Pixel margins + per-side straightness -> "4" | "3" | "2-opp" |
+    "2-adj" | "1" | "0": the sides with margin >= SIDE_MIN_PX px AND
+    straightness >= SIDE_STRAIGHT (None / -1 = no margin). Both arguments:
+    a mapping keyed by SIDES or a (top, bottom, left, right) sequence."""
+    real = {s for s, p, st in zip(SIDES, _per_side(px, "margins"),
+                                  _per_side(straight, "straightness"))
+            if p is not None and st is not None and p >= SIDE_MIN_PX
+            and st >= SIDE_STRAIGHT}
+    if len(real) == 2:
+        return ("2-opp" if real in ({"top", "bottom"}, {"left", "right"})
+                else "2-adj")
+    return str(len(real))
+
+
+def _exact(v, n):
+    """A count / n fraction stored rounded to ROUND digits -> the exact
+    fraction (exact for n < 10**ROUND / 2)."""
+    return round(v * n) / n if n else v
+
+
+def row_px_straight(r):
+    """Exact (px margins, straightness) of a score row from its rounded
+    columns: px = round(margin * h|w); the straightness of top / bottom is a
+    count over the content box width w - l - r, of left / right over its
+    height h - t - b."""
+    h, w = r["h"], r["w"]
+    t, b, l, rr = (round((r[f"margin_{s}"] or 0) * (h if s in ("top", "bottom")
+                                                    else w)) for s in SIDES)
+    px = {"top": t, "bottom": b, "left": l, "right": rr}
+    length = {"top": w - l - rr, "bottom": w - l - rr,
+              "left": h - t - b, "right": h - t - b}
+    st = {}
+    for s in SIDES:
+        v = r.get(f"straight_{s}")
+        st[s] = None if v is None or v < 0 else _exact(v, length[s])
+    return px, st
+
+
+def row_side_pattern(r):
+    """side_pattern of a score row: the stored column when present, else
+    from the rounded margin / straightness columns (an old scores.parquet)
+    via row_px_straight, i.e. what _finish computes unrounded."""
+    sp = r.get("side_pattern")
+    if sp:
+        return sp
+    return side_pattern(*row_px_straight(r))
+
+
+def is_border_row(r):
+    """Tab A eligibility: score > 0 and a border side pattern."""
+    return (r.get("score") or 0) > 0 and row_side_pattern(r) in BORDER_PATTERNS
+
+
 def _finish(h, w, px, fill, straight, ring_uniform, blank=False):
     """Derived numbers + score from px margins (t, b, l, r) of an h x w
     image, the bbox fill and per-side straightness."""
@@ -350,7 +461,11 @@ def _finish(h, w, px, fill, straight, ring_uniform, blank=False):
     score = maf * es * min(1.0, fill / FILL_FULL) if gate and not blank else 0.0
     out = {f"margin_{s}": _r(frac[s]) for s in SIDES}
     out.update({
-        "margin_area_frac": _r(maf), "n_sides": len(real), "fill": _r(fill),
+        "margin_area_frac": _r(maf), "n_sides": len(real),
+        "side_pattern": side_pattern(
+            px, [None if blank or frac[s] == 0 else straight[s]
+                 for s in SIDES]),
+        "fill": _r(fill),
         **{f"straight_{s}": (_r(straight[s]) if frac[s] > 0 else -1.0)
            for s in SIDES},
         "edge_straightness": _r(es), "pillar_or_letter": bool(pillar),
@@ -687,15 +802,30 @@ def join_rows(rows, meta):
 
 
 def build_tabs(joined, plan, top_n=TOP_N):
+    """joined: sorted by join_rows. A = the first top_n rows with score > 0
+    and a border side pattern (4 / 3 / 2 opposite sides)."""
     ok = [r for r in joined if "error" not in r]
-    pos = [r for r in ok if r["score"] > 0]
+    eligible = [r for r in ok if is_border_row(r)]
     return {
-        "A": [r["id"] for r in pos[:top_n]],
+        "A": [r["id"] for r in eligible[:top_n]],
         "B": list(plan["watermark"]),
         "C": list(plan["uncaptioned"]),
         "D": list(plan["control"]),
         "E": [r["id"] for r in ok if r.get("pillar_or_letter")],
     }
+
+
+def a_rule_record(joined, a_ids, top_n):
+    """The rule that produced tab A + its score-rank cutoff: every eligible
+    row among the first `rank_cutoff` rows with score > 0 (joined order) is
+    in A (A was not cut short by top_n beyond that rank)."""
+    positives = [r["id"] for r in joined if "error" not in r
+                 and (r.get("score") or 0) > 0]
+    if len(a_ids) < top_n or not a_ids:
+        cutoff = len(positives) if len(a_ids) < top_n else 0
+    else:
+        cutoff = positives.index(a_ids[-1]) + 1
+    return {**A_RULE, "top_n": top_n, "rank_cutoff": cutoff}
 
 
 def select_thumbs(tabs):
@@ -750,6 +880,12 @@ def quantiles(xs, qs=(0.5, 0.9, 0.95, 0.97, 0.99, 0.995, 0.999, 1.0)):
             for q in qs}
 
 
+def pattern_counts(rows):
+    """{side pattern: n} in SIDE_PATTERN_LABELS order (all keys)."""
+    c = Counter(row_side_pattern(r) for r in rows)
+    return {k: c.get(k, 0) for k in SIDE_PATTERN_LABELS}
+
+
 def summarize(joined, tabs, have_thumbs, plan, seconds, revision=None):
     ok = [r for r in joined if "error" not in r]
     scores = [r["score"] for r in ok]
@@ -771,6 +907,10 @@ def summarize(joined, tabs, have_thumbs, plan, seconds, revision=None):
         "shards": len(plan["shards"]),
         "score_quantiles": quantiles(scores),
         "score_gt0": sum(s > 0 for s in scores),
+        "side_patterns_score_gt0": pattern_counts(
+            r for r in ok if r["score"] > 0),
+        "side_patterns_A": pattern_counts(
+            r for r in ok if r["id"] in top),
         "pillar_or_letter": sum(bool(r.get("pillar_or_letter")) for r in ok),
         "thin_frame": sum(bool(r.get("thin_frame")) for r in ok),
         "peeled": sum(bool(r.get("peeled")) for r in ok),
@@ -783,6 +923,10 @@ def summarize(joined, tabs, have_thumbs, plan, seconds, revision=None):
     }
 
 
+def _fmt_counts(c):
+    return ", ".join(f"{k} {v}" for k, v in c.items())
+
+
 def print_summary(s, log=print):
     log(f"dataset {s['dataset_repo']}@{s['dataset_revision']}")
     log(f"images scored: {s['images']} (expected {s['expected']}, "
@@ -793,6 +937,8 @@ def print_summary(s, log=print):
     log(f"score > 0: {s['score_gt0']}, pillar_or_letter: "
         f"{s['pillar_or_letter']}, thin_frame: {s['thin_frame']}, peeled: "
         f"{s['peeled']}, canvas colour from: {s['bg_src']}")
+    log("side patterns (score > 0): " + _fmt_counts(s["side_patterns_score_gt0"])
+        + "; tab A: " + _fmt_counts(s["side_patterns_A"]))
     log("tabs: " + ", ".join(f"{k} {n} (no thumb {s['missing_thumbs'][k]})"
                              for k, n in s["tabs"].items())
         + f"; {s['thumbs_selected']} thumbnails selected")
@@ -817,6 +963,8 @@ def review_items(joined, tabs, meta, have_thumbs):
                 "m": [r.get(f"margin_{s}") for s in SIDES],
                 "st": r.get("edge_straightness"), "f": r.get("fill"),
                 "pl": bool(r.get("pillar_or_letter")),
+                "sp": (row_side_pattern(r) if r and "error" not in r
+                       else None),
                 "tg": tags_hit(m) if m else [],
                 "cb": bool(m.get("caption_mentions_border")),
                 "cap": m.get("cap", ""), "th": i in have_thumbs,
@@ -835,12 +983,15 @@ def review_id(tabs, generated, revision=None):
 
 
 def render_review(tabs, items, generated, title="datafilter review", info="",
-                  revision=None):
+                  revision=None, a_rule=None):
     """Self-contained review page (inline JSON, thumbs at ../thumbs/<id>.jpg)."""
     data = json.dumps({"tabs": tabs, "items": items, "names": dict(TABS),
+                       "patterns": SIDE_PATTERN_LABELS,
+                       "border_patterns": list(BORDER_PATTERNS),
                        "review_id": review_id(tabs, generated, revision),
                        "generated": generated, "dataset_repo": DATASET_REPO,
-                       "revision": revision}, separators=(",", ":"))
+                       "revision": revision, "a_rule": a_rule},
+                      separators=(",", ":"))
     data = data.replace("</", "<\\/")
     return (REVIEW_HTML.replace("__TITLE__", html.escape(title))
             .replace("__INFO__", html.escape(info))
@@ -848,33 +999,51 @@ def render_review(tabs, items, generated, title="datafilter review", info="",
             .replace("__DATA__", data))
 
 
-# Pure storage logic (no DOM; tests/test_score_borders.py runs it in node).
+# Pure state logic (no DOM; tests/test_score_borders.py runs it in node).
+# A selection is {id: state} with state in STATES minus "keep" (keep = absent).
 REVIEW_LOGIC_JS = """
-var STORE_PREFIX='datafilter_remove_v1:';
+var STORE_PREFIX='datafilter_review_v2:';
+var STATES=['keep','caption','crop','remove'];
+var STATE_LABELS={keep:'유지',caption:'캡션 보완',crop:'자르기',remove:'제거'};
+function own(o,k){return Object.prototype.hasOwnProperty.call(o,k)}
 function storeKey(D){return STORE_PREFIX+D.review_id}
-function loadSel(raw,D){var sel={},out={};
-try{sel=JSON.parse(raw||'{}')||{}}catch(e){sel={}}
-if(typeof sel!=='object'||Array.isArray(sel))return out;
+function marked(s){return typeof s==='string'&&STATES.indexOf(s)>0}
+function nextState(s){var i=STATES.indexOf(s);if(i<0)i=0;
+return STATES[(i+1)%STATES.length]}
+function loadSel(raw,D){var sel,out={};
+try{sel=JSON.parse(raw||'{}')}catch(e){return out}
+if(!sel||typeof sel!=='object'||Array.isArray(sel))return out;
 Object.keys(sel).forEach(function(id){
-if(Object.prototype.hasOwnProperty.call(D.items,id)&&sel[id]&&
-typeof sel[id]==='object')out[id]={tab:String(sel[id].tab),
-score:sel[id].score==null?null:+sel[id].score}});return out}
-function exportObj(sel,D,now){return {review_id:D.review_id,
-generated:D.generated,dataset_revision:D.revision,exported:now,
+if(own(D.items,id)&&marked(sel[id]))out[id]=sel[id]});return out}
+function setState(sel,id,s){id=String(id);
+if(marked(s))sel[id]=s;else delete sel[id];return sel}
+function cycle(sel,id){var s=nextState(own(sel,String(id))?sel[String(id)]:'keep');
+setState(sel,id,s);return s}
+function stateCounts(sel,D){var c={};STATES.forEach(function(s){c[s]=0});
+Object.keys(D.items).forEach(function(id){
+c[own(sel,id)&&marked(sel[id])?sel[id]:'keep']++});return c}
+function tabsOf(id,D){return Object.keys(D.tabs).filter(function(k){
+return D.tabs[k].indexOf(+id)>=0})}
+function exportObj(sel,D){return {review_id:D.review_id,
+generated:D.generated,dataset_revision:D.revision,
 items:Object.keys(sel).filter(function(id){
-return Object.prototype.hasOwnProperty.call(D.items,id)}).map(function(id){
-return {id:+id,tab:sel[id].tab,score:sel[id].score}})}}
+return own(D.items,id)&&marked(sel[id])}).sort(function(a,b){return a-b})
+.map(function(id){var it=D.items[id];return {id:+id,action:sel[id],
+tabs:tabsOf(id,D),score:it.s==null?null:it.s,
+side_pattern:it.sp==null?null:it.sp}})}}
 """
 
 REVIEW_HTML = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
 <style>
 :root{--bg:#fafafa;--fg:#1b1b1b;--muted:#666;--card:#fff;--line:#ddd;
---accent:#2563eb;--remove:#dc2626}
+--accent:#2563eb;--caption:#d97706;--crop:#2563eb;--remove:#dc2626;
+--badge:#e8eefc;--badge-off:#eee}
 @media (prefers-color-scheme: dark){:root{--bg:#141414;--fg:#e8e8e8;
---muted:#9a9a9a;--card:#1f1f1f;--line:#333;--accent:#60a5fa;--remove:#f87171}}
+--muted:#9a9a9a;--card:#1f1f1f;--line:#333;--accent:#60a5fa;--caption:#fbbf24;
+--crop:#60a5fa;--remove:#f87171;--badge:#1e2a44;--badge-off:#2a2a2a}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -886,15 +1055,29 @@ h1{font-size:16px;margin:0 12px 0 0}
 padding:5px 10px;border-radius:6px;cursor:pointer}
 .tab.on{border-color:var(--accent);color:var(--accent);font-weight:600}
 .sp{flex:1}
-#count{color:var(--muted)}
+#legend{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:13px}
+#legend span{display:inline-flex;align-items:center;gap:4px;
+font-variant-numeric:tabular-nums}
+#legend i{display:inline-block;width:12px;height:12px;border-radius:3px;
+border:2px solid var(--line)}
+#legend i.caption{border-color:var(--caption)}
+#legend i.crop{border-color:var(--crop)}
+#legend i.remove{border-color:var(--remove)}
 button.act{border:1px solid var(--line);background:var(--card);color:var(--fg);
 padding:5px 10px;border-radius:6px;cursor:pointer}
 #info{color:var(--muted);font-size:12px;padding:6px 16px 0}
 main{padding:12px 16px;display:grid;gap:10px;
 grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}
 .c{background:var(--card);border:3px solid transparent;border-radius:8px;
-padding:4px;cursor:pointer;outline:1px solid var(--line)}
-.c.rm{border-color:var(--remove);outline-color:var(--remove)}
+padding:4px;cursor:pointer;outline:1px solid var(--line);position:relative}
+.c.st-caption{border-color:var(--caption);outline-color:var(--caption)}
+.c.st-crop{border-color:var(--crop);outline-color:var(--crop)}
+.c.st-remove{border-color:var(--remove);outline-color:var(--remove)}
+.c .stl{position:absolute;top:8px;left:8px;padding:1px 6px;border-radius:4px;
+font-size:12px;font-weight:600;color:#fff;display:none}
+.c.st-caption .stl{display:block;background:var(--caption)}
+.c.st-crop .stl{display:block;background:var(--crop)}
+.c.st-remove .stl{display:block;background:var(--remove)}
 .c img{width:100%;height:220px;object-fit:contain;display:block;
 background:repeating-conic-gradient(#8882 0 25%,transparent 0 50%) 0 0/16px 16px}
 .c .ph{height:220px;display:flex;align-items:center;justify-content:center;
@@ -902,12 +1085,15 @@ color:var(--muted)}
 .c .t{font-size:12px;margin-top:4px;word-break:break-word}
 .c .t b{font-variant-numeric:tabular-nums}
 .c .g{color:var(--muted);font-size:11px}
+.pt{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;
+font-size:11px;background:var(--badge);color:var(--accent)}
+.pt.off{background:var(--badge-off);color:var(--muted)}
 </style></head><body>
 <header><h1>__TITLE__</h1><span id="tabs"></span><span class="sp"></span>
-<span id="count"></span>
+<span id="legend"></span>
 <button class="act" id="clear">clear tab</button>
 <button class="act" id="export">export</button></header>
-<div id="info">__INFO__</div>
+<div id="info">__INFO__ · 클릭: 유지 → 캡션 보완 → 자르기 → 제거 → 유지</div>
 <main id="grid"></main>
 <script id="data" type="application/json">__DATA__</script>
 <script id="logic">__LOGIC__</script>
@@ -919,42 +1105,52 @@ try{sel=loadSel(localStorage.getItem(KEY),D)}catch(e){sel={}}
 function save(){try{localStorage.setItem(KEY,JSON.stringify(sel))}catch(e){}}
 function fmt(x){return x==null?'-':(+x).toFixed(3)}
 function pct(x){return x==null?'-':Math.round(x*1000)/10}
-function count(){var n=Object.keys(sel).length;
-document.getElementById('count').textContent=n+' marked for removal'}
+function legend(){var el=document.getElementById('legend'),c=stateCounts(sel,D);
+el.innerHTML='';STATES.forEach(function(s){var sp=document.createElement('span');
+var i=document.createElement('i');i.className=s;sp.appendChild(i);
+sp.appendChild(document.createTextNode(STATE_LABELS[s]+' '+c[s]));
+el.appendChild(sp)})}
 function tabs(){var el=document.getElementById('tabs');el.innerHTML='';
 Object.keys(D.tabs).forEach(function(k){var b=document.createElement('button');
 b.className='tab'+(k===cur?' on':'');
 b.textContent=k+': '+(D.names[k]||'')+' ('+D.tabs[k].length+')';
 b.onclick=function(){cur=k;tabs();grid()};el.appendChild(b)})}
+function paint(c,id){var s=own(sel,String(id))?sel[String(id)]:'keep';
+c.className='c'+(s!=='keep'?' st-'+s:'');
+c.querySelector('.stl').textContent=STATE_LABELS[s]}
 function grid(){var g=document.getElementById('grid');g.innerHTML='';
 var f=document.createDocumentFragment();
 D.tabs[cur].forEach(function(id){var it=D.items[String(id)]||{};
-var c=document.createElement('div');c.className='c'+(sel[id]?' rm':'');
-var m=it.m||[];
+var c=document.createElement('div');
+var m=it.m||[], pn=it.sp==null?'-':(D.patterns[it.sp]||it.sp);
 c.title=(it.cap||'')+'\\n\\ntags: '+((it.tg||[]).join(', ')||'-')+
-'\\nmargins t/b/l/r %: '+m.map(pct).join(' / ')+
+'\\nmargins t/b/l/r %: '+m.map(pct).join(' / ')+' ('+pn+')'+
 '\\nstraightness '+fmt(it.st)+', fill '+fmt(it.f)+
 (it.pl?'\\npillar/letterbox':'')+(it.cb?'\\ncaption mentions border':'')+
 (it.err?'\\nerror: '+it.err:'');
+var stl=document.createElement('div');stl.className='stl';c.appendChild(stl);
 if(it.th){var im=document.createElement('img');im.loading='lazy';
 im.src='../thumbs/'+id+'.jpg';im.alt=String(id);c.appendChild(im)}
 else{var p=document.createElement('div');p.className='ph';
 p.textContent='no thumbnail';c.appendChild(p)}
 var t=document.createElement('div');t.className='t';
 t.innerHTML='<b>'+id+'</b> score <b>'+fmt(it.s)+'</b>'+(it.pl?' PL':'');
+var pt=document.createElement('span');
+pt.className='pt'+(D.border_patterns.indexOf(it.sp)<0?' off':'');
+pt.textContent=pn;t.appendChild(pt);
 var gg=document.createElement('div');gg.className='g';
 gg.textContent='m '+m.map(pct).join('/')+(it.tg&&it.tg.length?' | '+it.tg.join(', '):'');
-t.appendChild(gg);c.appendChild(t);
-c.onclick=function(){if(sel[id]){delete sel[id];c.classList.remove('rm')}
-else{sel[id]={tab:cur,score:it.s};c.classList.add('rm')}save();count()};
-f.appendChild(c)});g.appendChild(f);count()}
+t.appendChild(gg);c.appendChild(t);paint(c,id);
+c.onclick=function(){cycle(sel,id);paint(c,id);save();legend()};
+f.appendChild(c)});g.appendChild(f);legend()}
 document.getElementById('clear').onclick=function(){
-D.tabs[cur].forEach(function(id){delete sel[id]});save();grid()};
+if(!confirm('tab '+cur+': reset every image to keep?'))return;
+D.tabs[cur].forEach(function(id){setState(sel,id,'keep')});save();grid()};
 document.getElementById('export').onclick=function(){
-var out=exportObj(sel,D,new Date().toISOString());
+var out=exportObj(sel,D);
 var a=document.createElement('a');
 a.href=URL.createObjectURL(new Blob([JSON.stringify(out,null,1)],{type:'application/json'}));
-a.download='datafilter_remove.json';document.body.appendChild(a);a.click();
+a.download='datafilter_actions.json';document.body.appendChild(a);a.click();
 setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1000)};
 tabs();grid();
 })();
@@ -982,6 +1178,7 @@ def write_outputs(out_dir, rows, thumbs, meta, plan, seconds, top_n=TOP_N,
     (out_dir / "scores.parquet").write_bytes(table)
     items = review_items(joined, tabs, meta, have)
     s = summarize(joined, tabs, have, plan, seconds, revision)
+    s["a_rule"] = a_rule_record(joined, tabs["A"], top_n)
     generated = generated or datetime.now(timezone.utc).isoformat(
         timespec="seconds")
     info = info or (f"{DATASET_REPO}@{revision}: {s['images']} images, "
@@ -989,11 +1186,222 @@ def write_outputs(out_dir, rows, thumbs, meta, plan, seconds, top_n=TOP_N,
                     + ", ".join(f"{k} {v:.3f}" for k, v in
                                 s["score_quantiles"].items()))
     (out_dir / "review" / "index.html").write_text(
-        render_review(tabs, items, generated, info=info, revision=revision),
-        encoding="utf-8")
+        render_review(tabs, items, generated, info=info, revision=revision,
+                      a_rule=s["a_rule"]), encoding="utf-8")
     s["review_id"] = review_id(tabs, generated, revision)
     (out_dir / "summary.json").write_text(json.dumps(s, indent=1))
     return s
+
+
+# ------------------------------------------------------------------ re-render
+DATA_RE = re.compile(
+    r'<script id="data" type="application/json">(.*?)</script>', re.S)
+
+
+def page_data(path):
+    """Inline JSON of a review page; None when the file does not exist."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    m = DATA_RE.search(p.read_text(encoding="utf-8"))
+    if not m:
+        raise SystemExit(f"{p}: no inline review data")
+    return json.loads(m.group(1))
+
+
+def _ids_text(ids, n=50):
+    ids = sorted(ids)
+    return f"{ids[:n]}" + (f" ... (+{len(ids) - n})" if len(ids) > n else "")
+
+
+def load_score_rows(path):
+    """scores.parquet -> (rows sorted like join_rows, schema metadata).
+    A null `error` is dropped (error rows keep theirs)."""
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(path)
+    md = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()}
+    rows = t.to_pylist()
+    for r in rows:
+        if r.get("error") is None:
+            r.pop("error", None)
+    ids = Counter(r["id"] for r in rows)
+    dup = [i for i, n in ids.items() if n > 1]
+    if dup:
+        raise SystemExit(f"{path}: {len(dup)} duplicate ids {_ids_text(dup)}")
+    rows.sort(key=lambda r: (-(r.get("score") or 0.0), r["id"]))
+    return rows, md
+
+
+def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
+             log=print):
+    """Rebuild <out_dir>/review/index.html from a finished run's outputs
+    (no Modal, no tars): scores.parquet (side_pattern from the margins when
+    the column is missing), summary.json (dataset revision, the run's tab A
+    size), thumbs/ and the previous page(s) (caption snippets, the control
+    list D). B / C / E come from the parquet flags; D from the previous page
+    (else re-drawn with seed / control_n); every list on a previous page
+    must equal its re-derived one. Side patterns are recomputed under the
+    current rule. Tab A = the top top_n rows with score > 0 and a border
+    side pattern. Default top_n: every eligible row within the run's
+    score-rank cutoff, from the run's recorded `a_rule` in summary.json (a
+    legacy run without one: its unfiltered top-N, all thumbnailed). The
+    membership is decided from scores / patterns / cutoff alone; then any
+    tab id without thumbs/<id>.jpg fails (count + ids). The rule used is
+    recorded on the page (`a_rule`). A v1 page is backed up to review/index.v1.html first
+    (never overwritten). Writes only review/index.html (+ that backup)."""
+    out_dir = Path(out_dir)
+    rdir = out_dir / "review"
+    summary = json.loads((out_dir / "summary.json").read_text())
+    rows, md = load_score_rows(out_dir / "scores.parquet")
+    revision = summary.get("dataset_revision")
+    if md.get("dataset_revision") not in (None, str(revision)):
+        raise SystemExit(f"scores.parquet revision {md['dataset_revision']} "
+                         f"!= summary.json {revision}")
+    ok = [r for r in rows if "error" not in r]
+    # side patterns always from the columns under the CURRENT rule (a
+    # stored column may come from another rule version)
+    stale = 0
+    for r in rows:
+        sp = r.pop("side_pattern", None)
+        if sp is not None and "error" not in r and sp != row_side_pattern(r):
+            stale += 1
+    if stale:
+        log(f"{stale} stored side_pattern values differ from the current "
+            f"rule {A_RULE}; recomputed")
+    # previous pages (the backup first); a v1 page is backed up before it
+    # is replaced (below, after every check)
+    cur, v1 = rdir / "index.html", rdir / "index.v1.html"
+    cur_data = page_data(cur)
+    backup = cur_data is not None and "patterns" not in cur_data
+    if backup and v1.exists() and v1.read_bytes() != cur.read_bytes():
+        raise SystemExit(f"{cur} is a v1 page and {v1} exists with other "
+                         "content; move one of them away")
+    pages = [(p, d) for p, d in ((v1, page_data(v1)), (cur, cur_data))
+             if d is not None]
+    # tab lists B / C / D / E
+    plan = {
+        "watermark": sorted(r["id"] for r in rows if r.get("tag_sample_watermark")),
+        "uncaptioned": sorted(r["id"] for r in rows if r.get("border_uncaptioned")),
+    }
+    if pages:
+        plan["control"] = list(pages[0][1]["tabs"]["D"])
+        d_src = f"{pages[0][0].name} (tab D)"
+    else:
+        white = sorted(r["id"] for r in rows if r.get("tag_white_background"))
+        plan["control"] = sorted(random.Random(seed).sample(
+            white, min(control_n, len(white))))
+        d_src = f"re-drawn (seed {seed}, n {control_n})"
+    by_id = {r["id"]: r for r in rows}
+    unknown = [i for i in plan["control"] if i not in by_id]
+    if unknown:
+        raise SystemExit(f"{len(unknown)} control ids not in scores.parquet: "
+                         f"{_ids_text(unknown)}")
+    # the run's own tab A rule -> the score-rank cutoff above which its
+    # selection was thumbnailed
+    positives = [r["id"] for r in ok if r["score"] > 0]
+    run_rule = summary.get("a_rule")
+    if run_rule is None:      # legacy run: unfiltered top-N by score
+        run_rule = {"name": "unfiltered-top-n", "version": 1,
+                    "top_n": int(summary["tabs"]["A"]),
+                    "rank_cutoff": int(summary["tabs"]["A"])}
+    cutoff = int(run_rule["rank_cutoff"])
+    old_a = positives[:cutoff]
+    full = build_tabs(rows, plan, top_n=0)
+    for p, d in pages:
+        want = {"B": full["B"], "C": full["C"], "D": plan["control"],
+                "E": full["E"]}
+        if "patterns" not in d and run_rule["version"] == 1:
+            want["A"] = old_a            # v1 page: unfiltered top-N by score
+        diff = [k for k, v in want.items() if list(d["tabs"].get(k, [])) != v]
+        if diff or d.get("revision") != revision:
+            raise SystemExit(f"{p}: tabs {diff or ''} / revision "
+                             f"{d.get('revision')} disagree with scores.parquet"
+                             f" + summary.json ({revision})")
+    for k in ("B", "C", "D", "E"):
+        n = len(full[k]) if k != "D" else len(plan["control"])
+        if summary["tabs"].get(k) != n:
+            raise SystemExit(f"tab {k}: {n} ids, summary.json says "
+                             f"{summary['tabs'].get(k)}")
+    have = {int(p.stem) for p in (out_dir / "thumbs").glob("*.jpg")
+            if p.stem.isdigit()}
+    # intended tab A membership, independent of which thumbnails exist
+    old_set = set(old_a)
+    eligible = [r["id"] for r in ok if is_border_row(r)]
+    exact_n = sum(i in old_set for i in eligible)   # a prefix of eligible
+    if top_n is None:
+        top_n = exact_n
+        log(f"default --top-n {top_n}: the eligible rows (score > 0, side "
+            f"pattern {'/'.join(BORDER_PATTERNS)}, >= {SIDE_MIN_PX} px and "
+            f"straightness >= {SIDE_STRAIGHT}) within the run's score-rank "
+            f"cutoff {cutoff} ({run_rule['name']} v{run_rule['version']}; "
+            f"{len(eligible)} eligible in total)")
+    if top_n < 0:
+        raise SystemExit("--top-n must be >= 0")
+    tabs = build_tabs(rows, plan, top_n)
+    a_rule = a_rule_record(rows, tabs["A"], top_n)
+    if top_n == exact_n:   # A = every eligible row within the run's cutoff
+        a_rule["rank_cutoff"] = max(a_rule["rank_cutoff"], cutoff)
+    a_rule["source"] = "re-render"
+    a_rule["run_rule"] = run_rule
+    missing = {k: [i for i in v if i not in have] for k, v in tabs.items()}
+    n_miss = sum(map(len, missing.values()))
+    if n_miss:
+        raise SystemExit(f"{n_miss} tab ids have no thumbnail in "
+                         f"{out_dir / 'thumbs'}, nothing written: " + "; ".join(
+                             f"{k} {len(v)} {_ids_text(v)}"
+                             for k, v in missing.items() if v))
+    caps = {}
+    for _, d in pages:
+        for i, it in d.get("items", {}).items():
+            caps.setdefault(int(i), it.get("cap") or "")
+    sel = select_thumbs(tabs)
+    meta = {}
+    for i in sel:
+        r = by_id[i]
+        if r.get("tar") is None:
+            continue
+        meta[i] = {k: v for k, v in r.items()
+                   if k.startswith(("tag_", "caption_mentions_"))}
+        meta[i]["cap"] = caps.get(i, "")
+    no_cap = sorted(i for i in sel if i not in caps)
+    items = review_items(rows, tabs, meta, have)
+    generated = generated or datetime.now(timezone.utc).isoformat(
+        timespec="seconds")
+    run_gen = pages[0][1].get("generated") if pages else None
+    info = (f"{DATASET_REPO}@{revision}: {len(rows)} images; re-rendered "
+            f"{generated} from scores.parquet (run {run_gen or 'unknown'}); "
+            f"tab A = top {top_n} with score > 0 and side pattern "
+            f"{' / '.join(SIDE_PATTERN_LABELS[p] for p in BORDER_PATTERNS)}")
+    page = render_review(tabs, items, generated, info=info, revision=revision,
+                         a_rule=a_rule)
+    rdir.mkdir(parents=True, exist_ok=True)
+    if backup and not v1.exists():
+        v1.write_bytes(cur.read_bytes())
+        log(f"backed up the v1 page to {v1}")
+    cur.write_text(page, encoding="utf-8")
+    res = {
+        "review_id": review_id(tabs, generated, revision),
+        "generated": generated, "dataset_revision": revision,
+        "top_n": top_n, "exact_default_top_n": exact_n,
+        "eligible": len(eligible), "rank_cutoff": cutoff,
+        "run_rule": run_rule, "a_rule": a_rule,
+        "tabs": {k: len(v) for k, v in tabs.items()},
+        "side_patterns_A": pattern_counts(by_id[i] for i in tabs["A"]),
+        "side_patterns_old_A": pattern_counts(by_id[i] for i in old_a),
+        "thumbs_used": len(sel), "no_caption_snippet": len(no_cap),
+        "control_from": d_src, "pages_read": [str(p) for p, _ in pages],
+    }
+    log(f"control list D from {d_src}; caption snippets from "
+        f"{[p.name for p, _ in pages] or 'nowhere'} ({len(no_cap)} ids "
+        "without one)")
+    log("tabs: " + ", ".join(f"{k} {n}" for k, n in res["tabs"].items())
+        + f"; {len(sel)} thumbnails")
+    log("side patterns, tab A: " + _fmt_counts(res["side_patterns_A"])
+        + f"; the run's top {cutoff} by score: "
+        + _fmt_counts(res["side_patterns_old_A"]))
+    log(f"wrote {cur} (review id {res['review_id']})")
+    return res
 
 
 # ------------------------------------------------------------------ HF / env
@@ -1241,15 +1649,23 @@ def build_arg_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Modal: modal run scripts/modal_score_borders.py [--shards N "
                "--top-n 1500 --control-n 150 --seed 0 --out DIR --parquet "
-               "PATH --revision SHA]")
-    ap.add_argument("--tar-dir", required=True,
+               "PATH --revision SHA]; re-render only the review page of a "
+               "finished run: --rerender DIR [--top-n N]")
+    ap.add_argument("--tar-dir",
                     help="directory with the dataset tars (by their parquet "
                          "`tar` path or basename)")
     ap.add_argument("--parquet", default=str(LOCAL_PARQUET))
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out")
+    ap.add_argument("--rerender", metavar="DIR",
+                    help="only rebuild DIR/review/index.html from a finished "
+                         "run's DIR/{scores.parquet,summary.json,thumbs} "
+                         "(no tars; the v1 page is kept as index.v1.html)")
     ap.add_argument("--shards", type=int, default=0,
                     help="score only the first N tars of the parquet")
-    ap.add_argument("--top-n", type=int, default=TOP_N)
+    ap.add_argument("--top-n", type=int, default=None,
+                    help=f"tab A size (default {TOP_N}; with --rerender: the "
+                         "border-pattern rows inside the run's own top-N, "
+                         "which all have a thumbnail)")
     ap.add_argument("--control-n", type=int, default=CONTROL_N)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=SHARD_THREADS)
@@ -1262,7 +1678,18 @@ def build_arg_parser():
 def local_main(argv=None):
     """Same pipeline as the Modal run on tars already on disk. Every tar of
     the parquet (or the first --shards N) must be present."""
-    a = build_arg_parser().parse_args(argv)
+    ap = build_arg_parser()
+    a = ap.parse_args(argv)
+    if a.top_n is not None and a.top_n < 0:
+        ap.error("--top-n must be >= 0")
+    if a.rerender:
+        if a.tar_dir or a.out:
+            ap.error("--rerender takes no --tar-dir / --out")
+        return rerender(a.rerender, a.top_n, a.seed, a.control_n)
+    if not a.tar_dir or not a.out:
+        ap.error("--tar-dir and --out are required (or --rerender DIR)")
+    if a.top_n is None:
+        a.top_n = TOP_N
     t0 = time.time()
     meta = load_meta(a.parquet)
     plan = plan_job(meta, a.seed, a.control_n)
