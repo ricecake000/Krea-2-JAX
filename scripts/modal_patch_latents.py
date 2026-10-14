@@ -330,6 +330,7 @@ def check_patch_shard(path, items, vae, lat_channels=LAT_CHANNELS):
     """The encoded shard must hold exactly the applied crops, encoded from
     these exact images (images_sha256), bucket-shaped, bf16, finite, of the
     base's VAE. SystemExit listing every problem."""
+    import ml_dtypes  # noqa: F401  (registers bfloat16 for safetensors/numpy)
     import numpy as np
     from safetensors import safe_open
 
