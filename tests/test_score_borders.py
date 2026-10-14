@@ -9,12 +9,20 @@
     only part bars); thin dark frame line around a full image -> tiny score,
     thin_frame only; frame line + white mat + inset -> peeled, high score;
     light-grey / coloured canvas ~ white; busy edges -> 0; blank canvas
-  * thumbnail candidate selection, tag / caption flags, the always-thumb
-    plan (watermark, border-uncaptioned, seeded white-background control)
+  * review round 1: canvas colour chosen by score over all candidates (a
+    letterbox whose picture has flat side edges); geometric-mean
+    straightness (a bust with one flat cut stays below a 3% inset, an inset
+    with one weaker side stays high); tar member parsing and per-shard id
+    validation (missing / extra / duplicate -> the run fails, nothing
+    written); global two-pass thumbnail selection (exactly the review
+    page's ids, a missing one fails); localStorage key scoped to the review
+    id, foreign ids dropped on load / export (the page's logic run in node)
+  * tag / caption flags, the always-thumb plan (watermark,
+    border-uncaptioned, seeded white-background control)
   * dry run: a fake tar of synthetic WebPs (+ json/txt members) through the
-    per-shard scorer, then the join + scores.parquet + review page writer
-    (files exist, inline JSON parses, tabs, thumbs, no external URLs), and
-    the local CLI (--tar-dir) end to end
+    per-shard scorer, pass 2, then the join + scores.parquet + review page
+    writer (files exist, inline JSON parses, tabs, thumbs, no external
+    URLs), and the local CLI (--tar-dir) end to end
 
     python tests/test_score_borders.py      # or: pytest tests/test_score_borders.py
 """
@@ -22,6 +30,7 @@
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -132,8 +141,8 @@ def test_rect_inset_beats_silhouette():
         worst = max(worst, m["score"])
     best_inset_min = min(msb.border_metrics(i)["score"] for i in insets.values())
     assert best_inset_min > 2.5 * worst, (best_inset_min, worst)
-    # thin (1.5%) white border all round still clears the candidate threshold
-    assert msb.border_metrics(inset(0.016, 0.016))["score"] >= msb.SCORE_MIN
+    # a thin (1.6%) white border all round still outranks every silhouette
+    assert msb.border_metrics(inset(0.016, 0.016))["score"] > 1.2 * worst
 
 
 def test_full_bleed_and_busy_edges_zero():
@@ -166,6 +175,58 @@ def test_pillarbox_and_letterbox_flagged():
     assert m["pillar_or_letter"] and m["bg_black"], m
     assert m["margin_left"] == 0 and m["margin_right"] == 0, m
     assert m["score"] > 0.12, m
+
+
+def test_letterbox_with_flat_picture_sides():
+    """Picture side edges flat (sky colour) and covering more of the ring
+    than the bars: the whole-ring median is the picture colour (scores 0);
+    the bar colour from a side strip must win through the geometry."""
+    a = canvas((0, 0, 0), 2.0)
+    p = photo(H - 120, W, 4)
+    p[:, :60] = (120, 170, 220)
+    p[:, W - 60:] = (120, 170, 220)
+    a[60:H - 60] = p
+    m = msb.border_metrics(webp(a))
+    assert m["n_bg_candidates"] == 2 and m["bg_src"] in ("top", "bottom"), m
+    assert m["bg_black"] and m["pillar_or_letter"], m
+    assert m["ring_uniform"] < 0.5, m      # the bars are the ring's minority
+    assert abs(m["margin_top"] - 60 / H) < 3 / H and m["score"] > 0.08, m
+
+
+def bust(cut, seed=0):
+    """White-background bust: round head/hair/shoulders, one flat
+    horizontal cut `cut` px above the bottom (white below)."""
+    im = Image.fromarray(canvas(seed=seed))
+    d = ImageDraw.Draw(im)
+    cx = W // 2
+    d.ellipse([cx - 330, 620, cx + 330, 1500], fill=(70, 90, 160))
+    d.ellipse([cx - 150, 260, cx + 150, 680], fill=(225, 190, 170))
+    d.ellipse([cx - 190, 200, cx + 190, 470], fill=(60, 40, 30))
+    a = np.asarray(im).copy()
+    a[H - cut:] = canvas(seed=seed + 1)[H - cut:]
+    return webp(a)
+
+
+def test_geometric_straightness():
+    ref = msb.border_metrics(inset(0.03, 0.03))["score"]
+    for cut in (150, 250, 350):
+        m = msb.border_metrics(bust(cut))
+        st = [m[f"straight_{s}"] for s in msb.SIDES if m[f"straight_{s}"] >= 0]
+        assert m["straight_bottom"] > 0.95 and len(st) == 4, m
+        assert m["score"] < 0.6 * ref, (cut, m, ref)
+        # the arithmetic mean of the first version ranked it ~ the inset
+        arith = (m["margin_area_frac"] * sum(st) / len(st)
+                 * min(1, m["fill"] / msb.FILL_FULL))
+        assert arith > 0.75 * ref, (cut, arith, ref)
+    # an inset with one weaker side (~0.6: white patch along its top edge)
+    c = canvas()
+    mt, ml = int(H * 0.08), int(W * 0.08)
+    p = photo(H - 2 * mt, W - 2 * ml, 1)
+    p[:6, :int(p.shape[1] * 0.4)] = 255
+    c[mt:H - mt, ml:W - ml] = p
+    m = msb.border_metrics(webp(c))
+    assert 0.5 < m["straight_top"] < 0.7 and m["edge_straightness"] > 0.85, m
+    assert m["score"] > 0.8 * msb.border_metrics(inset(0.08, 0.08))["score"], m
 
 
 def test_thin_frame_and_frame_with_mat():
@@ -223,17 +284,73 @@ def test_blank_and_input_checks():
 
 
 # ------------------------------------------------------------------ selection
-def test_pick_thumbs():
-    rows = [{"id": i, "score": s, "pillar_or_letter": pl}
-            for i, s, pl in [(1, 0.5, False), (2, 0.04, False), (3, 0.0, True),
-                             (4, 0.01, False), (5, 0.0, False)]]
-    rows.append({"id": 6, "error": "broken"})
-    assert msb.pick_thumbs(rows, (), 0.05, 0.0) == {1, 3}
-    # top-frac: ceil(0.2 * 5 ok rows) = 1 -> the best positive score (1)
-    assert msb.pick_thumbs(rows, (), 0.6, 0.2) == {1, 3}
-    assert msb.pick_thumbs(rows, (), 0.6, 0.4) == {1, 2, 3}
-    # zero scores never fill the top-frac; always ids only when present
-    assert msb.pick_thumbs(rows, (5, 99), 0.6, 1.0) == {1, 2, 3, 4, 5}
+def test_thumb_selection():
+    joined = [{"id": i, "score": sc, "pillar_or_letter": pl}
+              for i, sc, pl in [(1, 0.5, False), (2, 0.04, False),
+                                (3, 0.0, True), (4, 0.01, False),
+                                (5, 0.0, False)]]
+    joined.append({"id": 6, "error": "broken"})
+    plan = {"watermark": [5], "uncaptioned": [], "control": [7]}
+    tabs = msb.build_tabs(joined, plan, top_n=2)
+    assert tabs == {"A": [1, 2], "B": [5], "C": [], "D": [7], "E": [3]}
+    sel = msb.select_thumbs(tabs)
+    assert sel == {1, 2, 3, 5, 7}       # 4 (rank 3) and 6 (error) not selected
+    meta = {i: {"tar": f"t{i % 2}"} for i in range(1, 8)}
+    assert msb.thumb_jobs(sel, {5: b"x"}, meta) == {"t0": [2], "t1": [1, 3, 7]}
+    msb.check_thumbs(sel, {i: b"" for i in sel})
+    try:
+        msb.check_thumbs(sel, {1: b"", 2: b""})
+    except SystemExit as e:
+        assert "3 selected ids have no thumbnail" in str(e) and "[3, 5, 7]" in str(e)
+    else:
+        raise AssertionError("missing thumbnails accepted")
+
+
+def _tar(path, members):
+    with tarfile.open(path, "w") as tf:
+        for name, data in members:
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+
+
+def test_member_parsing_and_shard_validation():
+    assert msb.parse_member("data/123.webp") == (123, "webp")
+    assert msb.parse_member("123.JSON") == (123, "json")
+    for bad in ("abc.webp", "123.bmp", "123", "12a.webp", "123.webp.bak",
+                ".webp", "123.foo.webp"):
+        try:
+            msb.parse_member(bad)
+        except msb.ShardError:
+            pass
+        else:
+            raise AssertionError(f"accepted member {bad!r}")
+    assert msb.validate_shard([1, 2, 3], {1, 2, 3}) == {}
+    assert msb.validate_shard([1, 2, 2, 4], {1, 2, 3}) == {
+        "missing": [3], "extra": [4], "duplicate": [2]}
+    img = webp_bytes(np.full((64, 48, 3), 128, np.uint8))
+    with tempfile.TemporaryDirectory() as d:
+        ok = Path(d) / "ok.tar"
+        _tar(ok, [("7.webp", img), ("7.json", b"{}"), ("7.txt", b"c"),
+                  ("8.webp", img), ("8.json", b"{}")])
+        res = msb.score_shard_impl(ok, [8], log=lambda *_: None)
+        assert [r["id"] for r in res["rows"]] == [7, 8] and set(res["thumbs"]) == {8}
+        for name in ("x7.webp", "9.bmp", "9.webp.orig"):
+            bad = Path(d) / "bad.tar"
+            _tar(bad, [("7.webp", img), (name, img)])
+            try:
+                msb.score_shard_impl(bad, log=lambda *_: None)
+            except msb.ShardError as e:
+                assert name in str(e)
+            else:
+                raise AssertionError(f"tar member {name!r} accepted")
+        # duplicate image of one id in a tar -> duplicate in validation
+        dup = Path(d) / "dup.tar"
+        _tar(dup, [("7.webp", img), ("7.png", img)])
+        res = msb.score_shard_impl(dup, log=lambda *_: None)
+        plan = {"ids": {"dup": [7, 8]}}
+        err = msb.check_shard_result("dup", res, plan, log=lambda *_: None)
+        assert "1 missing ids [8]" in err and "1 duplicate ids [7]" in err, err
 
 
 def test_flags_and_plan():
@@ -342,7 +459,10 @@ def _check_outputs(out, truth, s):
     m = re.search(r'<script id="data" type="application/json">(.*?)</script>',
                   page, re.S)
     data = json.loads(m.group(1))
-    assert set(data["tabs"]) == {"A", "B", "C", "D"}
+    assert set(data["tabs"]) == {"A", "B", "C", "D", "E"}
+    assert data["tabs"]["E"] == []
+    assert re.fullmatch(r"[0-9a-f]{16}", data["review_id"]) and data["generated"]
+    assert data["review_id"] == s["review_id"]
     insets = sorted(i for i, k in truth.items() if k == "inset")
     top = data["tabs"]["A"]
     assert set(top[:min(len(insets), len(top))]) <= set(insets), top
@@ -351,8 +471,8 @@ def _check_outputs(out, truth, s):
     assert sorted(data["tabs"]["C"]) == insets
     assert data["tabs"]["D"] and all(truth[i] == "sil" for i in data["tabs"]["D"])
     thumbs = {int(p.stem) for p in (out / "thumbs").glob("*.jpg")}
-    for tab in "BCD":   # always-thumb lists
-        assert set(data["tabs"][tab]) <= thumbs, tab
+    # exactly the review page's ids (two-pass global selection)
+    assert thumbs == {i for v in data["tabs"].values() for i in v}, thumbs
     assert set(insets) <= thumbs
     for i in thumbs:
         with Image.open(out / "thumbs" / f"{i}.jpg") as im:
@@ -365,8 +485,7 @@ def _check_outputs(out, truth, s):
     assert "@import" not in page and "prefers-color-scheme: dark" in page
     assert "localStorage" in page and "datafilter_remove.json" in page
     js = json.loads((out / "summary.json").read_text())
-    assert js["missing_thumbs"]["B"] == js["missing_thumbs"]["C"] == 0
-    assert js["missing_thumbs"]["D"] == 0
+    assert set(js["missing_thumbs"].values()) == {0}, js["missing_thumbs"]
 
 
 def test_dry_run_shard_and_outputs():
@@ -374,33 +493,94 @@ def test_dry_run_shard_and_outputs():
         root, truth = _fake_dataset(Path(d) / "ds")
         meta = msb.load_meta(root / "metadata.parquet")
         plan = msb.plan_job(meta, seed=0, control_n=3)
+        assert plan["ids"] == {t: sorted(i for i in truth if meta[i]["tar"] == t)
+                               for t in plan["shards"]}
         rows, thumbs, logs = [], {}, []
-        for tar in plan["shards"]:
+        for tar in plan["shards"]:          # pass 1
             res = msb.score_shard_impl(root / tar, plan["always"].get(tar, []),
-                                       msb.SCORE_MIN, 0.0, threads=2,
-                                       log=logs.append)
+                                       threads=2, log=logs.append)
             assert res["n"] == 18 and not any("error" in r for r in res["rows"])
-            assert set(res["seconds"]) == {"metrics", "thumbs"}
+            assert msb.check_shard_result(tar, res, plan) is None
+            assert set(res["thumbs"]) == set(plan["always"].get(tar, []))
             rows.extend(res["rows"])
             thumbs.update(res["thumbs"])
         assert len(logs) == 2 and "18 imgs" in logs[0]
-        # thumbs: candidates (insets) + always ids, nothing else
-        want = ({i for i, k in truth.items() if k == "inset"}
-                | {i for v in plan["always"].values() for i in v})
-        assert set(thumbs) == want, (sorted(thumbs), sorted(want))
+        tabs = msb.build_tabs(msb.join_rows(rows, meta), plan, top_n=16)
+        sel = msb.select_thumbs(tabs)
+        try:                                 # pass 1 alone is not enough
+            msb.write_outputs(Path(d) / "early", rows, thumbs, meta, plan, {},
+                              top_n=16)
+        except SystemExit as e:
+            assert "no thumbnail" in str(e)
+            assert not (Path(d) / "early").exists()
+        else:
+            raise AssertionError("write_outputs accepted missing thumbnails")
+        jobs = msb.thumb_jobs(sel, thumbs, meta)
+        assert jobs and set(jobs) <= set(plan["shards"])
+        for tar, ids in jobs.items():         # pass 2: exactly those ids
+            got = msb.thumb_shard_impl(root / tar, ids, log=logs.append)
+            assert set(got["thumbs"]) == set(ids)
+            thumbs.update(got["thumbs"])
+        assert set(thumbs) == sel
         out = Path(d) / "out"
         s = msb.write_outputs(out, rows, thumbs, meta, plan, {"total": 1.0},
-                              top_n=10)
+                              top_n=16)
         _check_outputs(out, truth, s)
         lines = []
         msb.print_summary(s, log=lines.append)
         assert any(l.startswith("score quantiles") for l in lines)
-        assert s["top_overlap"]["white border"] == {"tagged": 12, "in_top": 10}
+        assert s["top_overlap"]["white border"] == {"tagged": 12, "in_top": 12}
         # finalize-made table bytes are used as is
         tb = msb.table_bytes(msb.join_rows(rows, meta))
         out2 = Path(d) / "out2"
-        msb.write_outputs(out2, rows, thumbs, meta, plan, {}, table=tb)
+        msb.write_outputs(out2, rows, thumbs, meta, plan, {}, top_n=16,
+                          table=tb)
         assert (out2 / "scores.parquet").read_bytes() == tb
+
+
+def test_review_identity_and_storage_logic():
+    tabs = {"A": [1, 2], "B": [3], "C": [], "D": [], "E": []}
+    gen = "2026-10-14T00:00:00+00:00"
+    rid = msb.review_id(tabs, gen)
+    assert rid == msb.review_id(tabs, gen)
+    assert rid != msb.review_id(tabs, "2026-10-14T00:00:01+00:00")
+    assert rid != msb.review_id(dict(tabs, A=[1, 4]), gen)
+    items = {str(i): {"s": 0.1 * i} for i in (1, 2, 3)}
+    page = msb.render_review(tabs, items, gen)
+    data = json.loads(re.search(
+        r'<script id="data" type="application/json">(.*?)</script>', page,
+        re.S).group(1))
+    assert data["review_id"] == rid and data["generated"] == gen
+    assert "storeKey(D)" in page and "loadSel(localStorage.getItem(KEY),D)" in page
+    node = shutil.which("node")
+    if node is None:
+        print("node not found: storage logic not executed")
+        return
+    logic = re.search(r'<script id="logic">(.*?)</script>', page, re.S).group(1)
+    js = logic + """
+var D=%s;
+function eq(a,b,m){if(JSON.stringify(a)!==JSON.stringify(b)){
+  throw new Error(m+': '+JSON.stringify(a)+' != '+JSON.stringify(b))}}
+eq(storeKey(D),'datafilter_remove_v1:'+D.review_id,'key');
+var raw=JSON.stringify({'1':{tab:'A',score:0.1},'99':{tab:'A',score:1},
+  '3':{tab:'B',score:null},'2':'junk'});
+var sel=loadSel(raw,D);
+eq(Object.keys(sel).sort(),['1','3'],'foreign / malformed ids dropped');
+eq(loadSel('not json',D),{},'bad json');
+eq(loadSel('[1,2]',D),{},'array');
+eq(loadSel(null,D),{},'empty');
+sel['77']={tab:'A',score:2};
+var ex=exportObj(sel,D,'NOW');
+eq(ex.review_id,D.review_id,'export id');eq(ex.generated,D.generated,'gen');
+eq(ex.items.map(function(x){return x.id}).sort(),[1,3],'export ids');
+console.log('ok');
+""" % json.dumps(data)
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.js"
+        f.write_text(js)
+        p = subprocess.run([node, str(f)], capture_output=True, text=True,
+                           timeout=60)
+    assert p.returncode == 0 and p.stdout.strip() == "ok", p.stderr
 
 
 def test_local_cli_end_to_end():
@@ -426,6 +606,38 @@ def test_local_cli_end_to_end():
         assert p.returncode == 0, p.stderr[-3000:]
         s1 = json.loads((out1 / "summary.json").read_text())
         assert s1["images"] == 18 and s1["tabs"]["B"] == 1, s1
+        # the parquet lists an id the tar does not hold -> shard fails,
+        # exit != 0, nothing written
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        t = pq.read_table(root / "metadata.parquet")
+        extra = pa.table({c: [t.column(c)[0].as_py()] for c in t.column_names})
+        extra = extra.set_column(0, "id", pa.array([999999], pa.int64()))
+        pq.write_table(pa.concat_tables([t, extra]), root / "bad.parquet")
+        outb = Path(d) / "clibad"
+        p = subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "modal_score_borders.py"),
+             "--tar-dir", str(root), "--parquet", str(root / "bad.parquet"),
+             "--out", str(outb)],
+            capture_output=True, text=True, timeout=600)
+        assert p.returncode != 0, p.stdout
+        assert ("data/train-0000.tar: ids do not match metadata.parquet: "
+                "1 missing ids [999999]") in p.stderr, p.stderr[-2000:]
+        assert "nothing written" in p.stderr and not outb.exists()
+        # a malformed member -> the shard fails the same way
+        with tarfile.open(root / "data" / "train-0001.tar", "a") as tf:
+            ti = tarfile.TarInfo("notes.md")
+            ti.size = 1
+            tf.addfile(ti, io.BytesIO(b"x"))
+        p = subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "modal_score_borders.py"),
+             "--tar-dir", str(root), "--parquet",
+             str(root / "metadata.parquet"), "--out", str(outb)],
+            capture_output=True, text=True, timeout=600)
+        assert p.returncode != 0 and "unexpected tar member 'notes.md'" in \
+            p.stderr, p.stderr[-2000:]
+        assert not outb.exists()
     h = subprocess.run([sys.executable, str(REPO / "scripts" /
                                             "modal_score_borders.py"), "--help"],
                        capture_output=True, text=True, timeout=60)

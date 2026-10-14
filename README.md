@@ -715,20 +715,20 @@ modal run scripts/modal_coherence.py --run run1 --step 1513
 `ricecake/danbooru-curated-v2` for "a picture placed on a flat canvas"
 (white or flat margins around a rectangular picture, pillar/letterbox bars,
 a frame line + mat) and builds a review page to pick images for removal.
-CPU only: one container per tar (`.starmap`, Modal default resources; a
-950-image shard peaks at ~90 MiB RSS), each downloads its tar, scores every
-image at full resolution and returns the metrics plus 512 px JPEG thumbnails
-of the candidates.
+CPU only, Modal default resources (a 950-image shard peaks at ~90 MiB RSS).
 
-Metric (`border_metrics`, numpy): the canvas colour is the median of the
-2 px outer ring (or of one side strip when that matches more of the ring, so
-bars on two sides work); canvas pixels are within `TOL` = 18 (max abs channel
-difference: survives WebP noise/ringing, still separates near-white
-picture highlights). Margins are leading rows/columns that are >= 98%
-canvas; `fill` = non-canvas fraction of the remaining box;
-`edge_straightness` = mean over the sides with a margin of the box edge's
-non-canvas fraction (best of the first 4 lines: a rectangle gives ~1, a
-character silhouette on white ~0.1).
+Metric (`border_metrics`, numpy, full resolution): canvas colour candidates
+are the medians of the 2 px outer ring and of each side strip
+(de-duplicated within `TOL`); each goes through the full margin geometry and
+the best score wins (`bg_src`), so bars on only two sides work even when the
+picture's own edges cover more of the ring. Canvas pixels are within `TOL` =
+18 (max abs channel difference: survives WebP noise/ringing, still separates
+near-white picture highlights). Margins are leading rows/columns that are
+>= 98% canvas; `fill` = non-canvas fraction of the remaining box; per-side
+straightness = the box edge's non-canvas fraction (best of the first 4
+lines); `edge_straightness` = their geometric mean over the sides with a
+margin (a rectangle gives ~1, a silhouette ~0.1, and one flat cut of a bust
+cannot carry three round sides).
 `score = margin_area_frac * edge_straightness * min(1, fill / 0.85)` when the
 ring is >= 90% canvas or the image is `pillar_or_letter` (margins on exactly
 two opposite sides, straightness >= 0.9), else 0. A thin frame line (all
@@ -737,20 +737,26 @@ inset scores like the inset); a frame line around a full-bleed picture only
 sets `thin_frame`. All intermediate numbers are stored, so the ranking can
 be re-weighted from `scores.parquet` without re-running.
 
-Thumbnails: score >= `--score-min` (0.05: a ~1.3% border on all sides, a
-~5% band, or any larger inset), `pillar_or_letter`, each shard's top
-`--thumb-frac` (3%) by score, and always: every `sample watermark` image,
-every `border` / `white border` / `outside border` / `pillarboxed` image
-whose long caption does not mention a border/frame/margin/letterbox/
-pillarbox/inset, and `--control-n` (150) seeded random `white background`
-images.
+Flow: pass 1, one container per tar (`.starmap`): download, score every
+image, thumbnails (512 px JPEG) of the always-review ids. Tar members must
+be `<id>.{webp,png,jpg,jpeg,json,txt}` and the image ids of every tar must
+equal the parquet's ids for it (missing / extra / duplicate ids, a failed
+container or an odd member fail the run with exit != 0 and nothing
+written). Then the global selection (top `--top-n` by score, every
+pillar/letterbox, every `sample watermark` image, every `border` /
+`white border` / `outside border` / `pillarboxed` image whose long caption
+does not mention border/frame/margin/letterbox/pillarbox/inset, and
+`--control-n` seeded random `white background` images); pass 2 fetches
+exactly the missing thumbnails from the tars that hold them, and a selected
+id without a thumbnail fails the run.
 
 Output in `/home/mj/krea2-ops/eval/datafilter/`: `scores.parquet` (every
 image: metrics + tag/caption flags), `thumbs/<id>.jpg`, `summary.json` and
 `review/index.html` (self-contained; tabs A top `--top-n` by score, B sample
 watermark, C border tag without a border caption, D white-background
-control; click = mark for removal, kept in localStorage; "export" downloads
-`datafilter_remove.json`).
+control, E pillar/letterbox; click = mark for removal, kept in localStorage
+under a key scoped to this page's review id with foreign ids dropped;
+"export" downloads `datafilter_remove.json` with the review id).
 
 ```bash
 modal run scripts/modal_score_borders.py --shards 2   # smoke run (2 tars)
@@ -791,7 +797,8 @@ python tests/test_modal_export_full.py  # Modal export: minimal orbax download (
 python tests/test_modal_coherence.py    # Modal coherence: partial restore == full restore,
                                         # metrics, null-model simulation, fake-R2 flow
 python tests/test_score_borders.py      # dataset border score: synthetic insets vs
-                                        # silhouettes (WebP), fake-tar shard + review page
+                                        # silhouettes (WebP), shard id validation, two-pass
+                                        # thumbnails, fake-tar run + review page (node)
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
