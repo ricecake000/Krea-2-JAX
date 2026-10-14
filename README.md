@@ -806,6 +806,64 @@ python scripts/modal_score_borders.py --tar-dir DIR --out OUT   # same, tars alr
 python scripts/modal_score_borders.py --rerender /home/mj/krea2-ops/eval/datafilter  # page only
 ```
 
+### Dataset filter: patch the latents (new dataset version)
+
+`scripts/modal_patch_latents.py` turns a data-filter patch directory
+(`scripts/datafilter_apply.py`: `images/<id>.webp` re-cropped to their new
+bucket, `patch.parquet` with one row per acted id, `patch.json`) into a
+new version of `ricecake/danbooru-curated-v2-latents` **without touching
+any existing shard** (the VAE posterior sample is unseeded, so shards are
+never rebuilt). Rows apply when `status` is `ok` (or `crop_unsure` for a
+crop); anything else (`crop_too_small`, `over_budget`, `error`, ...) makes
+`build` fail unless `--unapplied keep` (row left as it is) or
+`--unapplied remove` (sample dropped).
+
+The new version = the base files plus three new ones:
+
+```
+metadata.parquet               base rows minus removed ids; long/medium/short + *_tok (and bucket_w/h
+                               for crops) from the patch; new column latent_shard (live shard per id)
+latents/manifest.json          base manifest + "patch-NNNN.safetensors" in shards/digests, n += count,
+                               "superseded": {shard: [ids]} (keys the loader skips: removed ids and
+                               the old latents of re-cropped ids), "patches": [provenance]
+latents/patch-NNNN.safetensors the re-encoded crops ("<id>" -> (16, h/8, w/8) bf16)
+```
+
+`BucketDataset` skips superseded keys (each must exist in its shard),
+still requires exactly one live latent per parquet id, checks
+`latent_shard` when present, and `--verify-latents` re-hashes every shard
+including the patch shard. A manifest without `"superseded"` (every
+existing cache) loads and fingerprints exactly as before
+(`tests/test_patch_latents.py` pins it against main's code). A patched
+version has a different `dataset_fingerprint`: train it as a fresh run, it
+cannot resume a run of the old version. The upload therefore goes to a
+**branch** (old shards are shared, not re-sent); `main`, which the node kit
+downloads, does not move.
+
+```bash
+P=/path/to/patch   # datafilter_apply.py output
+# (1) encode the crops on Modal (B200; same image, volume and VAE weights as
+#     modal_cache_latents.py; the patch files go to the volume)
+modal run scripts/modal_patch_latents.py --patch-dir $P      # -> $P/patch_latents.safetensors
+# (2) build the new version locally (needs only the base parquet + manifest)
+BASE_REV=ac8ffd73f5b227d11a53b08db92071be6aca3751   # main as verified by the 10/13 cache build
+hf download ricecake/danbooru-curated-v2-latents metadata.parquet latents/manifest.json \
+  --repo-type dataset --revision $BASE_REV --local-dir /home/mj/.cache/krea2-latents-base
+python scripts/modal_patch_latents.py build --base /home/mj/.cache/krea2-latents-base \
+  --base-revision $BASE_REV --patch-dir $P --out /home/mj/.cache/krea2-latents-v2   # [--unapplied keep|remove]
+# (3) upload: branch at BASE_REV + one commit of the 3 files, then every file of the
+#     new manifest is checked on the Hub (sha256); idempotent
+python scripts/modal_patch_latents.py upload --new /home/mj/.cache/krea2-latents-v2 \
+  --branch datafilter-<review_id>
+# node: the same download with --revision datafilter-<review_id> (only the 3 files change)
+```
+
+With the base shards on disk, `build --link-base-shards` symlinks them into
+the new version and loads it with `BucketDataset` (full header + digest
+check). `scripts/cache_latents.py --write-manifest` refuses a patched
+version (it would overwrite its parquet). Chained patches work: a second
+patch builds on a patched version and supersedes ids in `patch-0000` too.
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -842,6 +900,9 @@ python tests/test_score_borders.py      # dataset border score: synthetic insets
                                         # silhouettes (WebP), shard id validation, two-pass
                                         # thumbnails, fake-tar run + review page (node),
                                         # side patterns, 4-state review logic, --rerender
+python tests/test_patch_latents.py      # latent patch: unpatched fingerprint == main's,
+                                        # patched latents/captions/removals load + verify,
+                                        # validation, chained patches, fake-Hub upload
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -877,6 +938,7 @@ scripts/
   modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
   modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
   modal_score_borders.py  # Modal: inset/border score of the dataset + review page
+  modal_patch_latents.py  # Modal + local: data-filter patch -> new latents version
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
