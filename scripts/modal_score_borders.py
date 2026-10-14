@@ -38,10 +38,13 @@ Metric (border_metrics, pure numpy on the full-resolution RGB image):
      when ring_uniform >= RING_UNIFORM_MIN or pillar_or_letter, else 0
      (bars on two sides cover only part of the ring, so the ring gate alone
      would zero every pillarbox).
-  7. frame line + mat: when all four margins are thin (0 < m < MIN_SIDE_FRAC,
-     `thin_frame`), the image is measured again inside the frame (+2 px);
-     if that scores higher (a mat around an inset), its margins (added to
-     the frame's), fill and straightness are used (`peeled`, `frame_px`).
+  7. frame line + mat: for EACH outer candidate whose four margins are thin
+     (0 < m < MIN_SIDE_FRAC, `thin_frame`), the image is measured again
+     inside the frame (+2 px; best candidate of the crop); when that scores
+     higher (a mat around an inset), its margins (added to the frame's),
+     fill and straightness replace the candidate's own (`peeled`,
+     `frame_px`). The final winner is chosen over the peeled / unpeeled
+     results of all candidates.
      A thin frame line around a full-bleed picture keeps its tiny score
      (margin_area_frac ~ the line) and is only flagged `thin_frame`.
 
@@ -356,25 +359,74 @@ def _finish(h, w, px, fill, straight, ring_uniform, blank=False):
     return out
 
 
-def _best(rgb, tol=TOL):
-    """Every canvas candidate through the full geometry -> (finished dict,
-    measurement + {bg, ring_uniform, bg_src}, n candidates) of the best
-    score (the first candidate, the whole-ring median, on ties)."""
+def _outer(rgb, name, bg, ru, tol=TOL):
+    """One canvas candidate through the full geometry -> (finished dict,
+    measurement + {bg, ring_uniform, bg_src})."""
     h, w = rgb.shape[:2]
+    m = _measure(rgb, bg, tol)
+    m.update(bg=[int(x) for x in bg], ring_uniform=ru, bg_src=name)
+    return _finish(h, w, m["px"], m["fill"], m["straight"], ru,
+                   m["blank"]), m
+
+
+def _best(rgb, tol=TOL):
+    """Every canvas candidate through the full geometry (no peel) ->
+    (finished dict, measurement, n candidates) of the best score (the first
+    candidate, the whole-ring median, on ties). Used inside a frame."""
     cands = _bg_candidates(rgb, tol)
     best = None
     for name, bg, ru in cands:
-        m = _measure(rgb, bg, tol)
-        m.update(bg=[int(x) for x in bg], ring_uniform=ru, bg_src=name)
-        res = _finish(h, w, m["px"], m["fill"], m["straight"], ru, m["blank"])
+        res, m = _outer(rgb, name, bg, ru, tol)
         if best is None or res["score"] > best[0]["score"]:
             best = (res, m)
     return best[0], best[1], len(cands)
 
 
+def is_thin(px, blank, h, w):
+    """All four margins present and < MIN_SIDE_FRAC: a frame line."""
+    t, b, l, r = px
+    return (not blank and min(px) > 0
+            and t < MIN_SIDE_FRAC * h and b < MIN_SIDE_FRAC * h
+            and l < MIN_SIDE_FRAC * w and r < MIN_SIDE_FRAC * w)
+
+
+def _with_peel(rgb, res, m, tol=TOL):
+    """One outer candidate's result, peeled when its margins are a thin
+    frame and the inside (best candidate of the crop) scores higher ->
+    (finished dict, info)."""
+    h, w = rgb.shape[:2]
+    thin = is_thin(m["px"], m["blank"], h, w)
+    info = {"bg": m["bg"], "ring_uniform": m["ring_uniform"],
+            "bg_src": m["bg_src"], "thin": thin, "peeled": False,
+            "frame_px": 0, "blank": m["blank"]}
+    if not thin:
+        return res, info
+    t, b, l, r = m["px"]
+    y0, y1 = t + PEEL_PAD, h - b - PEEL_PAD
+    x0, x1 = l + PEEL_PAD, w - r - PEEL_PAD
+    if y1 - y0 < PEEL_MIN_PX or x1 - x0 < PEEL_MIN_PX:
+        return res, info
+    _, inner, _ = _best(rgb[y0:y1, x0:x1], tol)
+    if inner["blank"]:
+        return res, info
+    it, ib, il, ir = inner["px"]
+    px = (y0 + it, (h - y1) + ib, x0 + il, (w - x1) + ir)
+    cand = _finish(h, w, px, inner["fill"], inner["straight"],
+                   inner["ring_uniform"])
+    if cand["score"] > res["score"]:
+        info.update(bg=inner["bg"], ring_uniform=inner["ring_uniform"],
+                    bg_src="peel:" + inner["bg_src"], peeled=True,
+                    frame_px=max(m["px"]))
+        return cand, info
+    return res, info
+
+
 def border_metrics(rgb, tol=TOL):
     """rgb: uint8 [H, W, 3] (full resolution, no downscale) -> dict of
-    rounded floats / ints / bools (see the module docstring)."""
+    rounded floats / ints / bools (see the module docstring). Every outer
+    canvas candidate is scored with and (when its margins are a thin frame)
+    without its frame; the best final score wins (the first candidate on
+    ties)."""
     import numpy as np
 
     rgb = np.ascontiguousarray(rgb)
@@ -382,35 +434,23 @@ def border_metrics(rgb, tol=TOL):
         raise ValueError(f"expected uint8 [H, W, 3], got {rgb.dtype} "
                          f"{rgb.shape}")
     h, w = rgb.shape[:2]
-    res, m, n_cand = _best(rgb, tol)
-    t, b, l, r = m["px"]
-    thin = (not m["blank"] and min(m["px"]) > 0
-            and t < MIN_SIDE_FRAC * h and b < MIN_SIDE_FRAC * h
-            and l < MIN_SIDE_FRAC * w and r < MIN_SIDE_FRAC * w)
-    bg, ru, src, peeled, frame_px = (m["bg"], m["ring_uniform"], m["bg_src"],
-                                     False, 0)
-    if thin:
-        y0, y1 = t + PEEL_PAD, h - b - PEEL_PAD
-        x0, x1 = l + PEEL_PAD, w - r - PEEL_PAD
-        if y1 - y0 >= PEEL_MIN_PX and x1 - x0 >= PEEL_MIN_PX:
-            _, inner, _ = _best(rgb[y0:y1, x0:x1], tol)
-            if not inner["blank"]:
-                it, ib, il, ir = inner["px"]
-                px = (y0 + it, (h - y1) + ib, x0 + il, (w - x1) + ir)
-                cand = _finish(h, w, px, inner["fill"], inner["straight"],
-                               inner["ring_uniform"])
-                if cand["score"] > res["score"]:
-                    res, peeled = cand, True
-                    bg, ru = inner["bg"], inner["ring_uniform"]
-                    src, frame_px = "peel:" + inner["bg_src"], max(m["px"])
+    cands = _bg_candidates(rgb, tol)
+    best = None
+    for name, bg, ru in cands:
+        res, info = _with_peel(rgb, *_outer(rgb, name, bg, ru, tol), tol)
+        if best is None or res["score"] > best[0]["score"]:
+            best = (res, info)
+    res, info = best
+    bg = info["bg"]
     lum = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2]
     res.update({
         "h": h, "w": w, "bg_r": bg[0], "bg_g": bg[1], "bg_b": bg[2],
         "bg_lum": _r(lum), "bg_white": bool(min(bg) >= NEAR_WHITE_MIN),
         "bg_black": bool(max(bg) <= NEAR_BLACK_MAX),
-        "ring_uniform": _r(ru), "bg_src": src, "n_bg_candidates": n_cand,
-        "thin_frame": bool(thin), "peeled": bool(peeled),
-        "frame_px": int(frame_px), "blank": bool(m["blank"]),
+        "ring_uniform": _r(info["ring_uniform"]), "bg_src": info["bg_src"],
+        "n_bg_candidates": len(cands), "thin_frame": bool(info["thin"]),
+        "peeled": bool(info["peeled"]), "frame_px": int(info["frame_px"]),
+        "blank": bool(info["blank"]),
     })
     return res
 

@@ -733,10 +733,11 @@ margin (a rectangle gives ~1, a silhouette ~0.1, and one flat cut of a bust
 cannot carry three round sides).
 `score = margin_area_frac * edge_straightness * min(1, fill / 0.85)` when the
 ring is >= 90% canvas or the image is `pillar_or_letter` (margins on exactly
-two opposite sides, straightness >= 0.9), else 0. A thin frame line (all
-margins < 1.5%) is measured again inside the line (`peeled`: frame + mat +
-inset scores like the inset); a frame line around a full-bleed picture only
-sets `thin_frame`. All intermediate numbers are stored, so the ranking can
+two opposite sides, straightness >= 0.9), else 0. For every candidate whose
+margins are a thin frame line (all < 1.5%) the image is also measured
+inside the line (`peeled`: frame + mat + inset scores like the inset), and
+the final winner is chosen over all peeled / unpeeled results; a frame line
+around a full-bleed picture only sets `thin_frame`. All intermediate numbers are stored, so the ranking can
 be re-weighted from `scores.parquet` without re-running.
 
 Flow: `prepare` resolves the dataset repo's commit sha once (`--revision`,

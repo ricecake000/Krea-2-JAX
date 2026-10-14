@@ -18,8 +18,10 @@
     page's ids, a missing one fails); localStorage key scoped to the review
     id, foreign ids dropped on load / export (the page's logic run in node)
   * review round 2: canvas candidates within TOL of each other are all
-    scored (Codex's grey letterbox repro), the side-strip pruning never
-    changes the best score (brute force over every median, random fuzz);
+    scored (Codex's grey letterbox repro); round 3: the thin-frame peel runs
+    for every outer candidate (Codex's frame repro); the side-strip pruning
+    never changes the final post-peel score (brute force over every median
+    with per-candidate peel, random bar and framed fuzz);
     the dataset commit is resolved once and pinned for metadata.parquet and
     both tar passes (fake HfApi / download), recorded in summary.json,
     the scores.parquet schema metadata and the review page / export
@@ -219,9 +221,9 @@ def test_close_candidates_all_scored():
     assert not m["blank"], m
 
 
-def _brute_best_score(rgb):
-    """Best score over EVERY ring / side-strip median, no pruning, no
-    merging (border_metrics' step 1-6 without the peel)."""
+def _brute_candidates(rgb):
+    """EVERY ring / side-strip median (no pruning, no merging) in
+    border_metrics' order: [(colour uint8[3], ring_uniform)]."""
     h, w = rgb.shape[:2]
     k = max(1, min(msb.RING_PX, h // 2, w // 2))
     sides = [rgb[:k].reshape(-1, 3), rgb[h - k:].reshape(-1, 3),
@@ -229,25 +231,85 @@ def _brute_best_score(rgb):
     ring = np.concatenate([sides[0], sides[1],
                            rgb[k:h - k, :k].reshape(-1, 3),
                            rgb[k:h - k, w - k:].reshape(-1, 3)]).astype(np.int16)
-    best = 0.0
+    out = []
     for px in [ring] + sides:
         cand = np.round(np.median(px, axis=0)).astype(np.int16)
         ru = float((np.abs(ring - cand).max(axis=1) <= msb.TOL).mean())
-        mm = msb._measure(rgb, cand.astype(np.uint8))
-        res = msb._finish(h, w, mm["px"], mm["fill"], mm["straight"], ru,
-                          mm["blank"])
-        best = max(best, res["score"])
+        out.append((cand.astype(np.uint8), ru))
+    return out
+
+
+def _brute_measure(rgb):
+    """Best (score, measurement) over all brute candidates, no peel (first
+    wins ties)."""
+    h, w = rgb.shape[:2]
+    best = None
+    for cand, ru in _brute_candidates(rgb):
+        mm = msb._measure(rgb, cand)
+        mm["ring_uniform"] = ru
+        sc = msb._finish(h, w, mm["px"], mm["fill"], mm["straight"], ru,
+                         mm["blank"])["score"]
+        if best is None or sc > best[0]:
+            best = (sc, mm)
     return best
 
 
-def test_candidate_pruning_never_changes_the_best():
+def _brute_final_score(rgb):
+    """border_metrics' final score by brute force: every candidate, each
+    peeled (inside = brute best of the crop) when its margins are thin."""
+    h, w = rgb.shape[:2]
+    best = 0.0
+    for cand, ru in _brute_candidates(rgb):
+        mm = msb._measure(rgb, cand)
+        sc = msb._finish(h, w, mm["px"], mm["fill"], mm["straight"], ru,
+                         mm["blank"])["score"]
+        if msb.is_thin(mm["px"], mm["blank"], h, w):
+            t, b, l, r = mm["px"]
+            y0, y1 = t + msb.PEEL_PAD, h - b - msb.PEEL_PAD
+            x0, x1 = l + msb.PEEL_PAD, w - r - msb.PEEL_PAD
+            if y1 - y0 >= msb.PEEL_MIN_PX and x1 - x0 >= msb.PEEL_MIN_PX:
+                _, inner = _brute_measure(rgb[y0:y1, x0:x1])
+                if not inner["blank"]:
+                    it, ib, il, ir = inner["px"]
+                    px = (y0 + it, (h - y1) + ib, x0 + il, (w - x1) + ir)
+                    sc = max(sc, msb._finish(
+                        h, w, px, inner["fill"], inner["straight"],
+                        inner["ring_uniform"])["score"])
+        best = max(best, sc)
+    return best
+
+
+def _framed_fuzz(rng):
+    """1-3 px frame line, a mat and an inset in close greys (thin frames
+    on 150-260 px images), sometimes one frame side in another grey."""
+    h, w = int(rng.integers(150, 260)), int(rng.integers(150, 260))
+    g = lambda: int(rng.integers(0, 256))   # noqa: E731
+    a = np.full((h, w, 3), g(), np.uint8)
+    f, fc = int(rng.integers(1, 4)), g()
+    a[-f:], a[:, :f], a[:, -f:] = fc, fc, fc
+    a[:f, f:w - f] = (int(np.clip(fc + rng.integers(-30, 31), 0, 255))
+                      if rng.random() < 0.4 else fc)
+    m = int(rng.integers(f + 3, min(h, w) // 3))
+    a[m:h - m, m:w - m] = g()
+    if rng.random() < 0.5:
+        n = m + int(rng.integers(2, 12))
+        a[n:h - n, n:w - n] = g()
+    return a
+
+
+def test_candidate_pruning_never_changes_the_final():
     imgs = [inset(0.05, 0.05), inset(0.1, 0.02, (200, 200, 200)),
             silhouette(1, False), silhouette(2, True), webp(photo(H, W, 3))]
     lb = canvas((0, 0, 0), 2.0)
     lb[60:H - 60] = photo(H - 120, W, 4)
     lb[60:H - 60, :60] = (120, 170, 220)
     lb[60:H - 60, W - 60:] = (120, 170, 220)
-    imgs.append(webp(lb))
+    imgs += [webp(lb), _codex_frame()]
+    fm = canvas()
+    fm[:6] = fm[-6:] = 20
+    fm[:, :6] = fm[:, -6:] = 20
+    fm[90:H - 90, 70:W - 70] = photo(H - 180, W - 140, 7)
+    imgs.append(webp(fm))
     rng = np.random.default_rng(7)
     for _ in range(60):     # small random bar / box layouts with close greys
         h, w = int(rng.integers(40, 120)), int(rng.integers(40, 120))
@@ -260,10 +322,45 @@ def test_candidate_pruning_never_changes_the_best():
         if rng.random() < 0.5:
             a = a + rng.integers(0, 4, a.shape).astype(np.uint8)
         imgs.append(a)
+    n_peeled = 0
+    for _ in range(40):
+        a = _framed_fuzz(rng)
+        imgs.append(a if rng.random() < 0.5 else webp(a, 80))
     for i, img in enumerate(imgs):
-        got = msb._best(img)[0]["score"]
-        want = _brute_best_score(img)
-        assert got == want, (i, got, want)
+        got = msb.border_metrics(img)
+        want = _brute_final_score(img)
+        assert got["score"] == want, (i, got, want)
+        n_peeled += got["peeled"]
+    assert n_peeled >= 10, n_peeled    # the peel path is really exercised
+
+
+def _codex_frame():
+    """Codex round-3 repro: 1216x832 grey-50 mat, 6 px frame grey-20 on
+    three sides and grey-35 on top, grey-70 picture [80:-80] with a grey-25
+    interior [88:-88], WebP q80."""
+    a = np.full((1216, 832, 3), 50, np.uint8)
+    a[-6:] = 20
+    a[:, :6] = 20
+    a[:, -6:] = 20
+    a[:6, 6:-6] = 35
+    a[80:-80, 80:-80] = 70
+    a[88:-88, 88:-88] = 25
+    return webp(a, 80)
+
+
+def test_peel_for_every_candidate():
+    img = _codex_frame()
+    h, w = img.shape[:2]
+    outer = {}
+    for name, bg, ru in msb._bg_candidates(img):
+        res, mm = msb._outer(img, name, bg, ru)
+        outer[name] = (res["score"], msb.is_thin(mm["px"], mm["blank"], h, w))
+    # the un-thin top candidate beats the thin ring candidate before peeling
+    assert outer["top"][0] > outer["ring"][0] and outer["ring"][1], outer
+    assert not outer["top"][1], outer
+    m = msb.border_metrics(img)
+    assert m["peeled"] and m["thin_frame"] and m["frame_px"] == 6, m
+    assert abs(m["score"] - 0.2986) < 0.005 and m["bg_r"] == 50, m
 
 
 class FakeApi:
