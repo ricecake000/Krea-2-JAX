@@ -878,6 +878,20 @@ commits with `parent_commit` = the checked head, so a branch moved in
 between is refused by the Hub. `build` refuses a patch that would remove
 every sample.
 
+`scripts/fetch_originals.py` (local) fetches the full-resolution originals of
+selected ids from the Drive archive (`orig-XXXX.tar` + `orig-XXXX.parquet`
+index, rclone remote) into `~/.cache/krea2-orig/img/<id>.webp`, never storing
+a tar: member offsets follow from the index, so only the wanted members are
+read with ranged `rclone cat` calls (every tar header checked against the
+index; a mismatch falls back to streaming that tar and stopping once its ids
+are written). Size-checked atomic writes; re-running resumes; ids in no index
+are listed and exit 1.
+
+```bash
+python scripts/fetch_originals.py --ids-from-review /home/mj/krea2-ops/eval/datafilter  # tabs A/B/C/E
+python scripts/fetch_originals.py --ids datafilter_actions.json   # or a txt / json id list
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -917,6 +931,8 @@ python tests/test_score_borders.py      # dataset border score: synthetic insets
 python tests/test_patch_latents.py      # latent patch: unpatched fingerprint == main's,
                                         # patched latents/captions/removals load + verify,
                                         # validation, chained patches, fake-Hub upload
+python tests/test_fetch_originals.py    # originals fetch with a fake rclone: ranged reads,
+                                        # stream fallback / early stop, resume, retries
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -953,6 +969,7 @@ scripts/
   modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
   modal_score_borders.py  # Modal: inset/border score of the dataset + review page
   modal_patch_latents.py  # Modal + local: data-filter patch -> new latents version
+  fetch_originals.py  # rclone: originals of selected ids from the Drive archive
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
