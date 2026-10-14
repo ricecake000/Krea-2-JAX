@@ -594,64 +594,135 @@ def test_blank_and_input_checks():
 
 
 # ------------------------------------------------------------------ selection
-MARGINS = {"4": (0.1, 0.1, 0.1, 0.1), "3": (0.1, 0.0, 0.05, 0.05),
-           "2-opp": (0.0, 0.0, 0.2, 0.2), "2-adj": (0.1, 0.0, 0.1, 0.0),
-           "1": (0.0, 0.3, 0.0, 0.0), "0": (0.01, 0.0, 0.0, 0.0)}
+PATTERN_SIDES = {"4": 4, "3": 3, "2-opp": 2, "2-adj": 2, "1": 1, "0": 0}
+# px margins (t, b, l, r) per pattern; "0" = a 2 px band (below SIDE_MIN_PX)
+PX = {"4": (100, 100, 80, 80), "3": (100, 0, 60, 60), "2-opp": (0, 0, 120, 120),
+      "2-adj": (90, 0, 70, 0), "1": (0, 150, 0, 0), "0": (2, 0, 0, 0)}
+PATS = list(PX)
 
 
-def _margins(pattern):
-    return {f"margin_{s}": v for s, v in zip(msb.SIDES, MARGINS[pattern])}
+def _cols(pattern, h=H, w=W, straight=1.0):
+    """Score-row columns of a pattern: rounded margin fractions, h / w,
+    straight_* (-1 where there is no margin)."""
+    out = {"h": h, "w": w}
+    for s, p in zip(msb.SIDES, PX[pattern]):
+        n = h if s in ("top", "bottom") else w
+        out[f"margin_{s}"] = round(p / n, msb.ROUND)
+        out[f"straight_{s}"] = straight if p else -1.0
+    return out
+
+
+def _like_4484389():
+    """1024x1024 white canvas, picture with margins top 36 / bottom 12 /
+    left 132 / right 152 px (bottom 1.17% < MIN_SIDE_FRAC)."""
+    c = canvas(h=1024, w=1024)
+    c[36:1024 - 12, 132:1024 - 152] = photo(1024 - 48, 1024 - 284, 3)
+    return webp(c)
+
+
+def _like_8248423():
+    """896 wide x 1152 high white canvas; a yellow rectangle (~70% of the
+    content height) behind a character whose round head sticks out above
+    (24 px top margin) and whose legs run off the bottom edge."""
+    w, h = 896, 1152
+    im = Image.fromarray(canvas(h=h, w=w))
+    d = ImageDraw.Draw(im)
+    d.rectangle([155, 230, w - 134, 1020], fill=(240, 200, 40))
+    d.ellipse([360, 24, 560, 300], fill=(60, 40, 30))            # head
+    d.ellipse([330, 250, 590, 900], fill=(70, 90, 160))          # body
+    d.ellipse([360, 850, 450, h + 150], fill=(70, 90, 160))      # legs
+    d.ellipse([470, 850, 560, h + 150], fill=(70, 90, 160))
+    return webp(np.asarray(im))
 
 
 def test_side_pattern():
     sp = msb.side_pattern
-    for want, m in MARGINS.items():
-        assert sp(m) == want, (want, m)
-        assert sp(dict(zip(msb.SIDES, m))) == want
-        assert sp(_margins(want)) == want
-    assert sp((0.1, 0.1, 0.0, 0.0)) == "2-opp"          # letterbox
-    assert sp((0.0, 0.1, 0.0, 0.1)) == "2-adj"
-    assert sp((0.0, 0.1, 0.1, 0.0)) == "2-adj"
-    assert sp((0.0, 0.1, 0.1, 0.1)) == "3"
-    # >= MIN_SIDE_FRAC counts, just below does not
-    assert sp((msb.MIN_SIDE_FRAC,) * 4) == "4"
-    assert sp((msb.MIN_SIDE_FRAC - 1e-9,) * 4) == "0"
-    assert sp((None, 0.1, None, 0.1)) == "2-adj"
-    try:
-        sp((0.1, 0.1))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("2 margins accepted")
+    one = (1.0,) * 4
+    for want, px in PX.items():
+        assert sp(px, one) == want, (want, px)
+        assert sp(dict(zip(msb.SIDES, px)), dict(zip(msb.SIDES, one))) == want
+        row = _cols(want)
+        assert msb.row_side_pattern(row) == want, (want, row)
+    assert sp((10, 10, 0, 0), one) == "2-opp"                 # letterbox
+    assert sp((0, 10, 0, 10), one) == "2-adj"
+    assert sp((0, 10, 10, 10), one) == "3"
+    m = msb.SIDE_MIN_PX
+    s = msb.SIDE_STRAIGHT
+    assert (m, s) == (3, 0.5)
+    assert sp((m,) * 4, (s,) * 4) == "4"                      # >= counts
+    assert sp((m - 1,) * 4, one) == "0"                       # a 2 px band
+    assert sp((10,) * 4, (s - 1e-9,) * 4) == "0"              # not straight
+    assert sp((10,) * 4, (1.0, -1.0, None, 1.0)) == "2-adj"   # -1 / None
+    assert sp((10, 10, None, 0), one) == "2-opp"
+    for bad in (((1, 2), one), ((1, 2, 3, 4), (1.0,))):
+        try:
+            sp(*bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted {bad}")
     assert set(msb.SIDE_PATTERN_LABELS) == {"4", "3", "2-opp", "2-adj", "1", "0"}
     assert msb.BORDER_PATTERNS == ("4", "3", "2-opp")
-    # stored on new rows; the same from an old row's rounded margins
+    # the user's two cases as score rows (old parquet: no side_pattern)
+    r4484389 = {"h": 1024, "w": 1024, "margin_top": 0.0352,
+                "margin_bottom": 0.0117, "margin_left": 0.1289,
+                "margin_right": 0.1484, "straight_top": 1.0,
+                "straight_bottom": 1.0, "straight_left": 0.999,
+                "straight_right": 0.999}
+    assert msb.row_px_straight(r4484389)[0] == {
+        "top": 36, "bottom": 12, "left": 132, "right": 152}
+    assert msb.row_side_pattern(r4484389) == "4"
+    r8248423 = {"h": 1152, "w": 896, "margin_top": 0.0208,
+                "margin_bottom": 0.0, "margin_left": 0.173,
+                "margin_right": 0.1484, "straight_top": 0.099,
+                "straight_bottom": -1.0, "straight_left": 0.718,
+                "straight_right": 0.719}
+    assert msb.row_side_pattern(r8248423) == "2-opp"
+    # exact straightness from the rounded column: count / content length
+    px, st = msb.row_px_straight(r8248423)
+    assert st["left"] == round(0.718 * (1152 - 24)) / (1152 - 24), st
+    assert st["bottom"] is None and px["bottom"] == 0
+    # a stored column wins (new parquets)
+    assert msb.row_side_pattern(dict(r4484389, side_pattern="1")) == "1"
+
+
+def test_side_pattern_images():
     pb = canvas((0, 0, 0), 2.0, h=832, w=1216)
     pb[:, 304:1216 - 304] = photo(832, 608, 3)
-    cases = {"4": inset(0.08, 0.08), "2-opp": webp(pb),
-             "0": webp(photo(H, W, 5))}
+    cases = {"4": [inset(0.08, 0.08), _like_4484389()],
+             "2-opp": [webp(pb), _like_8248423()],
+             "0": [webp(photo(H, W, 5)), silhouette(1, False),
+                   silhouette(2, False)]}
     c = canvas()
     c[int(H * 0.1):, int(W * 0.1):] = photo(H - int(H * 0.1), W - int(W * 0.1), 2)
-    cases["2-adj"] = webp(c)
+    cases["2-adj"] = [webp(c)]
     c = canvas()
     c[int(H * 0.1):, int(W * 0.05):W - int(W * 0.05)] = photo(
         H - int(H * 0.1), W - 2 * int(W * 0.05), 2)
-    cases["3"] = webp(c)
-    for want, img in cases.items():
-        m = msb.border_metrics(img)
-        assert m["side_pattern"] == want, (want, m)
-        assert msb.PATTERN_SIDES[want] == m["n_sides"], m
-        old = {k: v for k, v in m.items() if k != "side_pattern"}
-        assert msb.row_side_pattern(old) == want, (want, old)
-    # an old row: 30 px of 2001 = 0.014993 (< MIN_SIDE_FRAC) is stored as
-    # 0.015; the px recovered from h gives the unrounded answer
-    row = {"margin_top": 0.015, "margin_bottom": 0.015, "margin_left": 0.1,
-           "margin_right": 0.1, "h": 2001, "w": 1000}
-    assert round(30 / 2001, msb.ROUND) == 0.015 and 30 / 2001 < msb.MIN_SIDE_FRAC
-    assert msb.row_side_pattern(row) == "2-opp"
-    assert msb.row_side_pattern({k: v for k, v in row.items()
-                                 if k not in ("h", "w")}) == "4"
-    assert msb.row_side_pattern(dict(row, side_pattern="1")) == "1"
+    # a 2 px straight band at the bottom does not count (WebP: ~1 px)
+    c2 = canvas()
+    c2[100:H - 2, 80:W - 80] = photo(H - 102, W - 160, 4)
+    # a ~10 px band below a ROUND bottom (silhouette tip) does not count
+    im = Image.fromarray(canvas())
+    d = ImageDraw.Draw(im)
+    d.rectangle([130, 100, W - 150, H - 300], fill=(90, 120, 160))
+    d.ellipse([200, H - 500, W - 220, H - 10], fill=(90, 120, 160))
+    cases["3"] = [webp(c), webp(c2), webp(np.asarray(im))]
+    for want, imgs in cases.items():
+        for k, img in enumerate(imgs):
+            m = msb.border_metrics(img)
+            assert m["side_pattern"] == want, (want, k, m)
+            old = {kk: v for kk, v in m.items() if kk != "side_pattern"}
+            assert msb.row_side_pattern(old) == want, (want, k, old)
+    m = msb.border_metrics(_like_4484389())
+    assert m["n_sides"] == 3 and 0 < m["margin_bottom"] < msb.MIN_SIDE_FRAC, m
+    m = msb.border_metrics(_like_8248423())
+    assert 0.6 < m["straight_left"] < 0.8 and m["straight_top"] < 0.3, m
+    m = msb.border_metrics(webp(np.asarray(im)))
+    assert 5 <= round(m["margin_bottom"] * H) <= 12, m
+    assert m["straight_bottom"] < 0.3, m
+    m = msb.border_metrics(webp(c2))
+    assert round(m["margin_bottom"] * H) < msb.SIDE_MIN_PX, m
 
 
 def test_tab_a_border_patterns_only():
@@ -659,7 +730,7 @@ def test_tab_a_border_patterns_only():
     for i, (pat, sc) in enumerate([("2-adj", 0.9), ("4", 0.8), ("1", 0.7),
                                    ("2-opp", 0.6), ("0", 0.5), ("3", 0.4),
                                    ("4", 0.3), ("4", 0.0)], start=1):
-        joined.append({"id": i, "score": sc, **_margins(pat)})
+        joined.append({"id": i, "score": sc, **_cols(pat)})
     joined.append({"id": 20, "error": "broken"})
     plan = {"watermark": [], "uncaptioned": [], "control": []}
     assert msb.build_tabs(joined, plan, top_n=3)["A"] == [2, 4, 6]
@@ -675,7 +746,7 @@ def test_tab_a_border_patterns_only():
 
 
 def test_thumb_selection():
-    joined = [{"id": i, "score": sc, "pillar_or_letter": pl, **_margins(pat)}
+    joined = [{"id": i, "score": sc, "pillar_or_letter": pl, **_cols(pat)}
               for i, sc, pl, pat in [(1, 0.5, False, "4"),
                                      (2, 0.04, False, "3"),
                                      (3, 0.0, True, "2-opp"),
@@ -885,6 +956,13 @@ def _check_outputs(out, truth, s):
             {k: v for k, v in r.items() if k != "side_pattern"}), r
     js = json.loads((out / "summary.json").read_text())
     assert set(js["missing_thumbs"].values()) == {0}, js["missing_thumbs"]
+    # the tab A rule is recorded in summary.json and on the page
+    assert js["a_rule"] == data["a_rule"], (js["a_rule"], data["a_rule"])
+    assert js["a_rule"]["name"] == "side-pattern" and js["a_rule"]["version"] == 2
+    pos = [r["id"] for r in t if r["score"] > 0]
+    assert set(data["tabs"]["A"]) == {
+        i for i in pos[:js["a_rule"]["rank_cutoff"]]
+        if msb.row_side_pattern(by[i]) in msb.BORDER_PATTERNS}
 
 
 def test_dry_run_shard_and_outputs():
@@ -906,6 +984,10 @@ def test_dry_run_shard_and_outputs():
         assert len(logs) == 2 and "18 imgs" in logs[0]
         tabs = msb.build_tabs(msb.join_rows(rows, meta), plan, top_n=16)
         sel = msb.select_thumbs(tabs)
+        # every tab A inset is also border-uncaptioned (an always-thumb id);
+        # drop those pass-1 thumbnails so pass 2 has to fetch them
+        for i in tabs["A"]:
+            thumbs.pop(i, None)
         try:                                 # pass 1 alone is not enough
             msb.write_outputs(Path(d) / "early", rows, thumbs, meta, plan, {},
                               top_n=16)
@@ -1081,9 +1163,6 @@ def test_local_cli_end_to_end():
 
 # ------------------------------------------------------------------ re-render
 REV = "05a9a13d4159363a5f5a5258ff3ae904506267bb"
-PX = {"4": (100, 100, 80, 80), "3": (100, 0, 60, 60), "2-opp": (0, 0, 120, 120),
-      "2-adj": (90, 0, 70, 0), "1": (0, 150, 0, 0), "0": (10, 0, 0, 0)}
-PATS = list(PX)
 
 
 def _old_run(root, old_n=12, control_n=4):
@@ -1096,10 +1175,7 @@ def _old_run(root, old_n=12, control_n=4):
     rows = []
     for i in range(1, 41):
         pat = PATS[i % 6]
-        t, b, l, r = PX[pat]
-        row = {"id": i, "margin_top": round(t / H, 4),
-               "margin_bottom": round(b / H, 4), "margin_left": round(l / W, 4),
-               "margin_right": round(r / W, 4), "n_sides": msb.PATTERN_SIDES[pat],
+        row = {"id": i, **_cols(pat), "n_sides": PATTERN_SIDES[pat],
                "score": round(0.5 - 0.01 * i, 4) if i <= 30 else 0.0,
                "pillar_or_letter": pat == "2-opp" and i % 2 == 0,
                "h": H, "w": W, "tar": "data/t.tar", **msb.flags_of("", "x")}
@@ -1215,12 +1291,14 @@ def test_rerender_missing_thumbs_fail():
                      f"A {len(beyond)} {sorted(beyond)}")
         assert _snapshot(root) == before            # no backup, no page
         # an eligible id inside the old top-N lost its thumbnail -> the
-        # default fails rather than dropping it
-        gone = eligible[1]
-        (root / "thumbs" / f"{gone}.jpg").unlink()
-        _expect_fail(lambda: msb.rerender(root, log=lambda *_: None),
-                     f"A 1 [{gone}]")
-        (root / "thumbs" / f"{gone}.jpg").write_bytes(b"x")
+        # default fails rather than dropping it (also the LAST one: the
+        # membership must not depend on which thumbnails exist)
+        for gone in (eligible[1], eligible[n_def - 1]):
+            (root / "thumbs" / f"{gone}.jpg").unlink()
+            _expect_fail(lambda: msb.rerender(root, log=lambda *_: None),
+                         f"A 1 [{gone}]")
+            (root / "thumbs" / f"{gone}.jpg").write_bytes(b"jpg%d" % gone)
+            assert _snapshot(root) == before
         # an id of another tab without a thumbnail
         b0 = info["tabs"]["B"][0]
         (root / "thumbs" / f"{b0}.jpg").unlink()
@@ -1253,6 +1331,47 @@ def test_rerender_missing_thumbs_fail():
         assert res["no_caption_snippet"] == len(
             {i for v in data["tabs"].values() for i in v})
         assert not (root / "review" / "index.v1.html").exists()
+
+
+def test_rerender_recorded_v2_rule():
+    """A v2 run records its tab A rule; the re-render's default cutoff is
+    that rule's score-rank cutoff, not the A size read as an unfiltered
+    top-N (Codex: ranked 1 = 2-adj, 2 = 4, 3 = 4, top_n 2 -> A [2, 3])."""
+    rows = [{"id": i, "score": sc, **_cols(pat), "tar": "data/t.tar",
+             "pillar_or_letter": False, **msb.flags_of("", "x"),
+             "border_uncaptioned": False}
+            for i, sc, pat in [(1, 0.5, "2-adj"), (2, 0.4, "4"), (3, 0.3, "4"),
+                               (4, 0.2, "3"), (5, 0.0, "4")]]
+    plan = {"watermark": [], "uncaptioned": [], "control": []}
+    tabs = msb.build_tabs(rows, plan, top_n=2)
+    assert tabs["A"] == [2, 3]
+    rule = msb.a_rule_record(rows, tabs["A"], 2)
+    assert rule["rank_cutoff"] == 3 and rule["version"] == 2
+    assert rule["side_min_px"] == msb.SIDE_MIN_PX
+    assert rule["side_straight"] == msb.SIDE_STRAIGHT
+    assert msb.a_rule_record(rows, [2, 3, 4], 10)["rank_cutoff"] == 4
+    assert msb.a_rule_record(rows, [], 0)["rank_cutoff"] == 0
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "thumbs").mkdir()
+        for i in (2, 3):
+            (root / "thumbs" / f"{i}.jpg").write_bytes(b"x")
+        (root / "scores.parquet").write_bytes(msb.table_bytes(rows, REV))
+        (root / "summary.json").write_text(json.dumps({
+            "dataset_revision": REV, "a_rule": rule,
+            "tabs": {k: len(v) for k, v in tabs.items()}}))
+        res = msb.rerender(root, control_n=0, log=lambda *_: None)
+        data = _page(root)
+        assert data["tabs"]["A"] == [2, 3] and res["rank_cutoff"] == 3
+        assert data["a_rule"]["rank_cutoff"] == 3
+        assert data["a_rule"]["run_rule"] == rule
+        # the same summary read as a legacy unfiltered top-2 would give [2]
+        legacy = dict(json.loads((root / "summary.json").read_text()))
+        legacy.pop("a_rule")
+        (root / "summary.json").write_text(json.dumps(legacy))
+        (root / "review" / "index.html").unlink()
+        res = msb.rerender(root, control_n=0, log=lambda *_: None)
+        assert _page(root)["tabs"]["A"] == [2] and res["rank_cutoff"] == 2
 
 
 def test_rerender_cli():

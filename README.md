@@ -738,8 +738,12 @@ margins are a thin frame line (all < 1.5%) the image is also measured
 inside the line (`peeled`: frame + mat + inset scores like the inset), and
 the final winner is chosen over all peeled / unpeeled results; a frame line
 around a full-bleed picture only sets `thin_frame`. `side_pattern` records
-which sides carry a margin >= 1.5%: `4`, `3`, `2-opp` (top+bottom or
-left+right), `2-adj`, `1`, `0`; a border is 4, 3 or 2 opposite sides.
+which sides carry a band: `4`, `3`, `2-opp` (top+bottom or left+right),
+`2-adj`, `1`, `0`; a border is 4, 3 or 2 opposite sides. A side counts when
+its margin is >= 3 px (a true k px band measures ~k-1 px after WebP q80;
+plain full-bleed WebPs give 0 px) and its straightness is >= 0.5 (a panel
+spanning ~70% of the content side gives ~0.72, a round silhouette tip
+~0.1); this is separate from the 1.5% `n_sides` threshold the score uses.
 All intermediate numbers are stored, so the ranking can
 be re-weighted from `scores.parquet` without re-running.
 
@@ -778,15 +782,20 @@ malformed entries dropped); "export" downloads `datafilter_actions.json`:
 side_pattern}]}` for the non-keep images.
 
 `--rerender DIR` rebuilds only `DIR/review/index.html` of a finished run,
-locally and without tars: rows from `scores.parquet` (an old one without
-`side_pattern` gets it from the margins, with the integer px recovered from
-the rounded fractions and h/w), the revision and the run's tab A size from
-`summary.json`, captions and list D from the previous page (a v1 page is
-first copied to `review/index.v1.html`); B/C/E are re-derived and must equal
-the previous page's lists. By default tab A = the border-pattern rows inside
-the run's own top-N by score, which were all thumbnailed, so it is exact by
-construction (the count is printed); any tab id without a thumbnail (e.g. a
-larger `--top-n`) fails with the count and ids, nothing written.
+locally and without tars: rows from `scores.parquet` (side patterns are
+recomputed under the current rule from the rounded margin / straightness
+columns, with the integer px and coverage counts recovered from h/w), the
+revision and the run's tab A rule from `summary.json`, captions and list D
+from the previous page (a v1 page is first copied to
+`review/index.v1.html`); B/C/E are re-derived and must equal the previous
+page's lists. By default tab A = every border-pattern row within the run's
+score-rank cutoff (`a_rule.rank_cutoff` in `summary.json`; a legacy run
+without `a_rule`: its unfiltered top-N, all thumbnailed). The membership is
+decided from scores, patterns and the cutoff alone; then any tab id without
+a thumbnail (e.g. a larger `--top-n`, or a newer side rule reaching rows the
+run never thumbnailed) fails with the count and ids, nothing written. The
+rule used (`a_rule`: name, version, thresholds, top_n, rank_cutoff) is
+recorded in `summary.json` by new runs and on every page.
 
 ```bash
 modal run scripts/modal_score_borders.py --shards 2   # smoke run (2 tars)

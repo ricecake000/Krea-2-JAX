@@ -29,9 +29,7 @@ Metric (border_metrics, pure numpy on the full-resolution RGB image):
      >= ROW_BG_FRAC, then columns from the left/right measured inside those
      rows, then rows again inside the columns (2 passes). Fractions of H/W;
      content bbox = the rest; margin_area_frac = 1 - bbox area / image area;
-     n_sides = sides with margin >= MIN_SIDE_FRAC; side_pattern = which
-     ones: "4", "3", "2-opp" (top+bottom or left+right), "2-adj", "1",
-     "0". A border is 4, 3 or 2 opposite sides (BORDER_PATTERNS).
+     n_sides = sides with margin >= MIN_SIDE_FRAC (score / pillar only).
   4. fill = non-bg fraction inside the bbox.
   5. per-side straightness = max over the first EDGE_PX rows/cols inside the
      bbox of their non-bg fraction; edge_straightness = GEOMETRIC mean over
@@ -52,6 +50,10 @@ Metric (border_metrics, pure numpy on the full-resolution RGB image):
      results of all candidates.
      A thin frame line around a full-bleed picture keeps its tiny score
      (margin_area_frac ~ the line) and is only flagged `thin_frame`.
+  8. side_pattern ("4", "3", "2-opp" = top+bottom or left+right, "2-adj",
+     "1", "0"): the sides whose margin is >= SIDE_MIN_PX (3) px AND whose
+     straightness is >= SIDE_STRAIGHT (0.5). A border is 4, 3 or 2
+     opposite sides (BORDER_PATTERNS); see SIDE_MIN_PX for the thresholds.
 
 Stages (Modal; the local entrypoint is stdlib-only, like the other Modal
 scripts, so everything that needs numpy/pyarrow/PIL runs in containers):
@@ -99,11 +101,14 @@ dataset_revision, items: [{id, action, tabs, score, side_pattern}]} (non-
 keep images only).
 
 --rerender DIR rebuilds only the review page of a finished run (see
-`rerender`): an old scores.parquet without side_pattern gets it from the
-margins (integer px recovered from the rounded fractions and h / w), the
-other tabs keep their membership, and by default tab A holds exactly the
-border-pattern rows inside the run's own top-N (all thumbnailed); a tab id
-without a thumbnail fails it.
+`rerender`): side patterns are recomputed under the current rule from the
+rounded margin / straightness columns (exact integer px and coverage
+counts recovered with h / w), the other tabs keep their membership, and by
+default tab A holds every border-pattern row within the run's score-rank
+cutoff (summary.json `a_rule`; a legacy run: its unfiltered top-N, all
+thumbnailed); a tab id without a thumbnail fails it. summary.json and the
+page record the tab A rule (`a_rule`: name, version, thresholds, top_n,
+rank_cutoff).
 
 Secrets: Modal secret `huggingface` (HF_TOKEN, HUGGING_FACE_HUB_TOKEN or
 HUGGINGFACE_TOKEN); the value is never printed.
@@ -207,12 +212,27 @@ CAPTION_BORDER_RE = re.compile(
     r"\b(border|frame|margin|letterbox|pillarbox|inset)", re.IGNORECASE)
 CAPTION_WATERMARK_RE = re.compile(r"watermark", re.IGNORECASE)
 SNIPPET_CHARS = 240
-# Which sides carry a margin >= MIN_SIDE_FRAC (side_pattern). A border = solid
-# bands on 4 sides, 3 sides or 2 OPPOSITE sides (with straight content edges,
-# which the score measures); 2 adjacent sides, 1 side or none are not.
+# side_pattern: which sides carry a band. A border = solid bands on 4 sides,
+# 3 sides or 2 OPPOSITE sides; 2 adjacent sides, 1 side or none are not.
+# A side counts when its margin is >= SIDE_MIN_PX pixels AND its straightness
+# (non-canvas coverage of the first content lines on that side) is >=
+# SIDE_STRAIGHT. Independent of MIN_SIDE_FRAC / n_sides (score only):
+#  * px, not a fraction: a thin but real band (12 px of 1024, 1.2%) counts.
+#    3 px: a true k px band on a WebP q80 canvas measures k-1 px (ringing
+#    eats ~1 px; 3 px -> 1-2), plain full-bleed WebPs give 0 px, and the
+#    real run's 1-12 px straight margins are flat (no noise spike at 1-2 px)
+#  * 0.5: a rectangle spanning ~70% of the content box side gives ~0.72 (a
+#    panel behind a character whose head / legs stick out); a round
+#    silhouette tip gives ~0.1
+SIDE_MIN_PX = 3
+SIDE_STRAIGHT = 0.5
 SIDE_PATTERN_LABELS = {"4": "4면", "3": "3면", "2-opp": "2면(마주봄)",
                        "2-adj": "2면(이웃)", "1": "1면", "0": "0면"}
 BORDER_PATTERNS = ("4", "3", "2-opp")
+# The tab A selection rule, recorded in summary.json and on the page (the
+# re-render derives its default cutoff from it).
+A_RULE = {"name": "side-pattern", "version": 2, "patterns": list(BORDER_PATTERNS),
+          "side_min_px": SIDE_MIN_PX, "side_straight": SIDE_STRAIGHT}
 TABS = (
     ("A", "top by score, border sides (4 / 3 / 2 opposite)"),
     ("B", "sample watermark"),
@@ -352,40 +372,64 @@ def _measure(rgb, bg, tol=TOL):
             "straight": straight}
 
 
-def side_pattern(margins):
-    """Margin fractions -> "4" | "3" | "2-opp" | "2-adj" | "1" | "0": the
-    sides whose margin is >= MIN_SIDE_FRAC. `margins`: a mapping keyed by
-    SIDES (or by margin_<side>) or a (top, bottom, left, right) sequence."""
-    if hasattr(margins, "keys"):
-        vals = [margins[s] if s in margins else margins[f"margin_{s}"]
-                for s in SIDES]
-    else:
-        vals = list(margins)
-        if len(vals) != 4:
-            raise ValueError(f"want 4 margins (t, b, l, r), got {margins!r}")
-    real = {s for s, v in zip(SIDES, vals) if v is not None
-            and v >= MIN_SIDE_FRAC}
+def _per_side(v, what):
+    """Mapping keyed by SIDES or a (top, bottom, left, right) sequence ->
+    list in SIDES order."""
+    if hasattr(v, "keys"):
+        return [v.get(s) for s in SIDES]
+    v = list(v)
+    if len(v) != 4:
+        raise ValueError(f"want 4 {what} (t, b, l, r), got {v!r}")
+    return v
+
+
+def side_pattern(px, straight):
+    """Pixel margins + per-side straightness -> "4" | "3" | "2-opp" |
+    "2-adj" | "1" | "0": the sides with margin >= SIDE_MIN_PX px AND
+    straightness >= SIDE_STRAIGHT (None / -1 = no margin). Both arguments:
+    a mapping keyed by SIDES or a (top, bottom, left, right) sequence."""
+    real = {s for s, p, st in zip(SIDES, _per_side(px, "margins"),
+                                  _per_side(straight, "straightness"))
+            if p is not None and st is not None and p >= SIDE_MIN_PX
+            and st >= SIDE_STRAIGHT}
     if len(real) == 2:
         return ("2-opp" if real in ({"top", "bottom"}, {"left", "right"})
                 else "2-adj")
     return str(len(real))
 
 
+def _exact(v, n):
+    """A count / n fraction stored rounded to ROUND digits -> the exact
+    fraction (exact for n < 10**ROUND / 2)."""
+    return round(v * n) / n if n else v
+
+
+def row_px_straight(r):
+    """Exact (px margins, straightness) of a score row from its rounded
+    columns: px = round(margin * h|w); the straightness of top / bottom is a
+    count over the content box width w - l - r, of left / right over its
+    height h - t - b."""
+    h, w = r["h"], r["w"]
+    t, b, l, rr = (round((r[f"margin_{s}"] or 0) * (h if s in ("top", "bottom")
+                                                    else w)) for s in SIDES)
+    px = {"top": t, "bottom": b, "left": l, "right": rr}
+    length = {"top": w - l - rr, "bottom": w - l - rr,
+              "left": h - t - b, "right": h - t - b}
+    st = {}
+    for s in SIDES:
+        v = r.get(f"straight_{s}")
+        st[s] = None if v is None or v < 0 else _exact(v, length[s])
+    return px, st
+
+
 def row_side_pattern(r):
     """side_pattern of a score row: the stored column when present, else
-    from the margins (an old scores.parquet). The stored fractions are
-    rounded to ROUND digits; with the row's h / w the integer px margins
-    are recovered first (exact for h, w < 10**ROUND / 2), so the result is
-    the one _finish computes from the unrounded fractions."""
+    from the rounded margin / straightness columns (an old scores.parquet)
+    via row_px_straight, i.e. what _finish computes unrounded."""
     sp = r.get("side_pattern")
     if sp:
         return sp
-    m = {}
-    for s in SIDES:
-        v = r[f"margin_{s}"]
-        n = r.get("h" if s in ("top", "bottom") else "w")
-        m[s] = round(v * n) / n if v is not None and n else v
-    return side_pattern(m)
+    return side_pattern(*row_px_straight(r))
 
 
 def is_border_row(r):
@@ -416,7 +460,10 @@ def _finish(h, w, px, fill, straight, ring_uniform, blank=False):
     out = {f"margin_{s}": _r(frac[s]) for s in SIDES}
     out.update({
         "margin_area_frac": _r(maf), "n_sides": len(real),
-        "side_pattern": side_pattern(frac), "fill": _r(fill),
+        "side_pattern": side_pattern(
+            px, [None if blank or frac[s] == 0 else straight[s]
+                 for s in SIDES]),
+        "fill": _r(fill),
         **{f"straight_{s}": (_r(straight[s]) if frac[s] > 0 else -1.0)
            for s in SIDES},
         "edge_straightness": _r(es), "pillar_or_letter": bool(pillar),
@@ -766,6 +813,19 @@ def build_tabs(joined, plan, top_n=TOP_N):
     }
 
 
+def a_rule_record(joined, a_ids, top_n):
+    """The rule that produced tab A + its score-rank cutoff: every eligible
+    row among the first `rank_cutoff` rows with score > 0 (joined order) is
+    in A (A was not cut short by top_n beyond that rank)."""
+    positives = [r["id"] for r in joined if "error" not in r
+                 and (r.get("score") or 0) > 0]
+    if len(a_ids) < top_n or not a_ids:
+        cutoff = len(positives) if len(a_ids) < top_n else 0
+    else:
+        cutoff = positives.index(a_ids[-1]) + 1
+    return {**A_RULE, "top_n": top_n, "rank_cutoff": cutoff}
+
+
 def select_thumbs(tabs):
     """Global thumbnail selection = every id on the review page (top-N by
     score, pillar/letterbox, the always-thumb lists)."""
@@ -921,14 +981,15 @@ def review_id(tabs, generated, revision=None):
 
 
 def render_review(tabs, items, generated, title="datafilter review", info="",
-                  revision=None):
+                  revision=None, a_rule=None):
     """Self-contained review page (inline JSON, thumbs at ../thumbs/<id>.jpg)."""
     data = json.dumps({"tabs": tabs, "items": items, "names": dict(TABS),
                        "patterns": SIDE_PATTERN_LABELS,
                        "border_patterns": list(BORDER_PATTERNS),
                        "review_id": review_id(tabs, generated, revision),
                        "generated": generated, "dataset_repo": DATASET_REPO,
-                       "revision": revision}, separators=(",", ":"))
+                       "revision": revision, "a_rule": a_rule},
+                      separators=(",", ":"))
     data = data.replace("</", "<\\/")
     return (REVIEW_HTML.replace("__TITLE__", html.escape(title))
             .replace("__INFO__", html.escape(info))
@@ -1115,6 +1176,7 @@ def write_outputs(out_dir, rows, thumbs, meta, plan, seconds, top_n=TOP_N,
     (out_dir / "scores.parquet").write_bytes(table)
     items = review_items(joined, tabs, meta, have)
     s = summarize(joined, tabs, have, plan, seconds, revision)
+    s["a_rule"] = a_rule_record(joined, tabs["A"], top_n)
     generated = generated or datetime.now(timezone.utc).isoformat(
         timespec="seconds")
     info = info or (f"{DATASET_REPO}@{revision}: {s['images']} images, "
@@ -1122,15 +1184,14 @@ def write_outputs(out_dir, rows, thumbs, meta, plan, seconds, top_n=TOP_N,
                     + ", ".join(f"{k} {v:.3f}" for k, v in
                                 s["score_quantiles"].items()))
     (out_dir / "review" / "index.html").write_text(
-        render_review(tabs, items, generated, info=info, revision=revision),
-        encoding="utf-8")
+        render_review(tabs, items, generated, info=info, revision=revision,
+                      a_rule=s["a_rule"]), encoding="utf-8")
     s["review_id"] = review_id(tabs, generated, revision)
     (out_dir / "summary.json").write_text(json.dumps(s, indent=1))
     return s
 
 
 # ------------------------------------------------------------------ re-render
-PATTERN_SIDES = {"4": 4, "3": 3, "2-opp": 2, "2-adj": 2, "1": 1, "0": 0}
 DATA_RE = re.compile(
     r'<script id="data" type="application/json">(.*?)</script>', re.S)
 
@@ -1178,11 +1239,14 @@ def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
     size), thumbs/ and the previous page(s) (caption snippets, the control
     list D). B / C / E come from the parquet flags; D from the previous page
     (else re-drawn with seed / control_n); every list on a previous page
-    must equal its re-derived one. Tab A = the top top_n rows with score > 0
-    and a border side pattern. Default top_n: the eligible rows inside the
-    run's own top-N by score (all of those were thumbnailed), so the default
-    is exact by construction. Any tab id without thumbs/<id>.jpg fails
-    (count + ids). A v1 page is backed up to review/index.v1.html first
+    must equal its re-derived one. Side patterns are recomputed under the
+    current rule. Tab A = the top top_n rows with score > 0 and a border
+    side pattern. Default top_n: every eligible row within the run's
+    score-rank cutoff, from the run's recorded `a_rule` in summary.json (a
+    legacy run without one: its unfiltered top-N, all thumbnailed). The
+    membership is decided from scores / patterns / cutoff alone; then any
+    tab id without thumbs/<id>.jpg fails (count + ids). The rule used is
+    recorded on the page (`a_rule`). A v1 page is backed up to review/index.v1.html first
     (never overwritten). Writes only review/index.html (+ that backup)."""
     out_dir = Path(out_dir)
     rdir = out_dir / "review"
@@ -1193,11 +1257,16 @@ def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
         raise SystemExit(f"scores.parquet revision {md['dataset_revision']} "
                          f"!= summary.json {revision}")
     ok = [r for r in rows if "error" not in r]
-    bad = [r["id"] for r in ok
-           if PATTERN_SIDES[row_side_pattern(r)] != r["n_sides"]]
-    if bad:
-        raise SystemExit(f"{len(bad)} rows whose side pattern disagrees with "
-                         f"n_sides: {_ids_text(bad)}")
+    # side patterns always from the columns under the CURRENT rule (a
+    # stored column may come from another rule version)
+    stale = 0
+    for r in rows:
+        sp = r.pop("side_pattern", None)
+        if sp is not None and "error" not in r and sp != row_side_pattern(r):
+            stale += 1
+    if stale:
+        log(f"{stale} stored side_pattern values differ from the current "
+            f"rule {A_RULE}; recomputed")
     # previous pages (the backup first); a v1 page is backed up before it
     # is replaced (below, after every check)
     cur, v1 = rdir / "index.html", rdir / "index.v1.html"
@@ -1226,14 +1295,22 @@ def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
     if unknown:
         raise SystemExit(f"{len(unknown)} control ids not in scores.parquet: "
                          f"{_ids_text(unknown)}")
-    old_n = int(summary["tabs"]["A"])
-    old_a = [r["id"] for r in ok if r["score"] > 0][:old_n]
+    # the run's own tab A rule -> the score-rank cutoff above which its
+    # selection was thumbnailed
+    positives = [r["id"] for r in ok if r["score"] > 0]
+    run_rule = summary.get("a_rule")
+    if run_rule is None:      # legacy run: unfiltered top-N by score
+        run_rule = {"name": "unfiltered-top-n", "version": 1,
+                    "top_n": int(summary["tabs"]["A"]),
+                    "rank_cutoff": int(summary["tabs"]["A"])}
+    cutoff = int(run_rule["rank_cutoff"])
+    old_a = positives[:cutoff]
     full = build_tabs(rows, plan, top_n=0)
     for p, d in pages:
         want = {"B": full["B"], "C": full["C"], "D": plan["control"],
                 "E": full["E"]}
-        if "patterns" not in d:          # v1 page: unfiltered top-N by score
-            want["A"] = old_a
+        if "patterns" not in d and run_rule["version"] == 1:
+            want["A"] = old_a            # v1 page: unfiltered top-N by score
         diff = [k for k, v in want.items() if list(d["tabs"].get(k, [])) != v]
         if diff or d.get("revision") != revision:
             raise SystemExit(f"{p}: tabs {diff or ''} / revision "
@@ -1246,18 +1323,25 @@ def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
                              f"{summary['tabs'].get(k)}")
     have = {int(p.stem) for p in (out_dir / "thumbs").glob("*.jpg")
             if p.stem.isdigit()}
+    # intended tab A membership, independent of which thumbnails exist
     old_set = set(old_a)
     eligible = [r["id"] for r in ok if is_border_row(r)]
-    exact_n = sum(i in old_set and i in have for i in eligible)
+    exact_n = sum(i in old_set for i in eligible)   # a prefix of eligible
     if top_n is None:
         top_n = exact_n
         log(f"default --top-n {top_n}: the eligible rows (score > 0, side "
-            f"pattern {'/'.join(BORDER_PATTERNS)}) inside the run's top "
-            f"{old_n} by score, all with a thumbnail ({len(eligible)} eligible "
-            "in total)")
+            f"pattern {'/'.join(BORDER_PATTERNS)}, >= {SIDE_MIN_PX} px and "
+            f"straightness >= {SIDE_STRAIGHT}) within the run's score-rank "
+            f"cutoff {cutoff} ({run_rule['name']} v{run_rule['version']}; "
+            f"{len(eligible)} eligible in total)")
     if top_n < 0:
         raise SystemExit("--top-n must be >= 0")
     tabs = build_tabs(rows, plan, top_n)
+    a_rule = a_rule_record(rows, tabs["A"], top_n)
+    if top_n == exact_n:   # A = every eligible row within the run's cutoff
+        a_rule["rank_cutoff"] = max(a_rule["rank_cutoff"], cutoff)
+    a_rule["source"] = "re-render"
+    a_rule["run_rule"] = run_rule
     missing = {k: [i for i in v if i not in have] for k, v in tabs.items()}
     n_miss = sum(map(len, missing.values()))
     if n_miss:
@@ -1287,7 +1371,8 @@ def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
             f"{generated} from scores.parquet (run {run_gen or 'unknown'}); "
             f"tab A = top {top_n} with score > 0 and side pattern "
             f"{' / '.join(SIDE_PATTERN_LABELS[p] for p in BORDER_PATTERNS)}")
-    page = render_review(tabs, items, generated, info=info, revision=revision)
+    page = render_review(tabs, items, generated, info=info, revision=revision,
+                         a_rule=a_rule)
     rdir.mkdir(parents=True, exist_ok=True)
     if backup and not v1.exists():
         v1.write_bytes(cur.read_bytes())
@@ -1297,7 +1382,8 @@ def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
         "review_id": review_id(tabs, generated, revision),
         "generated": generated, "dataset_revision": revision,
         "top_n": top_n, "exact_default_top_n": exact_n,
-        "eligible": len(eligible), "old_top_n": old_n,
+        "eligible": len(eligible), "rank_cutoff": cutoff,
+        "run_rule": run_rule, "a_rule": a_rule,
         "tabs": {k: len(v) for k, v in tabs.items()},
         "side_patterns_A": pattern_counts(by_id[i] for i in tabs["A"]),
         "side_patterns_old_A": pattern_counts(by_id[i] for i in old_a),
@@ -1310,7 +1396,8 @@ def rerender(out_dir, top_n=None, seed=0, control_n=CONTROL_N, generated=None,
     log("tabs: " + ", ".join(f"{k} {n}" for k, n in res["tabs"].items())
         + f"; {len(sel)} thumbnails")
     log("side patterns, tab A: " + _fmt_counts(res["side_patterns_A"])
-        + f"; the run's top {old_n}: " + _fmt_counts(res["side_patterns_old_A"]))
+        + f"; the run's top {cutoff} by score: "
+        + _fmt_counts(res["side_patterns_old_A"]))
     log(f"wrote {cur} (review id {res['review_id']})")
     return res
 
