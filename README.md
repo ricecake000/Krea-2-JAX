@@ -806,6 +806,20 @@ python scripts/modal_score_borders.py --tar-dir DIR --out OUT   # same, tars alr
 python scripts/modal_score_borders.py --rerender /home/mj/krea2-ops/eval/datafilter  # page only
 ```
 
+`scripts/fetch_originals.py` (local) fetches the full-resolution originals of
+selected ids from the Drive archive (`orig-XXXX.tar` + `orig-XXXX.parquet`
+index, rclone remote) into `~/.cache/krea2-orig/img/<id>.webp`, never storing
+a tar: member offsets follow from the index, so only the wanted members are
+read with ranged `rclone cat` calls (every tar header checked against the
+index; a mismatch falls back to streaming that tar and stopping once its ids
+are written). Size-checked atomic writes; re-running resumes; ids in no index
+are listed and exit 1.
+
+```bash
+python scripts/fetch_originals.py --ids-from-review /home/mj/krea2-ops/eval/datafilter  # tabs A/B/C/E
+python scripts/fetch_originals.py --ids datafilter_actions.json   # or a txt / json id list
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -842,6 +856,8 @@ python tests/test_score_borders.py      # dataset border score: synthetic insets
                                         # silhouettes (WebP), shard id validation, two-pass
                                         # thumbnails, fake-tar run + review page (node),
                                         # side patterns, 4-state review logic, --rerender
+python tests/test_fetch_originals.py    # originals fetch with a fake rclone: ranged reads,
+                                        # stream fallback / early stop, resume, retries
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -877,6 +893,7 @@ scripts/
   modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
   modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
   modal_score_borders.py  # Modal: inset/border score of the dataset + review page
+  fetch_originals.py  # rclone: originals of selected ids from the Drive archive
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
