@@ -516,6 +516,7 @@ Useful knobs:
 | `--max-hours` | – | stop cleanly (checkpoint + export) after a wall-clock budget; counts only the train loop (see below) |
 | `--resume` | off | continue the newest checkpoint in `--output-dir/ckpt`; without it the script refuses to reuse a directory that already holds checkpoints |
 | `--resume-step N` | – | resume from an older step N; newer step dirs are renamed `<step>.superseded` |
+| `--resume-new-dataset` | off | with `--resume`/`--resume-step`: continue a checkpoint trained on another dataset version (see below); a no-op when the checkpoint already used this dataset |
 | `--verify-latents` | on | re-hash every latent shard at startup (reads the whole ~49 GB cache once) and refuse the run if any shard's bytes differ from its manifest digest; `--no-verify-latents` trusts the manifest |
 | `--prefetch` / `--loader-workers` | 4 / 4 | streaming loader queue depth / reader threads |
 
@@ -605,6 +606,41 @@ cosine run with a larger `--steps` changes the next LR). `--attn`,
 the repo id as given, so a local copy of the same weights may be swapped in)
 also only warn.
 Older checkpoints without a recorded configuration resume with a warning.
+
+#### Continuing onto a new dataset version (`--resume-new-dataset`)
+
+A dataset change is a hard resume error, so a run cannot drift onto other
+data by accident. To deliberately continue a run on a new version of its
+dataset (e.g. a filtered/re-cropped/recaptioned patch of the same cache,
+see "Dataset filter: patch the latents" below), resume with
+`--resume-new-dataset`:
+
+```bash
+# ckpt/1513 of run1 (dataset version X) copied into run2's --output-dir/ckpt
+python scripts/train_full.py ... --data-dir /scratch/krea2-data-Y \
+  --output-dir ./run2 --steps 3600 --resume --resume-new-dataset
+```
+
+- Kept: the whole train state (fp32 params, AdamW moments, EMA, step), so
+  the LR schedule continues at the resumed global step, and `--steps` stays
+  absolute. The per-step noise/timestep RNG also follows the global step.
+- Only `dataset_fingerprint` and `n_samples` may differ; every other hard
+  key (`--seed`, `--batch-size`, `--caption-probs`, `--img-tokens`, ...)
+  is still enforced. The run prints a `NOTE` with the old -> new
+  fingerprint and sample count.
+- The data order **restarts at epoch 0** of the new dataset at the resumed
+  step: the run config records `data_step_offset` (= the resumed step) and
+  the loader reads data step `step - data_step_offset` (epoch permutation
+  and per-epoch caption/artist draws). Every later checkpoint records the
+  offset and a `dataset_switches` entry (step, old/new fingerprint and
+  sample count), so later resumes of run2 (with or without the flag still
+  on the command line; with it, it is a no-op since the checkpoint already
+  used this dataset) continue exactly like an uninterrupted run2.
+  Checkpoints written before the key existed count as offset 0. The
+  startup line `data: step N reads data step D (epoch E, batch K/S; ...)`
+  shows the position.
+- The flag needs an existing checkpoint: with `--resume` and an empty
+  `ckpt/` (or without `--resume`) it refuses instead of starting fresh.
 
 ### Export and sample
 
@@ -909,8 +945,10 @@ still requires exactly one live latent per parquet id, checks
 including the patch shard. A manifest without `"superseded"` (every
 existing cache) loads and fingerprints exactly as before
 (`tests/test_patch_latents.py` pins it against main's code). A patched
-version has a different `dataset_fingerprint`: train it as a fresh run, it
-cannot resume a run of the old version. The upload therefore goes to a
+version has a different `dataset_fingerprint`: a plain `--resume` of a run
+of the old version refuses it; train it as a fresh run, or continue the old
+run's train state with `--resume-new-dataset` (see "Continuing onto a new
+dataset version"). The upload therefore goes to a
 **branch** (old shards are shared, not re-sent); `main`, which the node kit
 downloads, does not move.
 
@@ -979,6 +1017,8 @@ python tests/test_train_and_io.py  # train step, save/load, merge script
 python tests/test_sharding.py      # 8-device FSDP parity (emulated on CPU)
 python tests/test_train_full.py    # full fine-tuning: loss, export parity, resume,
                                    # padded image rows inert, per-sample mu
+python tests/test_resume_new_dataset.py  # --resume-new-dataset: switch onto a new dataset
+                                         # version (batch ids), run2 resumes, refusals
 python tests/test_export.py        # official-layout export, param_shardings, orbax round trip
 python tests/test_data.py          # streaming loaders: fixed-res cache + bucketed latents/captions
 python tests/test_qwen3_text.py    # JAX Qwen3-VL text tower (parity parts need transformers)
