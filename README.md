@@ -741,9 +741,11 @@ around a full-bleed picture only sets `thin_frame`. `side_pattern` records
 which sides carry a band: `4`, `3`, `2-opp` (top+bottom or left+right),
 `2-adj`, `1`, `0`; a border is 4, 3 or 2 opposite sides. A side counts when
 its margin is >= 3 px (a true k px band measures ~k-1 px after WebP q80;
-plain full-bleed WebPs give 0 px) and its straightness is >= 0.5 (a panel
-spanning ~70% of the content side gives ~0.72, a round silhouette tip
-~0.1); this is separate from the 1.5% `n_sides` threshold the score uses.
+plain full-bleed WebPs give 0 px) and its straightness is >= 0.25 (a
+backdrop panel behind a character gives ~0.26-0.72 depending on how much of
+the side it spans, a rounded-corner inset ~0.4, a round silhouette tip
+~0.1; a silhouette with one flat cut still has only one such side); this is
+separate from the 1.5% `n_sides` threshold the score uses.
 All intermediate numbers are stored, so the ranking can
 be re-weighted from `scores.parquet` without re-running.
 

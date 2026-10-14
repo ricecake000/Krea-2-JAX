@@ -648,7 +648,7 @@ def test_side_pattern():
     assert sp((0, 10, 10, 10), one) == "3"
     m = msb.SIDE_MIN_PX
     s = msb.SIDE_STRAIGHT
-    assert (m, s) == (3, 0.5)
+    assert (m, s) == (3, 0.25)
     assert sp((m,) * 4, (s,) * 4) == "4"                      # >= counts
     assert sp((m - 1,) * 4, one) == "0"                       # a 2 px band
     assert sp((10,) * 4, (s - 1e-9,) * 4) == "0"              # not straight
@@ -678,6 +678,22 @@ def test_side_pattern():
                 "straight_bottom": -1.0, "straight_left": 0.718,
                 "straight_right": 0.719}
     assert msb.row_side_pattern(r8248423) == "2-opp"
+    # 7888448-like: a faint / occluded backdrop panel, left / right 0.26 /
+    # 0.30, the head above it (round, 0.1) -> a left/right pair
+    r7888448 = {"h": 1216, "w": 832, "margin_top": 0.03, "margin_bottom": 0.0,
+                "margin_left": 0.16, "margin_right": 0.15,
+                "straight_top": 0.1, "straight_bottom": -1.0,
+                "straight_left": 0.26, "straight_right": 0.30}
+    assert msb.row_side_pattern(r7888448) == "2-opp"
+    # a rounded-corner inset (4963122-like): top 0.37, the rest ~1 -> 4
+    assert msb.row_side_pattern(dict(
+        _cols("4"), straight_top=0.37, straight_left=0.99,
+        straight_right=0.97)) == "4"
+    # a silhouette with one 0.39 side (a flat cut), the other tips ~0.1 -> 1
+    sil = dict(_cols("4"), straight_top=0.1, straight_bottom=0.39,
+               straight_left=0.12, straight_right=0.09)
+    assert msb.row_side_pattern(sil) == "1"
+    assert msb.row_side_pattern(dict(sil, straight_left=0.24)) == "1"
     # exact straightness from the rounded column: count / content length
     px, st = msb.row_px_straight(r8248423)
     assert st["left"] == round(0.718 * (1152 - 24)) / (1152 - 24), st

@@ -52,7 +52,7 @@ Metric (border_metrics, pure numpy on the full-resolution RGB image):
      (margin_area_frac ~ the line) and is only flagged `thin_frame`.
   8. side_pattern ("4", "3", "2-opp" = top+bottom or left+right, "2-adj",
      "1", "0"): the sides whose margin is >= SIDE_MIN_PX (3) px AND whose
-     straightness is >= SIDE_STRAIGHT (0.5). A border is 4, 3 or 2
+     straightness is >= SIDE_STRAIGHT (0.25). A border is 4, 3 or 2
      opposite sides (BORDER_PATTERNS); see SIDE_MIN_PX for the thresholds.
 
 Stages (Modal; the local entrypoint is stdlib-only, like the other Modal
@@ -221,11 +221,13 @@ SNIPPET_CHARS = 240
 #    3 px: a true k px band on a WebP q80 canvas measures k-1 px (ringing
 #    eats ~1 px; 3 px -> 1-2), plain full-bleed WebPs give 0 px, and the
 #    real run's 1-12 px straight margins are flat (no noise spike at 1-2 px)
-#  * 0.5: a rectangle spanning ~70% of the content box side gives ~0.72 (a
-#    panel behind a character whose head / legs stick out); a round
-#    silhouette tip gives ~0.1
+#  * 0.25: a backdrop panel behind a character covers only part of the
+#    content box side (~0.7 when the head / legs stick out; 0.26-0.49 when
+#    it is faint or occluded), a rounded-corner inset ~0.4; a round
+#    silhouette tip gives ~0.1. A silhouette may reach 0.25 on one side (a
+#    flat cut), but the border patterns need 3+ sides or an opposite pair
 SIDE_MIN_PX = 3
-SIDE_STRAIGHT = 0.5
+SIDE_STRAIGHT = 0.25
 SIDE_PATTERN_LABELS = {"4": "4면", "3": "3면", "2-opp": "2면(마주봄)",
                        "2-adj": "2면(이웃)", "1": "1면", "0": "0면"}
 BORDER_PATTERNS = ("4", "3", "2-opp")
