@@ -685,6 +685,30 @@ modal run scripts/modal_export_full.py --run run1 --step 1513 --drift-only \
   --compare /vol/ft/run1/model.safetensors        # report only (no R2 transfers)
 ```
 
+### Update coherence of a checkpoint on Modal
+
+`scripts/modal_coherence.py` (one CPU container, 56 GiB RAM, same volume)
+asks whether a run learned coherently or only random-walked, with exact f32
+numbers from the train state instead of bf16 exports. It downloads the
+`params/`, `ema/` and `opt_state/` trees of `<run>/ckpt/<step>/` (the
+download of `modal_export_full.py`; a tree already on the volume is not
+fetched again) and reads them one leaf group at a time (a DiT block; orbax
+partial restore with `ocp.PLACEHOLDER` for every other leaf), so the four
+51 GB trees never sit in RAM together. Per tensor, per kind, per block and
+globally, with `D = P - base`, `De = EMA - base` and the current Adam
+direction `u = mhat / (sqrt(vhat) + eps)`: drift, `||De||/||D||`,
+`cos(De, D)`, `cos(-u, D)`, `cos(-m, D)`, sign agreement, `rms(D)` per unit of
+`sum lr` / `sqrt(sum lr^2)`, and what the bf16 export loses (changed
+elements rounded back to the base). A null / calibration simulation (Adam on
+`g = s + N(0, 1)` with the run's schedule) turns the measured `cos(-u, D)`
+and `||De||/||D||` into an effective SNR and the coherent fraction of
+`||D||^2`. Report: `/home/mj/krea2-ops/eval/coherence_<run>_<step>.json`.
+
+```bash
+modal run scripts/modal_coherence.py --run run1 --step 1513
+.venv/bin/python scripts/modal_coherence.py --sim-only   # simulation table only (local)
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -715,6 +739,8 @@ python tests/test_modal_eval_full.py  # Modal eval: prompt selection, caption fo
                                       # generate path, decode/index writing (no Modal)
 python tests/test_modal_export_full.py  # Modal export: minimal orbax download (fake R2),
                                         # export_full + upload flow, weight-drift report
+python tests/test_modal_coherence.py    # Modal coherence: partial restore == full restore,
+                                        # metrics, null-model simulation, fake-R2 flow
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -748,6 +774,7 @@ scripts/
   sample.py         # jax DiT + torch encode/decode
   modal_eval_full.py  # Modal: full FT vs base side-by-side images + contact sheet
   modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
+  modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
