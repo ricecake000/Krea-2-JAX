@@ -172,13 +172,15 @@ def list_objects(client, bucket, prefix):
         token = resp["NextContinuationToken"]
 
 
-def select_ckpt_objects(objects, prefix, tree):
+def select_ckpt_objects(objects, prefix, tree, trees=SOURCES):
     """The objects of one orbax step dir (listed under `prefix`) needed to
     restore `tree` alone: the step's top-level files, <tree>/ and meta/.
+    trees: the accepted tree names (default params / ema; e.g.
+    scripts/modal_coherence.py also passes opt_state).
     -> {relative path: {"key", "size", "etag"}}; ValueError when the step
     has no <tree>/ or no meta/ objects, or an unsafe relative path."""
-    if tree not in SOURCES:
-        raise ValueError(f"unknown tree {tree!r} (one of {SOURCES})")
+    if tree not in trees:
+        raise ValueError(f"unknown tree {tree!r} (one of {tuple(trees)})")
     sel, tops = {}, set()
     for o in objects:
         if not o["key"].startswith(prefix):
