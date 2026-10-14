@@ -651,6 +651,9 @@ def build_version(base_dir, patch_dir, out_dir, base_revision, latents=None,
         "tool": "scripts/modal_patch_latents.py build",
     }
     man["patches"] = list(man.get("patches") or []) + [entry]
+    if not new_ids:
+        raise SystemExit("the patch would remove every sample: refusing to "
+                         "build an empty version (nothing written)")
     problems = simulate_resolution(base, new_ids, new_where, man, patch_keys)
     if problems:
         _fail("internal consistency check FAILED (nothing written)", problems)
@@ -671,6 +674,7 @@ def build_version(base_dir, patch_dir, out_dir, base_revision, latents=None,
     tmp = ppath.with_name(ppath.name + ".tmp")
     pq.write_table(pa.table(new_cols), tmp)
     os.replace(tmp, ppath)
+    entry["metadata"] = _local_digests(ppath)   # checked before upload
     tmp = mpath.with_name(mpath.name + ".tmp")
     tmp.write_text(json.dumps(man, indent=2))
     os.replace(tmp, mpath)
@@ -753,18 +757,44 @@ def _content_problems(path, want, remote):
 
 
 def expected_files(new_dir):
-    """{repo path: {size?, sha256, git_sha1?}}: the three new files (hashed
-    here) + every manifest shard (sha256 from the manifest)."""
+    """Check the local files against the manifest, then -> ({repo path:
+    {size?, sha256, git_sha1?}} the branch must hold, manifest).
+
+    The manifest is the root of trust: the patch shard must hash to its
+    manifest digest and metadata.parquet to the digests the build recorded
+    in the manifest's last "patches" entry; any mismatch (a file modified
+    after build) is refused before anything is uploaded. Expected remote
+    content comes from the manifest, never from re-hashing local files."""
     new = Path(new_dir)
-    man = json.loads((new / "latents" / "manifest.json").read_text())
-    exp = {"metadata.parquet": _local_digests(new / "metadata.parquet"),
-           "latents/manifest.json": _local_digests(
-               new / "latents" / "manifest.json")}
+    mpath = new / "latents" / "manifest.json"
+    man = json.loads(mpath.read_text())
+    entry = man["patches"][-1]
+    shard = (entry.get("shard") or {}).get("shard")
+    want_meta = entry.get("metadata")
+    problems = []
+    if not want_meta:
+        problems.append("manifest has no metadata digests (built by an "
+                        "older version of this script: rebuild)")
+    else:
+        got = _local_digests(new / "metadata.parquet")
+        if got["sha256"] != want_meta["sha256"]:
+            problems.append(f"metadata.parquet sha256 {got['sha256']} != "
+                            f"{want_meta['sha256']} recorded at build")
+    if shard:
+        got = file_sha256(new / "latents" / shard)
+        if got != man["digests"][shard]:
+            problems.append(f"latents/{shard} sha256 {got} != manifest "
+                            f"digest {man['digests'][shard]}")
+    if problems:
+        _fail(f"{new}: local files differ from the manifest (modified after "
+              "build?); nothing uploaded", problems)
+    exp = {"metadata.parquet": dict(want_meta),
+           "latents/manifest.json": _local_digests(mpath)}
     for s in man["shards"]:
         exp[f"latents/{s}"] = {"sha256": man["digests"][s]}
-    shard = (man["patches"][-1].get("shard") or {}).get("shard")
     if shard:
-        exp[f"latents/{shard}"] = _local_digests(new / "latents" / shard)
+        exp[f"latents/{shard}"]["size"] = (new / "latents" / shard).stat(
+            ).st_size
     return exp, man
 
 
@@ -783,12 +813,31 @@ def base_problems(man, remote):
     return probs
 
 
+def branch_problems(exp, written, remote):
+    """An existing branch may only receive this commit if every file it
+    keeps (all expected files except the `written` ones) already has the
+    expected content and it holds no shard the new manifest does not list
+    (another base / another patch)."""
+    probs = []
+    for k, w in sorted(exp.items()):
+        if k not in written:
+            probs += _content_problems(k, w, remote)
+    extra = sorted(k for k in remote if k.startswith("latents/")
+                   and k.endswith(".safetensors") and k not in exp)
+    if extra:
+        probs.append(f"{len(extra)} shards not in the new manifest "
+                     f"({_examples(extra)})")
+    return probs
+
+
 def upload_version(new_dir, branch, repo=LATENTS_REPO, api=None,
                    allow_main=False, make_op=None, log=print):
     """Create `branch` at the base revision (if absent), commit
-    metadata.parquet, latents/manifest.json and the patch shard to it, then
-    check every file of the new manifest at the branch head. Idempotent: a
-    branch that already holds exactly this version is left alone."""
+    metadata.parquet, latents/manifest.json and the patch shard to it (with
+    parent_commit = the head that was checked), then check every file of
+    the new manifest at the new head. Idempotent: a branch that already
+    holds exactly this version is left alone; an existing branch whose
+    other files do not fit this version is refused untouched."""
     if not branch:
         raise SystemExit("--branch is required")
     if branch == "main" and not allow_main:
@@ -797,6 +846,8 @@ def upload_version(new_dir, branch, repo=LATENTS_REPO, api=None,
             "run resumed on the old version would see a different "
             "dataset_fingerprint. Use a branch (and --revision <branch> on "
             "download), or pass --allow-main deliberately.")
+    new = Path(new_dir)
+    exp, man = expected_files(new)   # local files vs manifest, first
     if api is None:
         from huggingface_hub import HfApi
         api = HfApi()
@@ -806,15 +857,21 @@ def upload_version(new_dir, branch, repo=LATENTS_REPO, api=None,
         def make_op(path_in_repo, local):
             return CommitOperationAdd(path_in_repo=path_in_repo,
                                       path_or_fileobj=str(local))
-    new = Path(new_dir)
-    exp, man = expected_files(new)
     entry = man["patches"][-1]
     base_rev = entry["base_revision"]
+    files = ["metadata.parquet", "latents/manifest.json"]
+    shard = (entry.get("shard") or {}).get("shard")
+    if shard:
+        files.append(f"latents/{shard}")
 
     def tree(rev):
         return remote_entries(api.list_repo_tree(
             repo, repo_type="dataset", recursive=True, expand=True,
             revision=rev))
+
+    def check(remote):
+        return [p for k, w in sorted(exp.items())
+                for p in _content_problems(k, w, remote)]
 
     info = api.repo_info(repo, repo_type="dataset", revision=base_rev)
     if getattr(info, "private", None) is not True:
@@ -829,32 +886,32 @@ def upload_version(new_dir, branch, repo=LATENTS_REPO, api=None,
     branches = {b.name: b.target_commit for b in refs.branches}
     if branch in branches:
         head = branches[branch]
-        probs = [p for k, w in exp.items()
-                 for p in _content_problems(k, w, tree(head))]
-        if not probs:
+        remote = tree(head)
+        if not check(remote):
             log(f"{repo}@{branch} ({head[:12]}) already holds this version")
             return {"repo": repo, "branch": branch, "revision": head,
                     "uploaded": False, "problems": []}
+        probs = branch_problems(exp, set(files), remote)
+        if probs:
+            _fail(f"branch {branch} ({head}) exists with content that does "
+                  "not fit this version (nothing committed; use a new "
+                  "--branch)", probs)
         log(f"branch {branch} exists at {head[:12]}: committing on top")
     else:
         api.create_branch(repo, branch=branch, revision=base_rev,
                           repo_type="dataset")
+        head = base_rev
         log(f"created branch {branch} at {base_rev[:12]}")
-    files = ["metadata.parquet", "latents/manifest.json"]
-    shard = (entry.get("shard") or {}).get("shard")
-    if shard:
-        files.append(f"latents/{shard}")
     ops = [make_op(p, new / p) for p in files]
     c = entry["counts"]
     api.create_commit(
-        repo, ops, repo_type="dataset", revision=branch,
+        repo, ops, repo_type="dataset", revision=branch, parent_commit=head,
         commit_message=(f"datafilter patch {entry['review_id']}: "
                         f"{c['replaced']} re-cropped, {c['recaptioned']} "
                         f"recaptioned, {c['removed']} removed"),
         commit_description=json.dumps(entry, indent=1))
     head = api.repo_info(repo, repo_type="dataset", revision=branch).sha
-    probs = [p for k, w in exp.items()
-             for p in _content_problems(k, w, tree(head))]
+    probs = check(tree(head))
     if probs:
         _fail(f"remote check of {repo}@{branch} ({head}) FAILED", probs)
     log(f"uploaded {files} to {repo}@{branch} = {head}; all "

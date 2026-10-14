@@ -333,6 +333,12 @@ def test_unapplied_modes_and_validation():
                                  "train-0001.safetensors": [13, 999]}
     assert man["patches"][-1]["counts"]["unapplied_removed"] == 2
     expect_exit(lambda: build(base, patch, root / "rm"), "already holds")
+    p_all = make_patch(root, base, [
+        {"id": i, "action": "remove", "status": "ok"}
+        for i in base_rows(base)], name="all")
+    expect_exit(lambda: build(base, p_all, root / "empty"),
+                "would remove every sample")
+    assert not (root / "empty").exists(), "empty build wrote files"
     expect_exit(lambda: mpl.build_version(base, patch, root / "x", ""),
                 "--base-revision is required")
 
@@ -547,6 +553,7 @@ class FakeHub:
     def __init__(self, base, private=True):
         self.private = private
         self.commits, self.refs, self.calls = {}, {}, []
+        self.trees, self.before_commit = 0, None
         files = {}
         for p in sorted(base.rglob("*")):
             if p.is_file():
@@ -569,6 +576,7 @@ class FakeHub:
                                sha=self.resolve(revision))
 
     def list_repo_tree(self, repo, repo_type, recursive, expand, revision):
+        self.trees += 1
         out = []
         for path, e in self.commits[self.resolve(revision)].items():
             lfs = SimpleNamespace(sha256=e["sha256"]) if e["sha256"] else None
@@ -585,17 +593,26 @@ class FakeHub:
         self.calls.append(("create_branch", branch, revision))
         self.refs[branch] = self.resolve(revision)
 
-    def create_commit(self, repo, ops, repo_type, revision, commit_message,
-                      commit_description):
-        self.calls.append(("create_commit", revision,
-                           sorted(p for p, _ in ops)))
-        files = dict(self.commits[self.resolve(revision)])
-        for path, local in ops:
-            files[path] = self.entry(Path(local))
+    def add_commit(self, branch, files):
         sha = hashlib.sha1(json.dumps(sorted(files.items())).encode()
                            ).hexdigest()
         self.commits[sha] = files
-        self.refs[revision] = sha
+        self.refs[branch] = sha
+        return sha
+
+    def create_commit(self, repo, ops, repo_type, revision, commit_message,
+                      commit_description, parent_commit=None):
+        if self.before_commit:
+            self.before_commit()
+        self.calls.append(("create_commit", revision,
+                           sorted(p for p, _ in ops), parent_commit))
+        if parent_commit is not None and parent_commit != self.resolve(
+                revision):
+            raise RuntimeError("412 parent commit is not the branch head")
+        files = dict(self.commits[self.resolve(revision)])
+        for path, local in ops:
+            files[path] = self.entry(Path(local))
+        self.add_commit(revision, files)
 
 
 def test_upload_fake_hub():
@@ -605,9 +622,11 @@ def test_upload_fake_hub():
     encode_stub(patch)
     build(base, patch, root / "new")
     new = root / "new"
+    written = ["latents/manifest.json", "latents/patch-0000.safetensors",
+               "metadata.parquet"]
 
-    def up(hub, branch="datafilter-r1", **kw):
-        return quiet(mpl.upload_version, new, branch, api=hub,
+    def up(hub, branch="datafilter-r1", where=new, **kw):
+        return quiet(mpl.upload_version, where, branch, api=hub,
                      make_op=lambda p, local: (p, local), **kw)
 
     hub = FakeHub(base)
@@ -615,16 +634,17 @@ def test_upload_fake_hub():
     res = up(hub)
     assert res["uploaded"] and res["branch"] == "datafilter-r1"
     assert hub.calls[0] == ("create_branch", "datafilter-r1", BASE_REV)
-    assert hub.calls[1] == ("create_commit", "datafilter-r1", [
-        "latents/manifest.json", "latents/patch-0000.safetensors",
-        "metadata.parquet"])
+    assert hub.calls[1] == ("create_commit", "datafilter-r1", written,
+                            BASE_REV)
+    assert hub.trees == 2, f"{hub.trees} tree listings (base + new head)"
     assert hub.refs["main"] == BASE_REV, "main must not move"
     files = hub.commits[hub.refs["datafilter-r1"]]
     assert files["latents/train-0000.safetensors"] == \
         hub.commits[BASE_REV]["latents/train-0000.safetensors"]
-    # idempotent re-run
-    n = len(hub.calls)
+    # idempotent re-run: base + branch head listed once each
+    n, hub.trees = len(hub.calls), 0
     assert up(hub)["uploaded"] is False and len(hub.calls) == n
+    assert hub.trees == 2, hub.trees
     # the Hub's base is not what was built on
     hub2 = FakeHub(base)
     hub2.commits[BASE_REV]["latents/train-0001.safetensors"]["sha256"] = \
@@ -632,9 +652,62 @@ def test_upload_fake_hub():
     expect_exit(lambda: up(hub2), "is not the base this version was built",
                 "latents/train-0001.safetensors")
     expect_exit(lambda: up(FakeHub(base, private=False)), "is not private")
-    print("  upload: branch at base revision, 3 files committed, main "
-          "untouched, verified, idempotent; foreign base / public repo / "
-          "main refused OK")
+
+    # (review 1) files modified after build: refused before any Hub call
+    for rel in ("latents/patch-0000.safetensors", "metadata.parquet"):
+        bad = Path(shutil.copytree(new, root / f"mod_{rel.replace('/', '_')}"))
+        with open(bad / rel, "ab") as f:
+            f.write(b"\0")
+        hub3 = FakeHub(base)
+        expect_exit(lambda: up(hub3, where=bad),
+                    "local files differ from the manifest", rel)
+        assert hub3.calls == [] and hub3.trees == 0
+
+    # (review 2) an existing branch that does not fit: refused untouched
+    hub4 = FakeHub(base)
+    other = dict(hub4.commits[BASE_REV])
+    other["latents/patch-0009.safetensors"] = {
+        "size": 1, "blob_id": "x", "sha256": "1" * 64}
+    head4 = hub4.add_commit("datafilter-r1", other)
+    expect_exit(lambda: up(hub4), "exists with content that does not fit",
+                "latents/patch-0009.safetensors")
+    hub5 = FakeHub(base)
+    other = dict(hub5.commits[BASE_REV])
+    other["latents/train-0000.safetensors"] = {
+        "size": 1, "blob_id": "x", "sha256": "2" * 64}
+    head5 = hub5.add_commit("datafilter-r1", other)
+    expect_exit(lambda: up(hub5), "exists with content that does not fit",
+                "sha256 latents/train-0000.safetensors")
+    for h, head in ((hub4, head4), (hub5, head5)):
+        assert h.refs["datafilter-r1"] == head
+        assert not [c for c in h.calls if c[0] == "create_commit"]
+    # a compatible existing branch (e.g. created, commit lost) gets the
+    # commit with parent_commit = the checked head
+    hub6 = FakeHub(base)
+    hub6.refs["datafilter-r1"] = BASE_REV
+    assert up(hub6)["uploaded"]
+    assert hub6.calls == [("create_commit", "datafilter-r1", written,
+                           BASE_REV)]
+    # the branch moves between the check and the commit: refused by the Hub
+    hub7 = FakeHub(base)
+
+    def race():
+        hub7.before_commit = None
+        hub7.add_commit("datafilter-r1", dict(hub7.commits[BASE_REV],
+                                              **{"x.txt": {
+                                                  "size": 1, "blob_id": "y",
+                                                  "sha256": None}}))
+    hub7.before_commit = race
+    try:
+        up(hub7)
+    except RuntimeError as e:
+        assert "parent commit" in str(e)
+    else:
+        raise AssertionError("commit on a moved branch accepted")
+    print("  upload: branch at base revision, 3 files committed with "
+          "parent_commit, main untouched, verified, idempotent, 2 tree "
+          "listings; modified local files / incompatible existing branch / "
+          "moved branch / foreign base / public repo / main refused OK")
 
 
 # -------------------------------------------------------- Modal (no Modal)

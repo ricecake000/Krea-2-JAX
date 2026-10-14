@@ -864,6 +864,20 @@ check). `scripts/cache_latents.py --write-manifest` refuses a patched
 version (it would overwrite its parquet). Chained patches work: a second
 patch builds on a patched version and supersedes ids in `patch-0000` too.
 
+The encode defaults to `--vae-impl 2d` (eager, so no compile per bucket /
+batch shape); the base shards were written with `2d-compile`. Real-GPU
+parity of `2d` vs `2d-compile` / `ref` is **unverified** in this repo
+(`tests/test_vae_fast.py` covers a tiny random VAE on CPU only); the impl
+is recorded in the patch shard's metadata (`vae_impl`).
+
+The upload refuses before any Hub call when the local patch shard or
+`metadata.parquet` no longer hash to the digests the build recorded in the
+manifest. It refuses an existing branch whose other files do not fit this
+version (another base, or shards the new manifest does not list), and it
+commits with `parent_commit` = the checked head, so a branch moved in
+between is refused by the Hub. `build` refuses a patch that would remove
+every sample.
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
