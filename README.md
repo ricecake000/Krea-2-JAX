@@ -709,6 +709,70 @@ modal run scripts/modal_coherence.py --run run1 --step 1513
 .venv/bin/python scripts/modal_coherence.py --sim-only   # simulation table only (local)
 ```
 
+### Dataset filter: inset / border score on Modal
+
+`scripts/modal_score_borders.py` scores every image of
+`ricecake/danbooru-curated-v2` for "a picture placed on a flat canvas"
+(white or flat margins around a rectangular picture, pillar/letterbox bars,
+a frame line + mat) and builds a review page to pick images for removal.
+CPU only, Modal default resources (a 950-image shard peaks at ~90 MiB RSS).
+
+Metric (`border_metrics`, numpy, full resolution): canvas colour candidates
+are the medians of the 2 px outer ring and of each side strip (only
+identical colours merged; a colour covering < 49% of every side strip is
+skipped, which provably cannot give a margin); each goes through the full
+margin geometry and the best score wins (`bg_src`), so bars on only two
+sides work even when the picture's own edges cover more of the ring or sit
+within `TOL` of the bars. Canvas pixels are within `TOL` =
+18 (max abs channel difference: survives WebP noise/ringing, still separates
+near-white picture highlights). Margins are leading rows/columns that are
+>= 98% canvas; `fill` = non-canvas fraction of the remaining box; per-side
+straightness = the box edge's non-canvas fraction (best of the first 4
+lines); `edge_straightness` = their geometric mean over the sides with a
+margin (a rectangle gives ~1, a silhouette ~0.1, and one flat cut of a bust
+cannot carry three round sides).
+`score = margin_area_frac * edge_straightness * min(1, fill / 0.85)` when the
+ring is >= 90% canvas or the image is `pillar_or_letter` (margins on exactly
+two opposite sides, straightness >= 0.9), else 0. For every candidate whose
+margins are a thin frame line (all < 1.5%) the image is also measured
+inside the line (`peeled`: frame + mat + inset scores like the inset), and
+the final winner is chosen over all peeled / unpeeled results; a frame line
+around a full-bleed picture only sets `thin_frame`. All intermediate numbers are stored, so the ranking can
+be re-weighted from `scores.parquet` without re-running.
+
+Flow: `prepare` resolves the dataset repo's commit sha once (`--revision`,
+default the default branch head); metadata.parquet and both tar passes are
+downloaded at that commit (the local parquet copy is used only when
+byte-identical to the commit's file), and the sha is recorded in
+`summary.json`, the `scores.parquet` schema metadata (`dataset_revision`)
+and the review page / its export. Pass 1, one container per tar
+(`.starmap`): download, score every
+image, thumbnails (512 px JPEG) of the always-review ids. Tar members must
+be `<id>.{webp,png,jpg,jpeg,json,txt}` and the image ids of every tar must
+equal the parquet's ids for it (missing / extra / duplicate ids, a failed
+container or an odd member fail the run with exit != 0 and nothing
+written). Then the global selection (top `--top-n` by score, every
+pillar/letterbox, every `sample watermark` image, every `border` /
+`white border` / `outside border` / `pillarboxed` image whose long caption
+does not mention border/frame/margin/letterbox/pillarbox/inset, and
+`--control-n` seeded random `white background` images); pass 2 fetches
+exactly the missing thumbnails from the tars that hold them, and a selected
+id without a thumbnail fails the run.
+
+Output in `/home/mj/krea2-ops/eval/datafilter/`: `scores.parquet` (every
+image: metrics + tag/caption flags), `thumbs/<id>.jpg`, `summary.json` and
+`review/index.html` (self-contained; tabs A top `--top-n` by score, B sample
+watermark, C border tag without a border caption, D white-background
+control, E pillar/letterbox; click = mark for removal, kept in localStorage
+under a key scoped to this page's review id with foreign ids dropped;
+"export" downloads `datafilter_remove.json` with the review id).
+
+```bash
+modal run scripts/modal_score_borders.py --shards 2   # smoke run (2 tars)
+modal run scripts/modal_score_borders.py              # all 100 tars (rough: a few min, < $0.5)
+python scripts/modal_score_borders.py --tar-dir DIR --out OUT   # same, tars already on disk
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -741,6 +805,9 @@ python tests/test_modal_export_full.py  # Modal export: minimal orbax download (
                                         # export_full + upload flow, weight-drift report
 python tests/test_modal_coherence.py    # Modal coherence: partial restore == full restore,
                                         # metrics, null-model simulation, fake-R2 flow
+python tests/test_score_borders.py      # dataset border score: synthetic insets vs
+                                        # silhouettes (WebP), shard id validation, two-pass
+                                        # thumbnails, fake-tar run + review page (node)
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -775,6 +842,7 @@ scripts/
   modal_eval_full.py  # Modal: full FT vs base side-by-side images + contact sheet
   modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
   modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
+  modal_score_borders.py  # Modal: inset/border score of the dataset + review page
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
