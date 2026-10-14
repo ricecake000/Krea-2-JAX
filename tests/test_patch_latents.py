@@ -681,6 +681,28 @@ def test_upload_fake_hub():
     for h, head in ((hub4, head4), (hub5, head5)):
         assert h.refs["datafilter-r1"] == head
         assert not [c for c in h.calls if c[0] == "create_commit"]
+    # (review round 2) repro 1: an existing branch holding exactly this
+    # version PLUS an unlisted shard is not an idempotent no-op
+    hub8 = FakeHub(base)
+    up(hub8)
+    extra = {"size": 1, "blob_id": "x", "sha256": "3" * 64}
+    head8 = hub8.add_commit("datafilter-r1", dict(
+        hub8.commits[hub8.refs["datafilter-r1"]],
+        **{"latents/patch-0009.safetensors": extra}))
+    n8 = len(hub8.calls)
+    expect_exit(lambda: up(hub8), "exists with content that does not fit",
+                "1 shards not in the new manifest",
+                "latents/patch-0009.safetensors")
+    assert hub8.refs["datafilter-r1"] == head8 and len(hub8.calls) == n8
+    # repro 2: a base revision with an unlisted shard (or a file at the
+    # patch shard's path) is refused before any branch is created
+    for stray in ("latents/patch-0009.safetensors",
+                  "latents/patch-0000.safetensors"):
+        hub9 = FakeHub(base)
+        hub9.commits[BASE_REV][stray] = dict(extra)
+        expect_exit(lambda: up(hub9), "is not the base this version was "
+                    "built on", f"1 shards not in the new manifest ({stray})")
+        assert hub9.calls == [] and "datafilter-r1" not in hub9.refs
     # a compatible existing branch (e.g. created, commit lost) gets the
     # commit with parent_commit = the checked head
     hub6 = FakeHub(base)

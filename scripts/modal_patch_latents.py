@@ -822,12 +822,20 @@ def branch_problems(exp, written, remote):
     for k, w in sorted(exp.items()):
         if k not in written:
             probs += _content_problems(k, w, remote)
+    return probs + unlisted_shards(exp, remote)
+
+
+def unlisted_shards(exp, remote):
+    """-> [problem] if `remote` holds a latents/*.safetensors the new
+    manifest does not list (another base / another patch; a node download
+    of the branch would carry it). Checked on the base, on an existing
+    branch head and on the final head: no success path skips it."""
     extra = sorted(k for k in remote if k.startswith("latents/")
                    and k.endswith(".safetensors") and k not in exp)
     if extra:
-        probs.append(f"{len(extra)} shards not in the new manifest "
-                     f"({_examples(extra)})")
-    return probs
+        return [f"{len(extra)} shards not in the new manifest "
+                f"({_examples(extra)})"]
+    return []
 
 
 def upload_version(new_dir, branch, repo=LATENTS_REPO, api=None,
@@ -869,15 +877,22 @@ def upload_version(new_dir, branch, repo=LATENTS_REPO, api=None,
             repo, repo_type="dataset", recursive=True, expand=True,
             revision=rev))
 
-    def check(remote):
+    def check(remote):   # every success path goes through this
         return [p for k, w in sorted(exp.items())
-                for p in _content_problems(k, w, remote)]
+                for p in _content_problems(k, w, remote)] + unlisted_shards(
+                    exp, remote)
 
     info = api.repo_info(repo, repo_type="dataset", revision=base_rev)
     if getattr(info, "private", None) is not True:
         raise SystemExit(f"{repo} is not private (private="
                          f"{getattr(info, 'private', None)!r}): not uploading")
-    probs = base_problems(man, tree(base_rev))
+    # the base may not hold any shard outside the base manifest (incl. a
+    # file at the patch shard's path): a new branch would inherit it
+    base_exp = {k: w for k, w in exp.items()
+                if not (shard and k == f"latents/{shard}")}
+    base_tree = tree(base_rev)
+    probs = (base_problems(man, base_tree)
+             + unlisted_shards(base_exp, base_tree))
     if probs:
         _fail(f"{repo}@{base_rev} is not the base this version was built on",
               probs)
