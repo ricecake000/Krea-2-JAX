@@ -19,8 +19,9 @@ Every acted id must be a dataset id; duplicate ids, unknown actions or a
 revision mismatch fail the run before anything is written.
 
 Actions:
-  * crop: the original is decoded (alpha composited on white, a non-sRGB
-    ICC profile converted to sRGB) and measured with
+  * crop: the original is decoded (EXIF orientation applied, a non-sRGB
+    ICC profile converted to sRGB, then alpha composited on white) and
+    measured with
     modal_score_borders.border_metrics (downscaled with a box filter to a
     long side <= --measure-max-side for the measurement; the integer margins
     are recovered with row_px_straight and mapped back to original pixels
@@ -60,11 +61,17 @@ before -> status over_budget (the trainer truncates from the end, i.e. it
 would drop the appended phrase). Captions already over budget in the
 dataset and not lengthened are only noted.
 
-Status precedence (one per row): error > crop_too_small > crop_unsure >
-over_budget > ok; notes holds everything ("; "-joined).
+      status caption_empty: stripping would leave a caption empty (or
+        only filler words) -> no image, old bucket and captions.
 
-Output (<out>, written to <out>.tmp-<pid> and renamed at the end; an
-existing <out> needs --overwrite):
+Status precedence (one per row): error > caption_empty > crop_too_small >
+crop_unsure > over_budget > ok; notes holds everything ("; "-joined). The
+latent patch builder applies only ok and crop_unsure rows; every other
+status is reported as unapplied.
+
+Output (<out>, built in <out>.tmp-<pid> under an exclusive flock on
+<out>.lock; an existing <out> needs --overwrite and is renamed aside, then
+deleted only once the new one is in place, restored if that rename fails):
     images/<id>.webp   final bucket-sized WebP q95, only for crop rows with
                        status ok / crop_unsure / over_budget (image present
                        <=> the file exists)
@@ -75,7 +82,8 @@ existing <out> needs --overwrite):
                        (recounted), crop_box_orig ([x0, y0, x1, y1] in
                        original px, null unless crop + measured), orig_w,
                        orig_h (null unless crop + decoded), status, notes
-    patch.json         source dataset repo / revision, review id, counts,
+    patch.json         dataset_revision (+ source_dataset_revision, same
+                       value), source repo, review id, counts,
                        parameters, tokenizer digest, tool versions
     report.html        self-contained: per acted id before/after thumbnails
                        (crops: original with the crop box + final image;
@@ -115,7 +123,11 @@ from krea2_jax.text_template import (  # noqa: E402
 
 FORMAT = "krea2-datafilter-patch-v1"
 ACTIONS = ("caption", "crop", "remove")
-STATUS_ORDER = ("error", "crop_too_small", "crop_unsure", "over_budget", "ok")
+STATUS_ORDER = ("error", "caption_empty", "crop_too_small", "crop_unsure",
+                "over_budget", "ok")
+# words that alone do not make a caption (a stripped caption left with only
+# these -> caption_empty)
+FILLER_WORDS = frozenset("a an the and or with of in on at by to as".split())
 CAPTION_FIELDS = ("long", "medium", "short")
 ARTIST_SUFFIX = ", drawn by {}"     # krea2_jax/data.py ARTIST_SUFFIX
 MEASURE_MAX_SIDE = 2048
@@ -276,37 +288,41 @@ def resize_to_bucket(img, bw, bh):
 
 # ------------------------------------------------------------------ images
 def open_original(path):
-    """-> (PIL RGB image, [notes]): alpha composited on white, a non-sRGB
-    ICC profile converted to sRGB."""
-    from PIL import Image, ImageCms
+    """-> (PIL RGB image, [notes]): EXIF orientation applied first, then a
+    non-sRGB ICC profile converted to sRGB (alpha kept through the
+    transform), then alpha composited on white."""
+    from PIL import Image, ImageCms, ImageOps
 
     notes = []
     with Image.open(path) as im:
         im.load()
         icc = im.info.get("icc_profile")
+        orient = im.getexif().get(0x0112, 1)
+        im = ImageOps.exif_transpose(im)
+        if orient not in (None, 1):
+            notes.append(f"EXIF orientation {orient} applied")
         has_alpha = im.mode in ("RGBA", "LA", "PA") or (
             im.mode == "P" and "transparency" in im.info)
-        if has_alpha:
-            rgba = im.convert("RGBA")
-            if rgba.getextrema()[3][0] < 255:
-                bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-                rgba = Image.alpha_composite(bg, rgba)
-                notes.append("alpha composited on white")
-            rgb = rgba.convert("RGB")
-        else:
-            rgb = im.convert("RGB")
+        mode = "RGBA" if has_alpha else "RGB"
+        img = im.convert(mode)
     if icc:
         try:
             src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
             desc = (ImageCms.getProfileDescription(src) or "").strip()
             if "srgb" not in desc.lower():
-                rgb = ImageCms.profileToProfile(
-                    rgb, src, ImageCms.createProfile("sRGB"), outputMode="RGB")
+                img = ImageCms.profileToProfile(
+                    img, src, ImageCms.createProfile("sRGB"), outputMode=mode)
                 notes.append(f"ICC {desc!r} converted to sRGB")
         except Exception as e:  # noqa: BLE001 - a broken profile: keep pixels
             notes.append(f"ICC profile unreadable ({type(e).__name__}), "
                          "pixels used as sRGB")
-    return rgb, notes
+    if has_alpha:
+        if img.getextrema()[3][0] < 255:
+            bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(bg, img)
+            notes.append("alpha composited on white")
+        img = img.convert("RGB")
+    return img, notes
 
 
 def measure_box(img, max_side=MEASURE_MAX_SIDE, inset=CROP_INSET_PX):
@@ -502,10 +518,18 @@ def border_phrases(score_row, tags):
         colour = "white"
     else:
         colour = None
-    if sp == "2-opp" or (pillar and sp not in ("4", "3")):
-        lr = px["left"] + px["right"]
-        tb = px["top"] + px["bottom"]
-        kind = ("bars on the left and right" if lr >= tb
+    if sp == "2-opp":
+        # the two sides side_pattern counted (margin >= SIDE_MIN_PX px and
+        # straightness >= SIDE_STRAIGHT), not the larger margin pair
+        q = {x for x in msb.SIDES if px[x] is not None and st[x] is not None
+             and px[x] >= msb.SIDE_MIN_PX and st[x] >= msb.SIDE_STRAIGHT}
+        kind = ("bars on the left and right" if q == {"left", "right"}
+                else "bars on the top and bottom")
+    elif pillar and sp not in ("4", "3"):
+        # pillar_or_letter: margins >= MIN_SIDE_FRAC on exactly one
+        # opposite pair
+        lr = min(score_row["margin_left"] or 0, score_row["margin_right"] or 0)
+        kind = ("bars on the left and right" if lr >= msb.MIN_SIDE_FRAC
                 else "bars on the top and bottom")
     elif not measured and "pillarboxed" in ts:
         kind = "bars on the left and right"
@@ -574,8 +598,21 @@ CONNECTOR = re.compile(
     r"\s+(with|framed by|framed with|framed in|framed within|surrounded by|"
     r"flanked by|bordered by|bordered with|enclosed by|enclosed in|inside|"
     r"within)\s+", re.I)
-PROTECTED = re.compile("['\"‘’“”]|\\btext reading\\b",
-                       re.I)
+PROTECTED = re.compile(r"\btext reading\b", re.I)
+# quoted text: double / curly quotes (an unclosed one runs to the end) and
+# single-quote pairs whose quotes are not word-internal (a possessive or
+# contraction apostrophe is not a quote)
+QUOTE_RES = (
+    re.compile(r'"[^"]*(?:"|$)'),
+    re.compile("\u201c[^\u201d]*(?:\u201d|$)"),
+    re.compile("\u2018[^\u2019]*(?:\u2019|$)"),
+    re.compile(r"(?<![\w'])'(?=\S).*?(?<=\S)'(?![\w])"),
+)
+# "already captioned" check: canvas-border vocabulary only (no frame /
+# margin mentions: "white frame on the wall" is not a border caption)
+CANVAS_MENTION = re.compile(
+    r"(?<![\w-])border(?:s|ed)?\b(?!\s+coll)|\bletterbox\w*|"
+    r"\bpillarbox\w*|" + dict(STRIP_PATTERNS)["bars"].pattern, re.I)
 SUSPECT = re.compile(r"(?<![\w-])(?:frames?|framed|inset|margins?)\b", re.I)
 OUTSIDE_MENTION = re.compile(
     r"\boutside\s+(?:of\s+)?(?:the\s+)?(?:border|frame)\b|"
@@ -588,8 +625,48 @@ def border_hits(text):
     return [n for n, rx in STRIP_PATTERNS if rx.search(text)]
 
 
+def quote_spans(text):
+    """Sorted, merged [(start, end)] of the quoted parts of text."""
+    spans = sorted((m.start(), m.end()) for rx in QUOTE_RES
+                   for m in rx.finditer(text) if m.end() > m.start())
+    merged = []
+    for a, b in spans:
+        if merged and a < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def unquoted(text):
+    """text with every quoted part blanked (same length)."""
+    for a, b in quote_spans(text):
+        text = text[:a] + " " * (b - a) + text[b:]
+    return text
+
+
+def split_segments(caption):
+    """Comma split outside quotes -> [(segment, has_quote)]; the segments
+    joined with "," give the caption back."""
+    spans = quote_spans(caption)
+    cuts = [i for i, ch in enumerate(caption) if ch == ","
+            and not any(a <= i < b for a, b in spans)]
+    out, start = [], 0
+    for c in cuts + [len(caption)]:
+        out.append((caption[start:c],
+                    any(a < c and b > start for a, b in spans)))
+        start = c + 1
+    return out
+
+
+def canvas_mentions(caption):
+    """Canvas-border mentions outside quotes."""
+    return [m.group(0) for m in CANVAS_MENTION.finditer(
+        unquoted(caption or ""))]
+
+
 def has_border_mention(caption):
-    return bool(border_hits(caption or ""))
+    return bool(canvas_mentions(caption))
 
 
 def is_pure_border(text):
@@ -654,9 +731,15 @@ def strip_border(caption):
     phrases / parts], [kept phrases that mention frame / inset / margin in
     another sense, for review]). Every other byte is kept as is."""
     caption = caption or ""
-    segs = caption.split(",")
+    parsed = split_segments(caption)
+    segs = [seg for seg, _ in parsed]
     out, removed, suspects = [], [], []
-    for seg in segs:
+    for seg, quoted in parsed:
+        if quoted:      # never modify a phrase holding quoted text
+            if border_hits(unquoted(seg)) or SUSPECT.search(unquoted(seg)):
+                suspects.append(seg.strip() + " (quoted text)")
+            out.append(seg)
+            continue
         units = re.split(r"(?<=\.)(\s+)", seg)  # sentence, sep, sentence...
         new_units, changed = [], False
         for k in range(0, len(units), 2):
@@ -692,12 +775,12 @@ def add_phrases(caption, phrases):
     added, skipped = [], []
     for p in phrases:
         outside = p.startswith("character extending outside")
-        if outside and OUTSIDE_MENTION.search(caption):
+        if outside and OUTSIDE_MENTION.search(unquoted(caption)):
             skipped.append(f"{p!r}: already mentioned")
             continue
         if not outside and has_border_mention(caption):
             skipped.append(f"{p!r}: caption already mentions a border "
-                           f"({', '.join(border_hits(caption))})")
+                           f"({', '.join(canvas_mentions(caption))})")
             continue
         base = caption.rstrip().rstrip(",").rstrip()
         caption = f"{base}, {p}" if base else p
@@ -717,6 +800,11 @@ def token_counts(template, captions, artists):
 
 
 # ------------------------------------------------------------------ build
+def caption_is_empty(caption):
+    words = re.findall(r"[^\W_]+", (caption or "").lower())
+    return not words or all(w in FILLER_WORDS for w in words)
+
+
 def worst(statuses):
     return min(statuses, key=STATUS_ORDER.index)
 
@@ -775,7 +863,15 @@ def build_rows(items, meta, scores, buckets, template, originals, images_dir,
             for f, (_, gone, sus) in planned.items():
                 if sus:
                     suspects[f] = sus
-            if r["image"]:
+            empty = [f for f, (cap, _, _) in planned.items()
+                     if cap != old[f] and caption_is_empty(cap)]
+            if r["image"] and empty:
+                statuses.append("caption_empty")
+                notes.append(f"stripping empties {empty}: not applied, "
+                             "image dropped")
+                (Path(images_dir) / f"{sid}.webp").unlink(missing_ok=True)
+                row["thumb_after"] = None
+            if r["image"] and not empty:
                 row.update(bucket_w=r["bucket"][0], bucket_h=r["bucket"][1])
                 for f, (cap, gone, _) in planned.items():
                     new[f], removed[f] = cap, gone
@@ -995,13 +1091,65 @@ def build_parser():
     return p
 
 
+def lock_path(out):
+    return out.with_name(out.name + ".lock")
+
+
+def acquire_lock(out):
+    """Exclusive non-blocking flock on <out>.lock (kept on disk) -> the open
+    file (closing it releases the lock); InputError when another run holds
+    it."""
+    import fcntl
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path(out), "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise InputError(f"{lock_path(out)} is held by another run")
+    return f
+
+
+def swap_in(tmp, out):
+    """Move the finished tmp dir to out. An existing out is first renamed
+    aside and deleted only once the new one is in place; a failed rename
+    puts it back."""
+    old = None
+    if out.exists():
+        old = out.with_name(f"{out.name}.old-{os.getpid()}")
+        if old.exists():
+            shutil.rmtree(old)
+        os.replace(out, old)
+    try:
+        os.replace(tmp, out)
+    except BaseException:
+        if old is not None:
+            os.replace(old, out)
+        raise
+    if old is not None:
+        shutil.rmtree(old, ignore_errors=True)
+
+
 def main(argv=None, log=print):
     args = build_parser().parse_args(argv)
+    out = Path(args.out)
+    try:
+        lock = acquire_lock(out)
+    except InputError as e:
+        log(f"error: {e}")
+        return 1
+    try:
+        return _run(args, out, log)
+    finally:
+        lock.close()
+
+
+def _run(args, out, log):
     from PIL import Image
     from tokenizers import Tokenizer
 
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-    out = Path(args.out)
     try:
         if out.exists() and not args.overwrite:
             raise InputError(f"{out} exists (pass --overwrite)")
@@ -1041,6 +1189,7 @@ def main(argv=None, log=print):
         info = {
             "format": FORMAT,
             "source_dataset_repo": msb.DATASET_REPO,
+            "dataset_revision": rev,
             "source_dataset_revision": rev,
             "review_id": doc.get("review_id"),
             "actions_generated": doc.get("generated"),
@@ -1075,14 +1224,12 @@ def main(argv=None, log=print):
         (tmp / "patch.json").write_text(json.dumps(info, indent=2) + "\n")
         (tmp / "report.html").write_text(
             render_report(rows, {k: info[k] for k in (
-                "source_dataset_revision", "review_id", "created")}),
+                "dataset_revision", "review_id", "created")}),
             encoding="utf-8")
+        swap_in(tmp, out)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
-    if out.exists():
-        shutil.rmtree(out)
-    os.replace(tmp, out)
     log(f"wrote {out}: {len(rows)} rows, status {dict(by_status)}, "
         f"{info['counts']['images']} images; report {out / 'report.html'}")
     return 2 if by_status.get("error") else 0

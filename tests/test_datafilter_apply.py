@@ -69,7 +69,8 @@ def save_original(path, arr, lossless=True):
 def score_row(h, w, px=(0, 0, 0, 0), straight=1.0, bg=(255, 255, 255),
               score=None, fill=0.95):
     """A scores.parquet row through modal_score_borders._finish."""
-    st = {s: straight for s in msb.SIDES}
+    st = (dict(straight) if isinstance(straight, dict)
+          else {s: straight for s in msb.SIDES})
     r = msb._finish(h, w, px, fill, st, 1.0)
     r.update(h=h, w=w, bg_r=bg[0], bg_g=bg[1], bg_b=bg[2])
     r.pop("side_pattern")       # like the stored parquet (recomputed)
@@ -289,6 +290,9 @@ STRIP_CASES = [
     ("a girl, and a red skirt. solid white background with black pillarbox"
      " borders. sharp style", "a girl, and a red skirt. solid white "
      "background. sharp style"),
+    # possessive / contraction apostrophes are not quotes
+    ("a girl, the girl's portrait with white border, it's raining",
+     "a girl, the girl's portrait, it's raining"),
     ("a girl, red skirt. white letterbox border", "a girl, red skirt."),
 ]
 KEEP_CASES = [
@@ -299,6 +303,10 @@ KEEP_CASES = [
     "a girl, artist signature in the right margin",
     "a girl, text reading 'WHITE BORDER' in the center",
     "a girl, white photo frame border placed on a corkboard surface",
+    # quoted text spanning commas is never touched
+    'a girl, text reading "HELLO, white border, WORLD", soft shading',
+    "a girl, sign reading 'OPEN, white border, CLOSED' in the top left",
+    "a girl, \u201cwhite border, thin frame\u201d logo",
     "a girl, wearing a dress with a white-bordered collar",
 ]
 
@@ -313,8 +321,11 @@ def test_strip_border():
         assert got == cap and not removed, (cap, got, removed)
     _, _, kept = da.strip_border(KEEP_CASES[1])
     assert any("other content" in k for k in kept)
-    _, _, kept = da.strip_border(KEEP_CASES[5])
-    assert any("quoted" in k for k in kept)
+    # a phrase holding a quote is kept whole, listed when it has border
+    # words outside the quotes
+    cap = "a girl, white border with the logo 'KREA'"
+    got, removed, kept = da.strip_border(cap)
+    assert got == cap and not removed and any("quoted" in k for k in kept)
     assert da.strip_border("") == ("", [], [])
     # untouched captions are byte-identical (odd spacing kept)
     odd = "a girl ,  smiling,x ,y"
@@ -493,6 +504,7 @@ def test_main_end_to_end():
         assert imgs == ["1.webp"]
         info = json.loads((out / "patch.json").read_text())
         assert info["source_dataset_revision"] == REV
+        assert info["dataset_revision"] == REV       # the builder's key
         assert info["review_id"] == "rid1"
         assert info["counts"]["rows"] == 7 and info["counts"]["images"] == 1
         assert info["counts"]["status"]["error"] == 1
@@ -575,6 +587,170 @@ def test_rejects_bad_inputs():
         assert da.main(argv({**paths, "--actions": d / "a4.json"}, out),
                        log=lambda *a: 0) == 1
         assert not out.exists() and not list(d.glob("patch.tmp-*"))
+
+
+def test_quote_aware_split():
+    cap = 'a, text reading "x, white border, y", b\'s, c'
+    segs = da.split_segments(cap)
+    assert ",".join(x for x, _ in segs) == cap
+    assert [q for _, q in segs] == [False, True, False, False]
+    assert da.quote_spans("the girl's hat, it's fine") == []
+    assert da.unquoted("say 'white border' now") == "say " + " " * 14 + " now"
+    # a quoted border word is not a mention: the phrase is still added
+    cap = "a girl, text reading 'WHITE BORDER'"
+    assert da.add_phrases(cap, ["white border"])[0] == cap + ", white border"
+
+
+def test_mention_is_canvas_vocabulary_only():
+    for cap in ("a girl, white frame on the wall",
+                "a girl, thin frame glasses, wide margins of a notebook",
+                "a girl, simple framed background"):
+        new, added, _ = da.add_phrases(cap, ["white border"])
+        assert added == ["white border"] and new == cap + ", white border"
+    for cap in ("a girl, white border", "a girl, letterboxed",
+                "a girl, black bars on the left and right",
+                "a girl, pillarbox format"):
+        assert da.add_phrases(cap, ["white border"])[0] == cap, cap
+
+
+def test_bar_direction_from_qualifying_sides():
+    # left / right qualify (straight); top / bottom margins are larger but
+    # not straight (< SIDE_STRAIGHT) -> 2-opp on left / right
+    st = {"top": 0.1, "bottom": 0.1, "left": 1.0, "right": 1.0}
+    r = score_row(1024, 1024, (200, 200, 60, 60), straight=st)
+    assert msb.row_side_pattern(r) == "2-opp"
+    assert da.border_phrases(r, "")[0] == ["white bars on the left and right"]
+    st = {"top": 1.0, "bottom": 1.0, "left": 0.1, "right": 0.1}
+    r = score_row(1024, 1024, (40, 40, 200, 200), straight=st)
+    assert msb.row_side_pattern(r) == "2-opp"
+    assert da.border_phrases(r, "")[0] == ["white bars on the top and bottom"]
+
+
+def test_icc_before_alpha_composite():
+    """ICC -> sRGB runs on the RGBA image, then the composite on white: a
+    transparent pixel ends up pure white whatever the transform does."""
+    from PIL import ImageCms
+
+    calls = []
+
+    def fake_p2p(im, src, dst, outputMode=None, **kw):
+        calls.append((im.mode, outputMode))
+        a = np.asarray(im).copy()
+        a[..., :3] = 255 - a[..., :3]          # a visible "transform"
+        return Image.fromarray(a, im.mode)
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        a = np.zeros((64, 80, 4), np.uint8)
+        a[16:48, 20:60] = (10, 200, 30, 255)
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        Image.fromarray(a, "RGBA").save(d / "x.webp", "WEBP", lossless=True,
+                                        icc_profile=icc)
+        old = (ImageCms.profileToProfile, ImageCms.getProfileDescription)
+        ImageCms.profileToProfile = fake_p2p
+        ImageCms.getProfileDescription = lambda prof: "Display P3"
+        try:
+            img, notes = da.open_original(d / "x.webp")
+        finally:
+            ImageCms.profileToProfile, ImageCms.getProfileDescription = old
+        assert calls == [("RGBA", "RGBA")], calls
+        px = np.asarray(img)
+        assert px[0, 0].tolist() == [255, 255, 255]            # composited after
+        assert px[30, 40].tolist() == [245, 55, 225]           # transformed
+        assert notes == ["ICC 'Display P3' converted to sRGB",
+                         "alpha composited on white"]
+
+
+def test_exif_orientation_applied():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        a = np.full((60, 100, 3), 128, np.uint8)
+        a[:, :10] = (255, 0, 0)                 # red strip on the left
+        im = Image.fromarray(a)
+        ex = im.getexif()
+        ex[0x0112] = 6                          # rotate 90 CW on display
+        im.save(d / "o.webp", "WEBP", lossless=True, exif=ex.tobytes())
+        img, notes = da.open_original(d / "o.webp")
+        assert img.size == (60, 100), img.size
+        assert np.asarray(img)[:10, 30].tolist()[0] == [255, 0, 0]  # now top
+        assert "EXIF orientation 6 applied" in notes
+
+
+def test_caption_empty_not_applied():
+    """A crop whose stripped caption would be empty keeps its old captions
+    and bucket, its image is dropped, status caption_empty."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "img").mkdir()
+        tmpl = CaptionTemplate(tokenizer(d))
+        meta = {9: {"bucket_w": 832, "bucket_h": 1216, "tags": "",
+                    "artist_name": "", "long": "white border",
+                    "medium": "a girl, white border", "short": "the border"}}
+        scores = {9: score_row(1216, 832, (60, 60, 40, 40))}
+
+        def fake_crop(sid, orig, ds, buckets, images_dir, **kw):
+            (Path(images_dir) / f"{sid}.webp").write_bytes(b"x")
+            return {"status": "ok", "notes": [], "box": [1, 1, 900, 900],
+                    "orig_w": 1000, "orig_h": 1000, "bucket": (1024, 1024),
+                    "image": True, "thumb_before": None, "thumb_after": "u"}
+
+        old = da.crop_one
+        da.crop_one = fake_crop
+        try:
+            rows = da.build_rows([{"id": 9, "action": "crop"}], meta, scores,
+                                 BUCKETS, tmpl, d, d / "img", workers=1,
+                                 log=lambda *a: 0)
+        finally:
+            da.crop_one = old
+        r = rows[0]
+        assert r["status"] == "caption_empty", r
+        assert (r["long"], r["medium"], r["short"]) == (
+            "white border", "a girl, white border", "the border")
+        assert (r["bucket_w"], r["bucket_h"]) == (832, 1216)
+        assert not (d / "img" / "9.webp").exists() and r["thumb_after"] is None
+        assert da.caption_is_empty("") and da.caption_is_empty(" the, a ")
+        assert not da.caption_is_empty("a girl")
+
+
+def test_output_swap_keeps_old_and_lock():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        paths = make_inputs(d)
+        out = d / "patch"
+        assert da.main(argv(paths, out), log=lambda *a: 0) == 2
+        before = (out / "patch.parquet").read_bytes()
+        # the final rename fails: the previous patch stays in place
+        real = da.os.replace
+
+        def failing(src, dst):
+            if Path(src).name.startswith("patch.tmp-"):
+                raise OSError("simulated rename failure")
+            return real(src, dst)
+
+        da.os.replace = failing
+        try:
+            try:
+                da.main(argv(paths, out, "--overwrite"), log=lambda *a: 0)
+                raise AssertionError("expected the rename failure")
+            except OSError:
+                pass
+        finally:
+            da.os.replace = real
+        assert (out / "patch.parquet").read_bytes() == before
+        assert sorted(x.name for x in d.glob("patch*")) == [
+            "patch", "patch.lock"]
+        # a concurrent run (lock held) is refused, nothing touched
+        import fcntl
+
+        with open(d / "patch.lock", "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert da.main(argv(paths, out, "--overwrite"),
+                           log=lambda *a: 0) == 1
+        assert (out / "patch.parquet").read_bytes() == before
+        # lock released: --overwrite replaces it
+        assert da.main(argv(paths, out, "--overwrite"), log=lambda *a: 0) == 2
+        assert sorted(x.name for x in d.glob("patch*")) == [
+            "patch", "patch.lock"]
 
 
 if __name__ == "__main__":

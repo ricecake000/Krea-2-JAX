@@ -817,8 +817,8 @@ the actions json, `metadata.parquet`, the review run's `scores.parquet`
 Qwen3-VL tokenizer of the local HF cache. Unknown / duplicate ids, unknown
 actions or a revision mismatch fail before anything is written.
 
-* **crop**: the original (alpha composited on white, a non-sRGB ICC profile
-  converted to sRGB) is measured with `border_metrics` (box-downscaled to a
+* **crop**: the original (EXIF orientation applied, a non-sRGB ICC profile
+  converted to sRGB, then alpha composited on white) is measured with `border_metrics` (box-downscaled to a
   long side <= 2048 for the measurement, margins mapped back so that no
   canvas survives the downscale, then every side with a margin inset 1 px),
   cropped, put in the bucket of the nearest aspect ratio (log space) among
@@ -828,7 +828,9 @@ actions or a revision mismatch fail before anything is written.
   need upscaling -> `crop_too_small` (no image, old bucket + captions kept,
   planned strip in `notes`); an original whose score is 0 or < 0.5x the
   dataset image's, or a box keeping >= 98% of the original -> `crop_unsure`
-  (image produced, flagged); a missing / undecodable original -> `error`.
+  (image produced, flagged); a strip that would leave a caption empty ->
+  `caption_empty` (no image, old bucket + captions); a missing /
+  undecodable original -> `error`.
 * **caption**: a phrase from the dataset image's measurement + tags is
   appended to every caption that does not already mention a border:
   `<colour> border` (white / black / simple colour names from the canvas
@@ -849,19 +851,26 @@ one): a phrase goes as a whole only when every word is border vocabulary
 "framed / bordered background" loses the adjective. Phrases with other
 content ("border collie", "mirror bordered with bulbs", "chibi inset",
 "signature in the right margin", quoted text) are kept and listed in
-`notes` for review. Token counts are recounted like the dataset's own
+`notes` for review; a phrase holding quoted text (quote pairs parsed
+across commas, apostrophes inside words are not quotes) is never modified,
+and quoted text never counts as a border mention. The "already mentions a
+border" check of caption fixes uses canvas vocabulary only (border,
+letterbox, pillarbox, bars on the sides), not frames. Token counts are recounted like the dataset's own
 `*_tok` columns (caption + `, drawn by {artist}`, `CaptionTemplate`); a
 caption that an edit pushes past the 251-token budget -> `over_budget`.
 
 Output: `<out>/images/<id>.webp` (crops with an image only),
 `<out>/patch.parquet` (id, action, bucket_w/h, long/medium/short + `_old` +
 `_tok`, crop_box_orig `[x0, y0, x1, y1]` in original px, orig_w/h, status
-`ok | crop_too_small | crop_unsure | over_budget | error`, notes),
-`<out>/patch.json` (dataset revision, review id, counts, parameters,
+`ok | caption_empty | crop_too_small | crop_unsure | over_budget | error`,
+notes; the latent patch builder applies only `ok` / `crop_unsure` rows),
+`<out>/patch.json` (`dataset_revision`, review id, counts, parameters,
 tokenizer sha256, tool versions) and `<out>/report.html` (self-contained:
 original with the crop box + final image, caption diffs with removed red /
-added green, status badges and filters). Written to a temp dir and renamed;
-exit 2 when any row is `error` (patch still written).
+added green, status badges and filters). Written to a temp dir under an
+exclusive lock on `<out>.lock` (a concurrent run is refused); an existing
+`<out>` is renamed aside and deleted only after the new one is in place
+(restored if the rename fails); exit 2 when any row is `error` (patch still written).
 
 ```bash
 python scripts/datafilter_apply.py --actions ~/다운로드/datafilter_actions.json \
