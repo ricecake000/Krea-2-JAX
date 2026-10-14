@@ -21,6 +21,7 @@ import io
 import json
 import os
 import random
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -218,10 +219,15 @@ def test_review_ids():
 def test_spans_and_offsets():
     rows = [(1, "1.webp", 100, 0), (2, "2.webp", 600, 1024),
             (3, "3.webp", 512, 2560), (4, "4.webp", 10, 3584)]
-    assert fo.spans_of(rows, {1, 3}, gap=0) == [
+    def want(*ids):
+        return {r[0]: r[1:] for r in rows if r[0] in ids}
+    assert fo.spans_of(rows, want(1, 3), gap=0) == [
         (0, 1024, rows[:1]), (2560, 3584, rows[2:3])]
-    assert fo.spans_of(rows, {1, 3}, gap=1536) == [(0, 3584, rows[:3])]
-    assert fo.spans_of(rows, {4}, gap=0) == [(3584, 4608, rows[3:])]
+    assert fo.spans_of(rows, want(1, 3), gap=1536) == [(0, 3584, rows[:3])]
+    assert fo.spans_of(rows, want(4), gap=0) == [(3584, 4608, rows[3:])]
+    # only the planned offset of an id counts (never a second occurrence)
+    dup = rows + [(1, "1.webp", 100, 4608)]
+    assert fo.spans_of(dup, want(1), gap=1 << 20) == [(0, 1024, rows[:1])]
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         write_tar(d / "orig-0000.tar", [(1, 100), (2, 600), (3, 512)])
@@ -310,6 +316,50 @@ def test_stream_cut_is_error_and_retry():
         assert run(tmp, fake, [100, 101, 210]) == 0     # range, one retry
         check_files(tmp, every, [100, 101, 210])
         assert sum("orig-0001" in c for c in cats(tmp)) == 2
+
+
+def test_duplicate_id_in_tar_rejected():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        fake, every = make_world(tmp)
+        arch = tmp / "arch" / "orig"
+        m = [(100, 500), (101, 600), (100, 700)]   # 100 twice, other payload
+        write_tar(arch / "orig-0000.tar", m)
+        write_index(arch / "orig-0000.parquet", [(i, s, "ok") for i, s in m])
+        try:
+            run(tmp, fake, [100, 101])
+        except SystemExit as e:
+            assert "orig-0000: duplicate id 100" in str(e), e
+        else:
+            raise AssertionError("duplicate id in one tar not rejected")
+        assert not list((tmp / "cache" / "img").iterdir())
+        assert not cats(tmp)
+
+
+def test_stream_end_of_archive_does_not_hang():
+    """An indexed id absent from the tar: tarfile stops at the end-of-archive
+    blocks while rclone still has MiBs of padding for a full pipe; the run
+    must finish (in a subprocess with a timeout), report it, free the lock."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        fake, every = make_world(tmp)
+        arch = tmp / "arch" / "orig"
+        write_tar(arch / "orig-0003.tar", [(400, 1000), (401, 1200)])
+        with open(arch / "orig-0003.tar", "ab") as f:
+            f.write(bytes(4 << 20))
+        write_index(arch / "orig-0003.parquet",
+                    [(400, 1000, "ok"), (401, 1200, "ok"), (403, 900, "ok")])
+        (tmp / "ids.json").write_text("[403]")
+        args = [sys.executable, str(REPO / "scripts" / "fetch_originals.py"),
+                "--ids", str(tmp / "ids.json"), "--remote", "fake:orig",
+                "--cache", str(tmp / "cache"), "--rclone", str(fake),
+                "--mode", "stream"]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 1, r.stdout + r.stderr
+        rep = json.loads((tmp / "cache" / "fetch_report.json").read_text())
+        assert rep["failed"] == {"403": "orig-0003: not in tar"}, rep
+        with open(tmp / "cache" / "fetch.lock", "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # released
 
 
 def test_lock_and_dry_run():

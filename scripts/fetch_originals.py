@@ -150,11 +150,14 @@ def load_index(index_dir, stems):
     for stem in sorted(stems):
         t = pq.read_table(index_dir / f"{stem}.parquet",
                           columns=["id", "size", "ext", "status"]).to_pydict()
-        rows, off = [], 0
+        rows, off, seen = [], 0, set()
         for i, size, ext, status in zip(t["id"], t["size"], t["ext"],
                                         t["status"]):
             if status != "ok":
                 continue
+            if int(i) in seen:   # two members, one output file: ambiguous
+                raise SystemExit(f"{stem}: duplicate id {int(i)} in the index")
+            seen.add(int(i))
             rows.append((int(i), f"{int(i)}.{ext}", int(size), off))
             off += BLOCK + padded(int(size))
         out[stem] = rows
@@ -183,10 +186,11 @@ def plan_fetch(index, wanted):
 def spans_of(rows, want, gap=GAP):
     """Group the wanted members of one tar (index rows in tar order) into
     contiguous spans: [(start, end, [rows in the span])], merging two wanted
-    members when the bytes between them are <= gap."""
+    members when the bytes between them are <= gap. want = {id: (name, size,
+    offset)} from plan_fetch; only the row at the planned offset counts."""
     spans = []
     for k, (i, name, size, off) in enumerate(rows):
-        if i not in want:
+        if i not in want or want[i][2] != off:
             continue
         end = off + BLOCK + padded(size)
         if spans and off - spans[-1][1] <= gap:
@@ -272,7 +276,8 @@ def kill(proc):
 
 
 def fetch_span(rclone, remote, stem, span, want, img_dir, progress):
-    """Read one span with a ranged rclone cat; write its wanted members."""
+    """Read one span with a ranged rclone cat; write its wanted members
+    (want = {id: planned offset}; a row elsewhere is only skipped)."""
     start, end, rows = span
     cmd = [rclone, "cat", "--offset", str(start), "--count", str(end - start),
            f"{remote}/{stem}.tar"]
@@ -289,7 +294,7 @@ def fetch_span(rclone, remote, stem, span, want, img_dir, progress):
             if ti.name != name or ti.size != size or not ti.isreg():
                 raise Mismatch(f"{stem}@{off}: header {ti.name}/{ti.size}, "
                                f"index {name}/{size}")
-            if i in want:
+            if want.get(i) == off:
                 write_member(proc.stdout, size, img_dir / name, progress)
                 skip(proc.stdout, padded(size) - size, progress)
             else:
@@ -325,9 +330,15 @@ def fetch_stream(rclone, remote, stem, want, img_dir, progress):
                 del todo[i]
                 if not todo:
                     break
-        # tarfile treats a stream cut at a member boundary as the end
-        if todo and proc.wait() != 0:
-            raise IOError(f"{stem}: rclone exit {proc.returncode}")
+        if todo:
+            # tarfile stopped at the end-of-archive blocks (rclone may still
+            # be writing record padding into a full pipe: drain it, or the
+            # wait below never returns) or at EOF; a stream cut at a member
+            # boundary also looks like EOF, so rclone's exit status decides
+            while proc.stdout.read(CHUNK):
+                pass
+            if proc.wait() != 0:
+                raise IOError(f"{stem}: rclone exit {proc.returncode}")
     finally:
         kill(proc)
     return set(todo)
@@ -401,11 +412,12 @@ def fetch(args, wanted, cache, index_dir, img_dir):
     done_tars = set()
 
     def range_task(stem, span):
-        want = {i for i, *_ in span[2] if i in jobs[stem]}
+        want = {i: off for i, _, _, off in span[2]
+                if i in jobs[stem] and jobs[stem][i][2] == off}
         for attempt in range(1, RETRIES + 1):
             if stem in fallback:
                 return
-            want = {i for i in want
+            want = {i: off for i, off in want.items()
                     if not present(img_dir, *jobs[stem][i][:2])}
             if not want:
                 return
