@@ -286,12 +286,41 @@ class BatchLoader:
 LATENT_FORMAT = "krea2-latents-v1"
 CAPTION_FIELDS = ("long", "medium", "short")
 ARTIST_SUFFIX = ", drawn by {}"
+LATENT_SHARD_COLUMN = "latent_shard"  # optional, written by patched versions
 
 
 def _examples(items, k=5):
     items = list(items)
     more = f", ... (+{len(items) - k})" if len(items) > k else ""
     return ", ".join(str(x) for x in items[:k]) + more
+
+
+def _parse_superseded(raw, shards):
+    """manifest "superseded" -> ({shard: frozenset(int ids)}, [problems]).
+    None (every unpatched manifest) -> ({}, [])."""
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, [f"manifest \"superseded\" is not an object "
+                    f"({type(raw).__name__})"]
+    out, problems = {}, []
+    unknown = sorted(str(k) for k in raw if k not in shards)
+    if unknown:
+        problems.append(f"{len(unknown)} superseded shards are not in the "
+                        f"manifest's shards ({_examples(unknown)})")
+    for name, ids in sorted(raw.items(), key=lambda kv: str(kv[0])):
+        if not isinstance(ids, list) or not all(
+                isinstance(x, int) and not isinstance(x, bool) for x in ids):
+            problems.append(f"superseded[{name!r}] is not a list of integer "
+                            "ids")
+            continue
+        uniq = frozenset(ids)
+        if len(uniq) != len(ids):
+            problems.append(f"superseded[{name!r}] lists "
+                            f"{len(ids) - len(uniq)} ids twice")
+        if uniq and name in shards:
+            out[str(name)] = uniq
+    return out, problems
 
 
 class BucketDataset:
@@ -307,6 +336,17 @@ class BucketDataset:
     scripts/cache_latents.py --write-manifest) for every shard, each a
     64-char lowercase hex string (null or malformed -> ValueError); they
     enter `fingerprint()`.
+
+    Patched versions (scripts/modal_patch_latents.py build): the manifest
+    may carry "superseded" ({shard file: [ids]}): those keys of that shard
+    are skipped (a removed sample, or one whose re-encoded latent lives in a
+    later patch shard); each listed id must exist in its shard and the
+    shard must be in "shards" (else ValueError). Every other check is
+    unchanged: each parquet id still needs exactly one live latent. An
+    optional metadata.parquet column `latent_shard` (written by the patch
+    builder) must name the shard each id resolved to. A manifest without
+    "superseded" and a parquet without `latent_shard` (every unpatched
+    cache) behave exactly as before, with the same fingerprint.
 
     verify_digests: re-hash every shard file (streaming sha256) at
     construction and raise ValueError listing every shard whose bytes differ
@@ -355,6 +395,10 @@ class BucketDataset:
             raise FileNotFoundError(f"{meta_path} not found")
         cols = ("id", "bucket_w", "bucket_h") + CAPTION_FIELDS + (
             "artist_name",)
+        has_latent_shard = (LATENT_SHARD_COLUMN
+                            in pq.read_schema(meta_path).names)
+        if has_latent_shard:
+            cols += (LATENT_SHARD_COLUMN,)
         table = pq.read_table(meta_path, columns=list(cols))
         ids = table.column("id").to_numpy().astype(np.int64)
         if len(ids) == 0:
@@ -379,6 +423,8 @@ class BucketDataset:
 
         self._captions = tuple(strings(c) for c in CAPTION_FIELDS)
         self._artist = strings("artist_name")
+        latent_shard_col = (strings(LATENT_SHARD_COLUMN) if has_latent_shard
+                            else None)
 
         # --- latents/manifest.json + shard headers ---
         lat_dir = self.data_dir / "latents"
@@ -406,6 +452,9 @@ class BucketDataset:
         bad_digest = [f"{name}={self.digests[name]!r}" for name in self.shards
                       if name in self.digests
                       and not is_sha256_hex(self.digests[name])]
+        self.superseded, sup_problems = _parse_superseded(
+            self.manifest.get("superseded"), self.shards)
+        sup_found = {name: set() for name in self.superseded}
         index = {int(x): j for j, x in enumerate(self.ids.tolist())}
         shard_of = np.full((self.n,), -1, dtype=np.int32)
         lat_shape = np.zeros((self.n, 3), dtype=np.int64)
@@ -416,6 +465,7 @@ class BucketDataset:
             if not path.exists():
                 missing_files.append(name)
                 continue
+            skip = self.superseded.get(name, ())
             with safe_open(str(path), framework="numpy") as f:
                 for key in f.keys():
                     n_latents += 1
@@ -423,6 +473,9 @@ class BucketDataset:
                         sid = int(key)
                     except ValueError:
                         bad_keys.append(f"{name}:{key}")
+                        continue
+                    if sid in skip:  # superseded by a patch: not this id's
+                        sup_found[name].add(sid)
                         continue
                     j = index.get(sid)
                     if j is None:
@@ -440,7 +493,23 @@ class BucketDataset:
                     shard_of[j] = s_idx
                     lat_shape[j] = shape
 
-        problems = []
+        problems = list(sup_problems)
+        sup_absent = [f"{name}:{sid}" for name in self.superseded
+                      if name not in missing_files
+                      for sid in sorted(self.superseded[name]
+                                        - sup_found[name])]
+        if sup_absent:
+            problems.append(f"{len(sup_absent)} superseded ids are not in "
+                            f"their shard ({_examples(sup_absent)})")
+        if latent_shard_col is not None:
+            wrong = [f"{self.ids[j]}:{latent_shard_col[j]!r}!="
+                     f"{self.shards[shard_of[j]]!r}"
+                     for j in range(self.n) if shard_of[j] >= 0
+                     and latent_shard_col[j] != self.shards[shard_of[j]]]
+            if wrong:
+                problems.append(f"{len(wrong)} parquet {LATENT_SHARD_COLUMN} "
+                                f"values differ from the shard holding the "
+                                f"id's live latent ({_examples(wrong)})")
         if no_digest:
             problems.append(f"{len(no_digest)} manifest shards have no digest "
                             f"({_examples(no_digest)}); rerun "
@@ -545,8 +614,10 @@ class BucketDataset:
         every caption field used (long, medium, short, artist_name; hashed
         separately and included as `captions_sha256`) and the preprocessing
         identity (format, vae, img_tokens, patch, tokenizer template ids,
-        text_rows, normalized caption_probs, artist_prob). Reads no latent;
-        deterministic."""
+        text_rows, normalized caption_probs, artist_prob), plus the
+        manifest's "superseded" keys when there are any (patched versions;
+        absent otherwise, so an unpatched cache's fingerprint is unchanged).
+        Reads no latent; deterministic."""
         if self._fingerprint is not None:
             return self._fingerprint
         h = hashlib.sha256()
@@ -573,6 +644,9 @@ class BucketDataset:
             "captions_sha256": h.hexdigest(),
             "shard_digests": {name: self.digests[name] for name in self.shards},
         }
+        if self.superseded:
+            ident["superseded"] = {name: sorted(ids) for name, ids
+                                   in self.superseded.items()}
         blob = json.dumps(ident, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=True)
         self._fingerprint = hashlib.sha256(blob.encode("utf-8")).hexdigest()
