@@ -26,6 +26,7 @@ import json
 import math
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -621,6 +622,47 @@ def test_quote_round2_repros():
     cap = "a girl, text reading 'it's a white border, ok', white border"
     assert da.strip_border(cap)[0] == ("a girl, text reading 'it's a white "
                                        "border, ok'")
+
+
+ADVERSARIAL = {
+    # Codex round 3 repro: an unclosed straight quote over curly apostrophes
+    "repro": "a girl, sign reading '" + "it\u2019s " * 24 + "OPEN, white border",
+    "repro_long": "a girl, sign reading '" + "it\u2019s " * 200 + "OPEN",
+    "straight_apos": "a girl, sign reading '" + "it's " * 200 + "OPEN",
+    "curly_open": "a girl, \u2018" + "girl\u2019s " * 150 + "white border",
+    "curly_mixed": "a, \u2018" + "it's it\u2019s " * 80,
+    "pairs": "'a', " * 200,
+    "stray": "' , white border" * 70,
+    "xq": "x'" * 500,
+    "mixed": "\u201c\u2018'\", white border " * 60,
+    "dq": '"a, ' * 300,
+    "nested": "'\u2018\"" * 330,
+}
+
+
+def test_quote_parsing_is_fast():
+    """Adversarial captions (up to 1000 chars) parse in < 50 ms each
+    (strip, mention check, phrase add)."""
+    for name, cap in ADVERSARIAL.items():
+        cap = cap[:1000]
+        best = 1e9
+        for _ in range(3):              # best of 3: robust to a busy host
+            t0 = time.perf_counter()
+            da.strip_border(cap)
+            da.has_border_mention(cap)
+            da.add_phrases(cap, ["white border"])
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05, (name, len(cap), best)
+    # the repro: the unclosed straight quote is ambiguous -> the backstop
+    # keeps everything from it to the last quote-like character (the last
+    # apostrophe); the border phrase after that is still stripped
+    cap = ADVERSARIAL["repro"]
+    new, removed, kept = da.strip_border(cap)
+    assert da.quote_info(cap)[1]
+    stretch = cap[cap.index("'"):cap.rindex("\u2019") + 1]
+    assert stretch in new and new == "a girl, sign reading '" + (
+        "it\u2019s " * 24 + "OPEN"), new
+    assert removed == ["white border"]
 
 
 def test_quote_backstop_unbalanced():

@@ -612,8 +612,13 @@ QUOTE_CHARS = "\"'\u2018\u2019\u201c\u201d"
 QUOTE_RES = (
     re.compile(r'"[^"]*(?:"|$)', re.S),
     re.compile("\u201c[^\u201d]*(?:\u201d|$)", re.S),
-    re.compile(rf"\u2018(?:[^\u2019]|{_APOS})*(?:\u2019|$)", re.S),
-    re.compile(rf"(?<![\w'])'(?=\S)(?:[^']|{_APOS})*?(?<=\S)'(?!\w)", re.S),
+    # the content alternatives are disjoint (the other kind of apostrophe is
+    # already in the negated class), so a missing closing quote cannot
+    # backtrack exponentially
+    re.compile(rf"\u2018(?:[^\u2019]|(?<={_L})\u2019(?={_L}))*(?:\u2019|$)",
+               re.S),
+    re.compile(rf"(?<![\w'])'(?=\S)(?:[^']|(?<={_L})'(?={_L}))*?(?<=\S)'"
+               r"(?!\w)", re.S),
 )
 # "already captioned" check: canvas-border vocabulary only (no frame /
 # margin mentions: "white frame on the wall" is not a border caption)
