@@ -709,6 +709,55 @@ modal run scripts/modal_coherence.py --run run1 --step 1513
 .venv/bin/python scripts/modal_coherence.py --sim-only   # simulation table only (local)
 ```
 
+### Dataset filter: inset / border score on Modal
+
+`scripts/modal_score_borders.py` scores every image of
+`ricecake/danbooru-curated-v2` for "a picture placed on a flat canvas"
+(white or flat margins around a rectangular picture, pillar/letterbox bars,
+a frame line + mat) and builds a review page to pick images for removal.
+CPU only: one container per tar (`.starmap`, Modal default resources; a
+950-image shard peaks at ~90 MiB RSS), each downloads its tar, scores every
+image at full resolution and returns the metrics plus 512 px JPEG thumbnails
+of the candidates.
+
+Metric (`border_metrics`, numpy): the canvas colour is the median of the
+2 px outer ring (or of one side strip when that matches more of the ring, so
+bars on two sides work); canvas pixels are within `TOL` = 18 (max abs channel
+difference: survives WebP noise/ringing, still separates near-white
+picture highlights). Margins are leading rows/columns that are >= 98%
+canvas; `fill` = non-canvas fraction of the remaining box;
+`edge_straightness` = mean over the sides with a margin of the box edge's
+non-canvas fraction (best of the first 4 lines: a rectangle gives ~1, a
+character silhouette on white ~0.1).
+`score = margin_area_frac * edge_straightness * min(1, fill / 0.85)` when the
+ring is >= 90% canvas or the image is `pillar_or_letter` (margins on exactly
+two opposite sides, straightness >= 0.9), else 0. A thin frame line (all
+margins < 1.5%) is measured again inside the line (`peeled`: frame + mat +
+inset scores like the inset); a frame line around a full-bleed picture only
+sets `thin_frame`. All intermediate numbers are stored, so the ranking can
+be re-weighted from `scores.parquet` without re-running.
+
+Thumbnails: score >= `--score-min` (0.05: a ~1.3% border on all sides, a
+~5% band, or any larger inset), `pillar_or_letter`, each shard's top
+`--thumb-frac` (3%) by score, and always: every `sample watermark` image,
+every `border` / `white border` / `outside border` / `pillarboxed` image
+whose long caption does not mention a border/frame/margin/letterbox/
+pillarbox/inset, and `--control-n` (150) seeded random `white background`
+images.
+
+Output in `/home/mj/krea2-ops/eval/datafilter/`: `scores.parquet` (every
+image: metrics + tag/caption flags), `thumbs/<id>.jpg`, `summary.json` and
+`review/index.html` (self-contained; tabs A top `--top-n` by score, B sample
+watermark, C border tag without a border caption, D white-background
+control; click = mark for removal, kept in localStorage; "export" downloads
+`datafilter_remove.json`).
+
+```bash
+modal run scripts/modal_score_borders.py --shards 2   # smoke run (2 tars)
+modal run scripts/modal_score_borders.py              # all 100 tars (rough: a few min, < $0.5)
+python scripts/modal_score_borders.py --tar-dir DIR --out OUT   # same, tars already on disk
+```
+
 ## Tests
 
 CPU-only numerical verification against the official PyTorch code
@@ -741,6 +790,8 @@ python tests/test_modal_export_full.py  # Modal export: minimal orbax download (
                                         # export_full + upload flow, weight-drift report
 python tests/test_modal_coherence.py    # Modal coherence: partial restore == full restore,
                                         # metrics, null-model simulation, fake-R2 flow
+python tests/test_score_borders.py      # dataset border score: synthetic insets vs
+                                        # silhouettes (WebP), fake-tar shard + review page
 ```
 
 All of these run on CPU (8 emulated devices where sharding is involved).
@@ -775,6 +826,7 @@ scripts/
   modal_eval_full.py  # Modal: full FT vs base side-by-side images + contact sheet
   modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
   modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
+  modal_score_borders.py  # Modal: inset/border score of the dataset + review page
   merge_lora.py     # torch: bake LoRA into a full checkpoint
 tests/              # parity / training / sharding verification
 ```
