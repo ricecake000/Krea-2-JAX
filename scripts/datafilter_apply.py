@@ -599,14 +599,21 @@ CONNECTOR = re.compile(
     r"flanked by|bordered by|bordered with|enclosed by|enclosed in|inside|"
     r"within)\s+", re.I)
 PROTECTED = re.compile(r"\btext reading\b", re.I)
-# quoted text: double / curly quotes (an unclosed one runs to the end) and
-# single-quote pairs whose quotes are not word-internal (a possessive or
-# contraction apostrophe is not a quote)
+# quoted text: double / curly quotes (an unclosed opening quote runs to
+# the end) and single-quote pairs. A straight or curly apostrophe between
+# two letters (girl's, girl\u2019s, it's) is an apostrophe, never a quote;
+# everything matches across newlines. When the quote characters are not
+# all accounted for (unbalanced / ambiguous), quote_info protects the whole
+# stretch from the first to the last quote-like character as a backstop.
+_L = r"[^\W\d_]"                    # a letter
+_APOS = rf"(?<={_L})['\u2019](?={_L})"
+APOSTROPHE = re.compile(_APOS)
+QUOTE_CHARS = "\"'\u2018\u2019\u201c\u201d"
 QUOTE_RES = (
-    re.compile(r'"[^"]*(?:"|$)'),
-    re.compile("\u201c[^\u201d]*(?:\u201d|$)"),
-    re.compile("\u2018[^\u2019]*(?:\u2019|$)"),
-    re.compile(r"(?<![\w'])'(?=\S).*?(?<=\S)'(?![\w])"),
+    re.compile(r'"[^"]*(?:"|$)', re.S),
+    re.compile("\u201c[^\u201d]*(?:\u201d|$)", re.S),
+    re.compile(rf"\u2018(?:[^\u2019]|{_APOS})*(?:\u2019|$)", re.S),
+    re.compile(rf"(?<![\w'])'(?=\S)(?:[^']|{_APOS})*?(?<=\S)'(?!\w)", re.S),
 )
 # "already captioned" check: canvas-border vocabulary only (no frame /
 # margin mentions: "white frame on the wall" is not a border caption)
@@ -625,17 +632,50 @@ def border_hits(text):
     return [n for n, rx in STRIP_PATTERNS if rx.search(text)]
 
 
-def quote_spans(text):
-    """Sorted, merged [(start, end)] of the quoted parts of text."""
-    spans = sorted((m.start(), m.end()) for rx in QUOTE_RES
-                   for m in rx.finditer(text) if m.end() > m.start())
+def _merge(spans):
     merged = []
-    for a, b in spans:
+    for a, b in sorted(spans):
         if merged and a < merged[-1][1]:
             merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
         else:
             merged.append((a, b))
     return merged
+
+
+def quote_info(text):
+    """-> (sorted merged [(start, end)] protected spans, ambiguous). The
+    quotes are ambiguous when an opening quote is never closed, two
+    matches overlap without nesting, or a quote-like character (not an
+    apostrophe between letters) lies outside every match; then the stretch
+    from the first to the last quote-like character (apostrophes included)
+    is protected too."""
+    raw = [(m.start(), m.end()) for rx in QUOTE_RES
+           for m in rx.finditer(text) if m.end() > m.start()]
+    ambiguous = False
+    for a, b in raw:
+        closer = {'"': '"', "\u201c": "\u201d", "\u2018": "\u2019",
+                  "'": "'"}[text[a]]
+        if b - a < 2 or text[b - 1] != closer:
+            ambiguous = True                    # unclosed: ran to the end
+    for i, (a, b) in enumerate(raw):
+        for c, d in raw[i + 1:]:
+            if a < d and c < b and not (a <= c and d <= b or
+                                        c <= a and b <= d):
+                ambiguous = True
+    apos = {m.start() for m in APOSTROPHE.finditer(text)}
+    spans = _merge(raw)
+    qpos = [i for i, ch in enumerate(text) if ch in QUOTE_CHARS]
+    if any(i not in apos and not any(a <= i < b for a, b in spans)
+           for i in qpos):
+        ambiguous = True
+    if ambiguous and qpos:
+        spans = _merge(spans + [(qpos[0], qpos[-1] + 1)])
+    return spans, ambiguous
+
+
+def quote_spans(text):
+    """Sorted, merged [(start, end)] of the protected (quoted) parts."""
+    return quote_info(text)[0]
 
 
 def unquoted(text):
@@ -732,12 +772,15 @@ def strip_border(caption):
     another sense, for review]). Every other byte is kept as is."""
     caption = caption or ""
     parsed = split_segments(caption)
+    ambiguous = quote_info(caption)[1]
     segs = [seg for seg, _ in parsed]
     out, removed, suspects = [], [], []
     for seg, quoted in parsed:
         if quoted:      # never modify a phrase holding quoted text
-            if border_hits(unquoted(seg)) or SUSPECT.search(unquoted(seg)):
-                suspects.append(seg.strip() + " (quoted text)")
+            if border_hits(seg) or SUSPECT.search(seg):
+                suspects.append(seg.strip() + (
+                    " (inside unbalanced quotes)" if ambiguous
+                    else " (quoted text)"))
             out.append(seg)
             continue
         units = re.split(r"(?<=\.)(\s+)", seg)  # sentence, sep, sentence...

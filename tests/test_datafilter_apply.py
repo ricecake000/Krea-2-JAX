@@ -601,6 +601,52 @@ def test_quote_aware_split():
     assert da.add_phrases(cap, ["white border"])[0] == cap + ", white border"
 
 
+def test_quote_round2_repros():
+    # a curly apostrophe inside a word does not close a curly quote
+    cap = ("a girl, sign reading \u2018girl\u2019s hat, white border, "
+           "OPEN\u2019, white border")
+    new, removed, kept = da.strip_border(cap)
+    assert new == ("a girl, sign reading \u2018girl\u2019s hat, white "
+                   "border, OPEN\u2019"), new
+    assert removed == ["white border"]
+    assert any("quoted text" in k for k in kept)
+    assert not da.quote_info(cap)[1]
+    # a single-quote pair spanning a newline
+    cap = ("a girl, text reading 'HELLO,\nwhite border, WORLD', soft "
+           "shading, white border")
+    new, removed, _ = da.strip_border(cap)
+    assert new == ("a girl, text reading 'HELLO,\nwhite border, WORLD', "
+                   "soft shading"), new
+    # straight apostrophes between letters inside a straight quote
+    cap = "a girl, text reading 'it's a white border, ok', white border"
+    assert da.strip_border(cap)[0] == ("a girl, text reading 'it's a white "
+                                       "border, ok'")
+
+
+def test_quote_backstop_unbalanced():
+    """Unbalanced / ambiguous quote characters: nothing between the first
+    and the last quote-like character is stripped; it is listed instead."""
+    cap = ("a girl, the girls' hats, white border, rock 'n roll, smiling, "
+           "white border")
+    spans, ambiguous = da.quote_info(cap)
+    assert ambiguous
+    new, removed, kept = da.strip_border(cap)
+    # the white border between the two stray quotes stays; the last one
+    # (after the last quote-like character) goes
+    assert new == "a girl, the girls' hats, white border, rock 'n roll, " \
+        "smiling", new
+    assert removed == ["white border"]
+    assert any("unbalanced" in k and "white border" in k for k in kept)
+    # an unclosed double quote protects to the end
+    cap = 'a girl, text reading "OPEN, white border, smile, white border'
+    new, removed, kept = da.strip_border(cap)
+    assert new == cap and not removed and da.quote_info(cap)[1]
+    assert any("unbalanced" in k for k in kept)
+    # crossing quote pairs are ambiguous too
+    cap = "a, 'x \"y' z\", white border, w"
+    assert da.quote_info(cap)[1]
+
+
 def test_mention_is_canvas_vocabulary_only():
     for cap in ("a girl, white frame on the wall",
                 "a girl, thin frame glasses, wide margins of a notebook",

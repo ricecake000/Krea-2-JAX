@@ -852,8 +852,11 @@ one): a phrase goes as a whole only when every word is border vocabulary
 content ("border collie", "mirror bordered with bulbs", "chibi inset",
 "signature in the right margin", quoted text) are kept and listed in
 `notes` for review; a phrase holding quoted text (quote pairs parsed
-across commas, apostrophes inside words are not quotes) is never modified,
-and quoted text never counts as a border mention. The "already mentions a
+across commas and newlines; a straight or curly apostrophe between two
+letters is not a quote) is never modified, and quoted text never counts as
+a border mention. When the quote characters are unbalanced or ambiguous,
+nothing between the first and the last quote-like character is stripped
+(listed in `notes` instead). The "already mentions a
 border" check of caption fixes uses canvas vocabulary only (border,
 letterbox, pillarbox, bars on the sides), not frames. Token counts are recounted like the dataset's own
 `*_tok` columns (caption + `, drawn by {artist}`, `CaptionTemplate`); a
