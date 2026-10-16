@@ -48,11 +48,14 @@ Options (local entrypoint):
                   (defaults base=hf-base, ft=krea2-fullft/run1/model.safetensors,
                   run1's EMA export), one pair labels[0]:labels[1]
   --out DIR       one pair: that pair's dir; several: their parent dir.
-                  Default /home/mj/krea2-ops/eval/<A>_vs_<B>_<UTC timestamp>
+                  Default /home/mj/krea2-ops/eval/<A>_vs_<B>_<UTC timestamp>.
+                  An existing non-empty pair dir, or two pairs mapping to
+                  the same dir, is refused before any remote work.
   --no-cache      regenerate (and re-decode) every entry of this run,
                   overwriting the cached ones
   --cache-only    prepare's cache listing + the estimate, then exit: nothing
-                  is downloaded, generated or decoded (no GPU)
+                  is downloaded (not even the parquet: the volume's is used,
+                  none -> stop), generated or decoded (no GPU)
 
 Generated-image cache (Volume `krea2-eval-cache`):
   /vol/gen/<SAMPLER_VERSION>/<model_id>/<entry_hash>.npz   final latents
@@ -62,11 +65,18 @@ Generated-image cache (Volume `krea2-eval-cache`):
         latent_std, device, jax, created)}; written after the .npz (both
         atomically), so an entry is valid iff its sidecar parses, its key
         hashes to the file name and the .npz exists
-  /vol/gen/<SAMPLER_VERSION>/<model_id>/<entry_hash>.png   decoded image
-        (written by `decode`; removed whenever the .npz is rewritten)
-  local mirror /home/mj/krea2-ops/eval/cache/<same relative path>.png/.json
-        (PNG + sidecar copied back by `decode`; a pair dir copies from here)
-        and .../cache/<SAMPLER_VERSION>/pairs/<hash>.png (pair images)
+  /vol/gen/<SAMPLER_VERSION>/<model_id>/<entry_hash>.<dtag>.png  decoded
+        image; dtag = 12 hex of the decode settings (DECODE_VERSION, the
+        VAE identity: repo + revision from the volume marker (+ file sizes
+        when no revision), VAE dtype, torch / diffusers pins). A PNG is only
+        reused under the same decode settings; latents are re-decoded under
+        new ones. Written by `decode`; all removed when the .npz is
+        rewritten.
+  local mirror /home/mj/krea2-ops/eval/cache/<same relative path>.<dtag>.png
+        + .<dtag>.json (sidecar + "decode"), copied back by `decode`; a
+        pair dir copies from here; .../cache/<SAMPLER_VERSION>/pairs/<hash>.png
+        are the pair images (hash over both entries, decode settings,
+        caption strip, labels)
   model_id = readable slug + hash of the model identity; entry_hash = the
   first 32 hex of sha256(canonical JSON of the key: sort_keys, compact
   separators, ASCII). The key is {"sampler": {sampler_version, jax, dtype,
@@ -89,8 +99,9 @@ Generated-image cache (Volume `krea2-eval-cache`):
   only be paired when their whole "sampler" key part is identical (sampler
   version, steps, cfg, negative, cfg_batch, attn, compact_text, text_rows,
   text encoder, and per prompt caption / size / seed / mu); only the model
-  identity may differ. Anything else is refused with UnfairPairError naming
-  the differing fields.
+  identity may differ; both images must be decoded under the same decode
+  settings. Anything else is refused with UnfairPairError naming the
+  differing fields.
 
   Determinism caveat: cuDNN / XLA kernels are not guaranteed bitwise
   deterministic across containers, GPU types or autotuning results, so a
@@ -140,9 +151,10 @@ Stages:
      prompts.json ({"weights": {"base", "ft"} checkpoint identities,
      "settings": the sampler key part, "labels": {"base": A, "ft": B},
      "pair", "entries" (the cache paths), "prompts": [id, source, caption,
-     width, height, seed, mu, seconds, ...]}), generate.json (provenance and
-     this run's GPU log) and index.html (prompt | A | B table, relative
-     links). The layout is that of the earlier runs, so
+     width, height, seed, mu, seconds, ...] - only prompts with BOTH
+     images; the rest in "incomplete"}, "decode"), generate.json
+     (provenance and this run's GPU log) and index.html (prompt | A | B
+     table, relative links; incomplete prompts named in the header). The layout is that of the earlier runs, so
      krea2-ops/eval/tools/make_blind.py works unchanged.
 
 Prompt set (build_prompts, deterministic for --seed): --n-dataset rows drawn
@@ -284,6 +296,10 @@ DTYPE = "bfloat16"        # DiT params / sampler latents
 # attention kernels, text path, dtypes, pins): entries live under it.
 SAMPLER_VERSION = "v2-cfgbatch"
 HF_BASE = "hf-base"       # --models KEY of the HF base checkpoint
+# Bump whenever decode_latent / the PNG encoding change: decoded PNGs are
+# keyed by decode_settings (this + the VAE identity + the torch/diffusers
+# pins), latents are not (they are re-decoded under new decode settings).
+DECODE_VERSION = "d1"
 VOL_GEN = f"{VOL}/gen"
 LOCAL_CACHE_ROOT = LOCAL_OUT_ROOT / "cache"
 LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -723,14 +739,49 @@ def read_sidecar(root, rel):
     return doc
 
 
-def entry_status(root, key):
+def vae_identity(vae_dir=None):
+    """{repo, revision} of the volume's VAE (vae_dir, default VOL_VAE) from
+    its download marker, plus the marker's file sizes when no revision was
+    recorded; None when it is not completely downloaded."""
+    vae_dir = VOL_VAE if vae_dir is None else vae_dir
+    if not marker_ok(vae_dir):
+        return None
+    m = json.loads((Path(vae_dir) / MARKER).read_text())
+    ident = {"repo": m.get("repo", VAE_REPO), "revision": m.get("revision")}
+    if not ident["revision"]:
+        ident["files"] = m.get("files")
+    return ident
+
+
+def decode_settings(vae):
+    """What a decoded PNG depends on besides the latents: DECODE_VERSION,
+    the VAE identity (vae_identity), the VAE dtype and the torch / diffusers
+    pins of the decode image. None when the VAE identity is unknown."""
+    if not vae:
+        return None
+    return {"decode_version": DECODE_VERSION, "vae": vae,
+            "vae_dtype": "float32", "torch": TORCH_PIN,
+            "diffusers": next(x for x in CPU_PIP
+                              if x.startswith("diffusers=="))}
+
+
+def png_suffix(decode):
+    """File suffix of an entry's PNG decoded under `decode` (a cached PNG is
+    only reused under the same decode settings)."""
+    return f".{short_hash(decode, 12)}.png"
+
+
+def entry_status(root, key, decode=None):
     """{"latent": the entry's latents are cached under root (valid sidecar
-    with this exact key + the .npz), "png": its decoded PNG too}."""
+    with this exact key + the .npz), "png": its PNG decoded under `decode`
+    too (False when decode is None)}."""
     rel = entry_rel(key)
     doc = read_sidecar(root, rel)
     ok = (doc is not None and doc["key"] == key
           and entry_file(root, rel, ".npz").is_file())
-    return {"latent": ok, "png": ok and entry_file(root, rel, ".png").is_file()}
+    return {"latent": ok,
+            "png": bool(ok and decode is not None and entry_file(
+                root, rel, png_suffix(decode)).is_file())}
 
 
 def _atomic_write(path, data):
@@ -747,14 +798,16 @@ def _atomic_write(path, data):
 
 
 def write_entry(root, key, latent, meta):
-    """Store a generated latent as a cache entry: the old sidecar / PNG are
+    """Store a generated latent as a cache entry: the old sidecar / PNGs are
     removed first (the entry is invalid meanwhile), then the .npz, then the
     sidecar {"hash", "key", "meta"}, each atomically. -> rel."""
     import numpy as np
 
     rel = entry_rel(key)
-    for suffix in (".json", ".png"):
-        entry_file(root, rel, suffix).unlink(missing_ok=True)
+    entry_file(root, rel, ".json").unlink(missing_ok=True)
+    base = entry_file(root, rel, "")
+    for old in base.parent.glob(base.name + ".*.png"):   # every decode
+        old.unlink(missing_ok=True)
     buf = io.BytesIO()
     np.savez(buf, latent=np.asarray(latent, dtype=np.float32))
     _atomic_write(entry_file(root, rel, ".npz"), buf.getvalue())
@@ -773,12 +826,15 @@ def _flat(d, prefix=""):
     return out
 
 
-def check_pairable(key_a, key_b, where="pair"):
+def check_pairable(key_a, key_b, where="pair", decode_a=None,
+                   decode_b=None):
     """THE FAIRNESS RULE: two cache entries may be paired only when their
     "sampler" key parts (sampler version, jax, dtype, steps, cfg, negative,
     cfg_batch, attn, compact_text, text_rows, text encoder, and the prompt's
     caption / size / seed / mu) are identical; only "model" may differ.
-    Raises UnfairPairError naming every differing field."""
+    Their images must also be decoded under the same decode settings
+    (decode_a == decode_b: VAE identity, DECODE_VERSION, pins). Raises
+    UnfairPairError naming every differing field."""
     try:
         fa, fb = _flat(key_a["sampler"]), _flat(key_b["sampler"])
     except (KeyError, TypeError, AttributeError) as e:
@@ -793,6 +849,10 @@ def check_pairable(key_a, key_b, where="pair"):
             f"{where}: refusing to pair entries sampled with different "
             f"settings ({detail}); only the model may differ - regenerate "
             "with the same settings")
+    if decode_a != decode_b:
+        raise UnfairPairError(
+            f"{where}: refusing to pair images decoded with different decode "
+            f"settings ({decode_a!r} vs {decode_b!r})")
 
 
 # --------------------------------------------------------------- planning
@@ -1070,8 +1130,9 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
     when some entry is missing (or use_cache is False). cache_only: nothing
     is downloaded (identities that need a download stay unknown).
     -> {"artifacts": {name: status}, "errors": {name: msg}, "prompts": [...]
-    (None when the parquet is missing; first `limit` rows), "settings" (with
-    text_encoder), "models": [{label, key, path, identity, model_id,
+    (None when the parquet is missing - cache_only never downloads it; first
+    `limit` rows), "settings" (with text_encoder), "decode"
+    (decode_settings of the volume's VAE), "models": [{label, key, path, identity, model_id,
     entries: {prompt id: {rel, hash, key, latent, png} or None}}]}."""
     env = os.environ if env is None else env
     gen_root = VOL_GEN if gen_root is None else gen_root
@@ -1089,8 +1150,9 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
     def hf_base_task():
         return hf_fetch(BASE_REPO, VOL_BASE, [BASE_FILE], token, log=log)
 
-    tasks = [("parquet", lambda: hf_fetch(DATA_REPO, VOL_DATA, [PARQUET],
-                                          token, repo_type="dataset", log=log))]
+    tasks = [] if cache_only else [
+        ("parquet", lambda: hf_fetch(DATA_REPO, VOL_DATA, [PARQUET], token,
+                                     repo_type="dataset", log=log))]
     if fetch:
         tasks += [
             ("text_encoder", lambda: hf_fetch(TEXT_REPO, VOL_TEXT,
@@ -1102,7 +1164,7 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
             tasks += [(label, hf_base_task if key == HF_BASE
                        else r2_task(key)) for label, key in models]
     out = {"artifacts": {}, "errors": {}, "prompts": None,
-           "settings": None, "models": []}
+           "settings": None, "decode": None, "models": []}
 
     def attempt(name, fn):
         try:
@@ -1128,6 +1190,7 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
 
     settings = {**settings, "text_encoder": text_encoder_identity()}
     out["settings"] = settings
+    decode = out["decode"] = decode_settings(vae_identity())
     client = []
 
     def r2_ident(key):
@@ -1154,7 +1217,7 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
                 continue
             k = entry_key(settings, p, ident)
             entries[p["id"]] = {"rel": entry_rel(k), "hash": entry_hash(k),
-                                "key": k, **entry_status(gen_root, k)}
+                                "key": k, **entry_status(gen_root, k, decode)}
         missing = (not use_cache
                    or any(e is None or not e["latent"]
                           for e in entries.values()))
@@ -1618,20 +1681,27 @@ def make_pair(base, ft, label, labels=MODELS, strip=None):
     return out
 
 
-def decode_tasks(tasks, root, vae_loader, log=print):
+def decode_tasks(tasks, root, vae_loader, decode, current=None, log=print):
     """The `decode` stage over cache entries under root (VOL_GEN).
 
     tasks: {"kind": "entry", "rel", "key"} -> the entry's PNG bytes + its
     sidecar (for the local mirror), or {"kind": "pair", "name", "a": {rel,
     key}, "b": {rel, key}, "label", "labels": [A, B]} -> the captioned pair
     image A | B, after check_pairable on the two sidecar keys. Every entry
-    must be valid with exactly the requested key. An entry's PNG is decoded
-    from its latents once (vae_loader() called lazily, at most once) and
-    cached next to them (<rel>.png); later calls read it.
-    -> [{"kind", "rel" | "name", "png": bytes, "sidecar" (entries),
-    "decoded": bool (entries)}] in task order."""
+    must be valid with exactly the requested key. decode: the decode
+    settings the caller planned with; current (when given): those of the
+    VAE this container loads (decode_settings(vae_identity())) - refused
+    when they differ. An entry's PNG is decoded from its latents once per
+    decode settings (vae_loader() called lazily, at most once) and cached
+    next to them (<rel><png_suffix(decode)>); later calls read it.
+    -> [{"kind", "rel" | "name", "png": bytes, "sidecar", "decode"
+    (entries), "decoded": bool (entries)}] in task order."""
     import numpy as np
     from PIL import Image
+
+    if decode is None or (current is not None and current != decode):
+        raise RuntimeError(f"decode settings of this container {current!r} "
+                           f"!= the planned {decode!r}; run again")
 
     vae = []
     cache = {}
@@ -1645,7 +1715,7 @@ def decode_tasks(tasks, root, vae_loader, log=print):
         if doc is None or doc["key"] != e["key"] or not npz.is_file():
             raise RuntimeError(f"{rel}: no valid cache entry with the "
                                "requested key")
-        png = entry_file(root, rel, ".png")
+        png = entry_file(root, rel, png_suffix(decode))
         decoded = not png.is_file()
         t0 = time.time()
         if decoded:
@@ -1667,11 +1737,12 @@ def decode_tasks(tasks, root, vae_loader, log=print):
         if t["kind"] == "entry":
             doc, data, decoded = ensure(t)
             out.append({"kind": "entry", "rel": t["rel"], "png": data,
-                        "sidecar": doc, "decoded": decoded})
+                        "sidecar": doc, "decode": decode,
+                        "decoded": decoded})
         elif t["kind"] == "pair":
             da, pa, _ = ensure(t["a"])
             db, pb, _ = ensure(t["b"])
-            check_pairable(da["key"], db["key"], where=t["name"])
+            check_pairable(da["key"], db["key"], t["name"], decode, decode)
             img = make_pair(Image.open(io.BytesIO(pa)),
                             Image.open(io.BytesIO(pb)), t["label"],
                             labels=tuple(t["labels"]))
@@ -1802,23 +1873,39 @@ def print_estimate(prompts, steps, cfg, gpu, todo=None, log=print):
 
 
 # --------------------------------------------------------------- local mirror
-def local_entry_ok(local_root, entry):
-    """The local mirror holds this entry's PNG with a sidecar of exactly its
-    key."""
+def local_png_sidecar(local_root, rel, decode):
+    """The mirror's sidecar of an entry's PNG decoded under `decode` ({hash,
+    key, meta, decode}) when valid for rel and decode, else None."""
+    if decode is None:
+        return None
+    path = entry_file(local_root, rel, png_suffix(decode)[:-4] + ".json")
+    try:
+        doc = json.loads(path.read_text())
+        if entry_rel(doc["key"]) != rel or doc.get("decode") != decode:
+            return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return doc
+
+
+def local_entry_ok(local_root, entry, decode):
+    """The local mirror holds this entry's PNG decoded under `decode`, with
+    a sidecar of exactly its key."""
     if not entry:
         return False
-    doc = read_sidecar(local_root, entry["rel"])
+    doc = local_png_sidecar(local_root, entry["rel"], decode)
     return (doc is not None and doc["key"] == entry["key"]
-            and entry_file(local_root, entry["rel"], ".png").is_file())
+            and entry_file(local_root, entry["rel"],
+                           png_suffix(decode)).is_file())
 
 
-def store_local_entry(local_root, rel, png, sidecar):
-    """Mirror an entry's PNG + sidecar (sidecar last: it validates the
-    PNG)."""
-    entry_file(local_root, rel, ".json").unlink(missing_ok=True)
-    _atomic_write(entry_file(local_root, rel, ".png"), png)
-    _atomic_write(entry_file(local_root, rel, ".json"),
-                  json.dumps(sidecar, indent=1))
+def store_local_entry(local_root, rel, png, sidecar, decode):
+    """Mirror an entry's PNG (<rel><png_suffix>) + its sidecar with the
+    decode settings (sidecar last: it validates the PNG)."""
+    side = entry_file(local_root, rel, png_suffix(decode)[:-4] + ".json")
+    side.unlink(missing_ok=True)
+    _atomic_write(entry_file(local_root, rel, png_suffix(decode)), png)
+    _atomic_write(side, json.dumps({**sidecar, "decode": decode}, indent=1))
 
 
 def pair_label(p):
@@ -1826,11 +1913,11 @@ def pair_label(p):
     return f"{p['id']}  {p['width']}x{p['height']}  seed {p['seed']}"
 
 
-def pair_image_rel(entry_a, entry_b, label, labels):
+def pair_image_rel(entry_a, entry_b, label, labels, decode):
     """Local mirror path (no suffix) of a pair image: it depends on both
-    entries, the caption strip and the labels."""
+    entries, the decode settings, the caption strip and the labels."""
     return (f"{SAMPLER_VERSION}/pairs/"
-            + short_hash([entry_a["rel"], entry_b["rel"], label,
+            + short_hash([entry_a["rel"], entry_b["rel"], decode, label,
                           list(labels)], 32))
 
 
@@ -1838,31 +1925,65 @@ def pair_dir_name(a, b, stamp):
     return f"{a}_vs_{b}_{stamp}"
 
 
-def assemble_pair_dir(out_dir, prompts, pair, models_info, settings,
+def pair_dirs(pairs, out, out_root, stamp):
+    """The output dir of every pair (--out: that dir for one pair, the
+    parent for several; else out_root/<a>_vs_<b>_<stamp>). ValueError when
+    two pairs map to the same dir."""
+    if out:
+        dirs = ([Path(out)] if len(pairs) == 1 else
+                [Path(out) / pair_dir_name(a, b, stamp) for a, b in pairs])
+    else:
+        dirs = [Path(out_root) / pair_dir_name(a, b, stamp)
+                for a, b in pairs]
+    seen = {}
+    for pair, d in zip(pairs, dirs):
+        if d in seen:
+            raise ValueError(f"pairs {':'.join(seen[d])} and {':'.join(pair)}"
+                             f" would both be written to {d}; rename a label")
+        seen[d] = pair
+    return dirs
+
+
+def check_dirs_free(dirs):
+    """ValueError for a pair dir that already exists and is not empty (a
+    pair dir is never written over: stale images could stay behind)."""
+    for d in dirs:
+        if Path(d).exists() and any(Path(d).iterdir()):
+            raise ValueError(f"{d} already exists and is not empty; choose "
+                             "another --out (pair dirs are never overwritten)")
+
+
+def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
                       local_root=LOCAL_CACHE_ROOT, gen=None, run_id="",
                       title=None):
     """Write the pair dir A:B (A = "base" side, B = "ft" side) from the local
     mirror in the layout of the earlier runs (<id>_base.png, <id>_ft.png,
     <id>_pair.png, prompts.json with "labels", generate.json, index.html),
     so make_blind.py works unchanged. Each side's PNG is used only when the
-    mirror's sidecar has exactly the planned key; when both sides are
-    present, check_pairable(key A, key B) must pass (UnfairPairError
-    otherwise, before anything is written). A prompt missing on a side is
-    shown as "not generated". -> written paths."""
+    mirror's sidecar has exactly the planned key and decode settings;
+    check_pairable(key A, key B, decode A, decode B) must pass
+    (UnfairPairError otherwise, before anything is written). prompts.json
+    "prompts" (and the table) lists only the prompts with both images; the
+    others go to "incomplete" ({id, caption, have: [sides]}) and are named
+    in the index.html header. Refuses an existing non-empty out_dir.
+    -> written paths."""
+    check_dirs_free([out_dir])
     a, b = pair
     info = {m["label"]: m for m in models_info}
     ma, mb = info[a], info[b]
     decoded, rows, entries, devices = [], [], {}, set()
+    complete, incomplete = [], []
     for p in prompts:
         pid = p["id"]
-        files, keys = {}, {}
+        files, keys, decodes = {}, {}, {}
         for side, m in (("base", ma), ("ft", mb)):
             e = m["entries"].get(pid)
-            if not local_entry_ok(local_root, e):
+            if not local_entry_ok(local_root, e, decode):
                 continue
-            doc = read_sidecar(local_root, e["rel"])
-            files[side] = entry_file(local_root, e["rel"], ".png")
+            doc = local_png_sidecar(local_root, e["rel"], decode)
+            files[side] = entry_file(local_root, e["rel"], png_suffix(decode))
             keys[side] = doc["key"]
+            decodes[side] = doc["decode"]
             meta = doc.get("meta") or {}
             rows.append({"id": pid, "model": side,
                          "seconds": meta.get("seconds")})
@@ -1871,15 +1992,22 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings,
             entries.setdefault(pid, {})[side] = e["rel"]
         if len(keys) == 2:
             check_pairable(keys["base"], keys["ft"],
-                           where=f"pair {a}:{b}, prompt {pid}")
+                           f"pair {a}:{b}, prompt {pid}", decodes["base"],
+                           decodes["ft"])
             pimg = entry_file(local_root, pair_image_rel(
                 ma["entries"][pid], mb["entries"][pid], pair_label(p),
-                (a, b)), ".png")
+                (a, b), decode), ".png")
             if pimg.is_file():
                 files["pair"] = pimg
-        decoded.append({"id": pid, "png": files})
+            decoded.append({"id": pid, "png": files})
+            complete.append(p)
+        else:
+            incomplete.append({"id": pid, "caption": p["caption"],
+                               "have": sorted(keys)})
+            rows = [r for r in rows if r["id"] != pid]
+            entries.pop(pid, None)
     weights = {"base": ma["identity"], "ft": mb["identity"]}
-    n_both = sum(1 for d in decoded if "base" in d["png"] and "ft" in d["png"])
+    n_both = len(complete)
     gen_doc = {"weights": weights, "env": settings, "rows": rows,
                "pair": [a, b], "run_id": run_id,
                "devices": sorted(devices), "generate": gen}
@@ -1895,19 +2023,27 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings,
         + (f"{settings['text_encoder']['repo']} @ "
            f"{settings['text_encoder']['revision']}"
            if settings.get("text_encoder") else "unknown"),
+        f"decoded with {decode['vae']['repo']} @ "
+        f"{decode['vae'].get('revision')} ({decode['decode_version']}, "
+        f"{decode['torch']}, {decode['diffusers']})",
         f"{n_both}/{len(prompts)} prompts with both sides; entries sampled "
         f"on {sorted(devices) or ['?']} (from the cache {LOCAL_CACHE_ROOT.name}"
         f"/{SAMPLER_VERSION})",
-    ] + [f"NOTE: {n}" for n in (gen or {}).get("notes", [])]
+    ] + (["incomplete, left out of this dir: "
+          + ", ".join(f"{x['id']} (has {x['have'] or 'nothing'})"
+                      for x in incomplete)] if incomplete else []) + [
+        f"NOTE: {n}" for n in (gen or {}).get("notes", [])]
+    gen_doc["decode"] = decode
     return write_outputs(
-        out_dir, prompts, decoded, gen_doc,
+        out_dir, complete, decoded, gen_doc,
         title=title or f"Krea 2: {b} vs {a}", info_lines=info_lines,
-        labels=(a, b), extra={"pair": [a, b], "entries": entries})
+        labels=(a, b), extra={"pair": [a, b], "decode": decode,
+                              "entries": entries, "incomplete": incomplete})
 
 
 # ------------------------------------------------------------------ orchestration
-def decode_plan(prompts, pairs, models_info, local_root, use_cache=True,
-                regenerated=()):
+def decode_plan(prompts, pairs, models_info, local_root, decode,
+                use_cache=True, regenerated=()):
     """The decode work of a run: per prompt, an "entry" task for every entry
     a pair needs whose PNG the local mirror lacks (or that was regenerated
     this run, or every one with use_cache False), and a "pair" task for
@@ -1927,7 +2063,7 @@ def decode_plan(prompts, pairs, models_info, local_root, use_cache=True,
                 if not e or not e["latent"] or e["rel"] in fetched:
                     continue
                 if (use_cache and (label, pid) not in regenerated
-                        and local_entry_ok(local_root, e)):
+                        and local_entry_ok(local_root, e, decode)):
                     continue
                 tasks.append({"kind": "entry", "rel": e["rel"],
                               "key": e["key"]})
@@ -1936,7 +2072,7 @@ def decode_plan(prompts, pairs, models_info, local_root, use_cache=True,
             if not (ea and eb and ea["latent"] and eb["latent"]):
                 continue
             label = pair_label(p)
-            prel = pair_image_rel(ea, eb, label, (a, b))
+            prel = pair_image_rel(ea, eb, label, (a, b), decode)
             if (use_cache and (a, pid) not in regenerated
                     and (b, pid) not in regenerated
                     and entry_file(local_root, prel, ".png").is_file()):
@@ -1958,11 +2094,18 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
              out_root=LOCAL_OUT_ROOT, stamp=None, log=print):
     """The local entrypoint's flow (stdlib only; the stages are callables:
     prepare(**kw) -> prepare_impl's dict, generate(prompts, jobs, settings,
-    use_cache) -> generate_jobs_impl's dict, decode_map(chunks) -> iterable
-    of decode_tasks results). prepare + plan -> (unless --cache-only)
+    use_cache) -> generate_jobs_impl's dict, decode_map(chunks, decode) ->
+    iterable of decode_tasks results). The pair dirs are computed (and
+    duplicates / existing non-empty dirs refused) before any remote work. prepare + plan -> (unless --cache-only)
     generate the missing entries -> decode what the local mirror lacks ->
     one pair dir per pair. -> {"prompts", "todo", "gen", "dirs"}."""
     stamp = stamp or utc_stamp()
+    try:   # before any remote work
+        dirs = pair_dirs(pairs, out, out_root, stamp)
+        if not (only_prompts or cache_only):
+            check_dirs_free(dirs)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
     for label, key in models:
         src = f"hf {BASE_REPO}" if key == HF_BASE else f"r2 {key}"
         log(f"{label}: {src} -> {model_path(key)}")
@@ -1980,8 +2123,11 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
     for name, err in prep["errors"].items():
         log(f"  ERROR {name}: {err}")
     if prep["prompts"] is None:
-        raise SystemExit("no metadata.parquet on the volume: see the "
-                         "prepare errors above")
+        raise SystemExit(
+            "no metadata.parquet on the volume: "
+            + ("--cache-only does not download it; run once without "
+               "--cache-only (e.g. --only-prompts)" if cache_only
+               else "see the prepare errors above"))
     prompts = prep["prompts"]
     log("\n" + prompt_table(prompts) + "\n")
     result = {"prompts": prompts, "todo": None, "gen": None, "dirs": []}
@@ -1991,12 +2137,13 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
         raise SystemExit("no prompts")
     if prep["errors"] and not cache_only:
         raise SystemExit(f"prepare failed: {sorted(prep['errors'])}")
-    settings, info = prep["settings"], prep["models"]
+    settings, info, decode = prep["settings"], prep["models"], prep["decode"]
     ids = [p["id"] for p in prompts]
     todo = plan_generation(info, ids, use_cache)
     result["todo"] = todo
     local_ok = {(m["label"], pid): use_cache and local_entry_ok(
-        local_root, m["entries"].get(pid)) for m in info for pid in ids}
+        local_root, m["entries"].get(pid), decode)
+        for m in info for pid in ids}
     log(f"cache ({VOLUME_NAME}:{VOL_GEN}/{SAMPLER_VERSION}, local "
         f"{local_root}/{SAMPLER_VERSION}"
         + ("" if use_cache else "; --no-cache: everything regenerated")
@@ -2007,8 +2154,9 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
     if cache_only:
         return result
     unknown = [m["label"] for m in info if not m["identity"]]
-    if unknown or settings.get("text_encoder") is None:
-        raise SystemExit(f"identity unknown after prepare: {unknown or 'text encoder'}")
+    if unknown or settings.get("text_encoder") is None or decode is None:
+        raise SystemExit("identity unknown after prepare: "
+                         f"{unknown or 'text encoder / VAE'}")
     regenerated = set()
     if todo:
         t0 = time.time()
@@ -2037,16 +2185,19 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
             pid, _, label = tag.partition("_")
             by_label[label]["entries"][pid]["latent"] = True
         result["gen"] = gen
-    chunks_ = decode_plan(prompts, pairs, info, local_root, use_cache,
-                          regenerated)
+    chunks_ = decode_plan(prompts, pairs, info, local_root, decode,
+                          use_cache, regenerated)
     if chunks_:
         t0 = time.time()
         n_dec = n_png = 0
-        for res in decode_map(chunks_):
+        for res in decode_map(chunks_, decode):
             for r in res:
                 if r["kind"] == "entry":
+                    if r["decode"] != decode:
+                        raise SystemExit(f"{r['rel']}: decoded with "
+                                         f"{r['decode']}, planned {decode}")
                     store_local_entry(local_root, r["rel"], r["png"],
-                                      r["sidecar"])
+                                      r["sidecar"], decode)
                     n_dec += bool(r["decoded"])
                     n_png += 1
                 else:
@@ -2059,14 +2210,9 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
         k: result["gen"].get(k) for k in ("notes", "timings", "skipped",
                                           "env", "text", "written",
                                           "already_cached")}
-    for a, b in pairs:
-        if out:
-            d = (Path(out) if len(pairs) == 1
-                 else Path(out) / pair_dir_name(a, b, stamp))
-        else:
-            d = Path(out_root) / pair_dir_name(a, b, stamp)
+    for (a, b), d in zip(pairs, dirs):
         paths = assemble_pair_dir(d, prompts, (a, b), info, settings,
-                                  local_root, gen=gen_summary,
+                                  decode, local_root, gen=gen_summary,
                                   run_id=f"eval_{stamp}")
         log(f"\n{a} vs {b}: wrote {len(paths)} files to {d}")
         log(f"open {d / 'index.html'}")
@@ -2133,14 +2279,16 @@ if modal is not None:
 
     @app.function(image=cpu_image, cpu=float(DECODE_CPU),
                   timeout=DECODE_TIMEOUT_S, volumes={VOL: vol})
-    def decode(tasks: list) -> list:
+    def decode(tasks: list, decode: dict) -> list:
         _remote_path()
         import torch
 
         torch.set_num_threads(DECODE_CPU)
         vol.reload()
         try:
-            return decode_tasks(tasks, VOL_GEN, lambda: load_vae(VOL_VAE))
+            return decode_tasks(tasks, VOL_GEN, lambda: load_vae(VOL_VAE),
+                                decode,
+                                current=decode_settings(vae_identity()))
         finally:
             vol.commit()   # decoded PNGs
 
@@ -2164,7 +2312,8 @@ if modal is not None:
         run_eval(
             prepare=lambda **kw: prepare.remote(**kw),
             generate=lambda *a: generate.with_options(gpu=gpu).remote(*a),
-            decode_map=lambda chunks_: decode.map(chunks_),
+            decode_map=lambda chunks_, dec: decode.map(
+                chunks_, kwargs={"decode": dec}),
             models=ms, pairs=ps, n_dataset=n_dataset, n_ood=n_ood,
             steps=steps, cfg=cfg, seed=seed, only_prompts=only_prompts,
             limit=limit, gpu=gpu, out=out, use_cache=cache,

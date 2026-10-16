@@ -763,11 +763,15 @@ def test_decode_and_outputs(tmp_path):
              {"kind": "pair", "name": "pair base:ft, prompt 00", "rel": "x",
               "a": e0b, "b": e0f, "label": mef.pair_label(p0),
               "labels": ["base", "ft"]}]
-    dec = mef.decode_tasks(tasks, root, vae_loader, log=lambda *_: None)
+    vae_a = {"repo": mef.VAE_REPO, "revision": "vae-1"}
+    D = mef.decode_settings(vae_a)
+    dec = mef.decode_tasks(tasks, root, vae_loader, D, current=D,
+                           log=lambda *_: None)
     assert loads == [1], loads   # the VAE loads lazily, once
     assert [d["kind"] for d in dec] == ["entry", "entry", "pair"]
     assert dec[0]["decoded"] and dec[0]["sidecar"]["key"] == e0b["key"]
-    assert (root / (e0b["rel"] + ".png")).is_file()
+    assert dec[0]["decode"] == D
+    assert (root / (e0b["rel"] + mef.png_suffix(D))).is_file()
     img = Image.open(io.BytesIO(dec[0]["png"]))
     assert img.size == (p0["width"], p0["height"])
     # decode math (sample.py): x * std + mean, tanh stub, [-1, 1] -> uint8
@@ -781,15 +785,33 @@ def test_decode_and_outputs(tmp_path):
     assert pair.size[0] == 2 * p0["width"] and pair.size[1] > p0["height"]
     assert dec[2]["rel"] == "x"
     # second call: the PNGs come from the volume, no VAE
-    dec2 = mef.decode_tasks(tasks[:2], root, vae_loader, log=lambda *_: None)
+    dec2 = mef.decode_tasks(tasks[:2], root, vae_loader, D,
+                            log=lambda *_: None)
     assert loads == [1] and not dec2[0]["decoded"]
     assert dec2[0]["png"] == dec[0]["png"]
+    # another VAE identity: the cached PNG is not reused, the latents are
+    # decoded again into a PNG of its own
+    D2 = mef.decode_settings({**vae_a, "revision": "vae-2"})
+    assert mef.png_suffix(D2) != mef.png_suffix(D)
+    dec3 = mef.decode_tasks(tasks[:1], root, vae_loader, D2,
+                            log=lambda *_: None)
+    assert dec3[0]["decoded"] and loads == [1, 1] and dec3[0]["decode"] == D2
+    assert (root / (e0b["rel"] + mef.png_suffix(D))).is_file()
+    assert (root / (e0b["rel"] + mef.png_suffix(D2))).is_file()
+    # the container's own VAE is not the planned one: refused
+    try:
+        mef.decode_tasks(tasks[:1], root, vae_loader, D, current=D2,
+                         log=lambda *_: None)
+    except RuntimeError as e:
+        assert "decode settings" in str(e), e
+    else:
+        raise AssertionError("decode with another VAE accepted")
     # a key that is not the entry's / a missing entry: refused
     bad = {**e0b, "key": {**e0b["key"], "model": mb}}
     for t in ({"kind": "entry", **bad},
               {"kind": "entry", "rel": e0b["rel"][:-1] + "0", "key": {}}):
         try:
-            mef.decode_tasks([t], root, vae_loader, log=lambda *_: None)
+            mef.decode_tasks([t], root, vae_loader, D, log=lambda *_: None)
         except RuntimeError as e:
             assert "no valid cache entry" in str(e)
         else:
@@ -797,7 +819,7 @@ def test_decode_and_outputs(tmp_path):
     # fairness inside decode: entries with other steps are not paired
     e_other = fake_entry(root, p0, mb, lat0, steps=3)
     try:
-        mef.decode_tasks([{**tasks[2], "b": e_other}], root, vae_loader,
+        mef.decode_tasks([{**tasks[2], "b": e_other}], root, vae_loader, D,
                          log=lambda *_: None)
     except mef.UnfairPairError as e:
         assert "sampler.steps" not in str(e) and "steps: 2 vs 3" in str(e), e

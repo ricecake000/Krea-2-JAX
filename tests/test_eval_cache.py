@@ -12,13 +12,20 @@
     mapping, mixing / duplicate / unknown-label errors, local CLI
   * the planner: which (model, prompt) entries are generated, fully cached
     models are not loaded, run_models with per-model prompt subsets
+  * decode settings: VAE identity (revision, else file sizes) in the PNG
+    name / mirror sidecar / pair-image key / fairness; another VAE ->
+    re-decode, latents reused
   * pair-dir assembly in the exact make_blind.py layout (make_blind.py run
-    on it when krea2-ops is present)
+    on it when krea2-ops is present), incomplete prompts left out of
+    "prompts" (make_blind.py on a partial dir), existing non-empty dirs and
+    colliding dir names refused
   * end to end (run_eval with the real prepare_impl / generate_jobs_impl /
     decode_tasks on a tiny DiT + text tower, a temp "volume" and a stub
     VAE): run 1 samples 2 models; run 2 adds a third model and only that
     one is downloaded, loaded and sampled; run 3 is fully cached (no
-    generate, no decode); --cache-only; --no-cache regenerates
+    generate, no decode); --cache-only (never downloads the parquet); an
+    existing --out refused before prepare; a new VAE revision re-decodes
+    without generating; --no-cache regenerates
 
     python tests/test_eval_cache.py      # or: pytest tests/test_eval_cache.py
 """
@@ -206,12 +213,20 @@ def test_cache_key(tmp_path):
         assert np.array_equal(z["latent"], lat)
     doc = json.loads((root / (rel + ".json")).read_text())
     assert doc == {"hash": h, "key": k, "meta": {"seconds": 1.0}}, doc
-    (root / (rel + ".png")).write_bytes(b"png")
-    assert mef.entry_status(root, k) == {"latent": True, "png": True}
+    D = mef.decode_settings({"repo": mef.VAE_REPO, "revision": "v1"})
+    D2 = mef.decode_settings({"repo": mef.VAE_REPO, "revision": "v2"})
+    assert mef.png_suffix(D) != mef.png_suffix(D2)
+    (root / (rel + mef.png_suffix(D))).write_bytes(b"png")
+    (root / (rel + mef.png_suffix(D2))).write_bytes(b"png2")
+    assert mef.entry_status(root, k, D) == {"latent": True, "png": True}
+    assert mef.entry_status(root, k)["png"] is False   # decode unknown
+    D3 = mef.decode_settings({"repo": mef.VAE_REPO, "revision": "v3"})
+    assert mef.entry_status(root, k, D3)["png"] is False
     assert not list(root.rglob("*.tmp"))
-    # a rewrite drops the stale PNG
+    # a rewrite drops the stale PNGs (of every decode)
     mef.write_entry(root, k, lat + 1, {"seconds": 2.0})
-    assert mef.entry_status(root, k) == {"latent": True, "png": False}
+    assert mef.entry_status(root, k, D) == {"latent": True, "png": False}
+    assert not list(root.rglob("*.png"))
     # a sidecar whose key does not map to its file name is not an entry
     other = with_sampler(steps=3)
     doc["key"] = other
@@ -225,6 +240,27 @@ def test_cache_key(tmp_path):
     assert mef.entry_status(root, k)["latent"] is False
     print(f"    cache key: canonical, {len(variants)} key parts each change "
           "the hash, cfg-0 normalization, entry files")
+
+
+def test_decode_identity(tmp_path):
+    vdir = tmp_path / "vae"
+    assert mef.vae_identity(vdir) is None and mef.decode_settings(None) is None
+    (vdir / "vae").mkdir(parents=True)
+    (vdir / "vae" / "w.safetensors").write_bytes(b"x" * 5)
+    mef.write_marker(vdir, mef.VAE_REPO, mef.VAE_PATTERNS, revision="abc")
+    v = mef.vae_identity(vdir)
+    assert v == {"repo": mef.VAE_REPO, "revision": "abc"}, v
+    d = mef.decode_settings(v)
+    assert d == {"decode_version": mef.DECODE_VERSION, "vae": v,
+                 "vae_dtype": "float32", "torch": mef.TORCH_PIN,
+                 "diffusers": "diffusers==0.40.0"}, d
+    # no recorded revision: the file sizes stand in for it
+    mef.write_marker(vdir, mef.VAE_REPO, mef.VAE_PATTERNS)
+    v2 = mef.vae_identity(vdir)
+    assert v2 == {"repo": mef.VAE_REPO, "revision": None,
+                  "files": {"vae/w.safetensors": 5}}, v2
+    assert mef.png_suffix(mef.decode_settings(v2)) != mef.png_suffix(d)
+    print("    VAE identity (revision, else file sizes), decode settings")
 
 
 def test_fairness(tmp_path):
@@ -266,6 +302,13 @@ def test_fairness(tmp_path):
            "cfg_batch: True vs '<absent>'")
     raises(mef.UnfairPairError, lambda: mef.check_pairable(ka, {"x": 1}),
            "not a cache key")
+    # both images must be decoded under the same decode settings
+    D = mef.decode_settings({"repo": mef.VAE_REPO, "revision": "v1"})
+    D2 = mef.decode_settings({"repo": mef.VAE_REPO, "revision": "v2"})
+    mef.check_pairable(ka, kb, "t", D, copy.deepcopy(D))
+    raises(mef.UnfairPairError, lambda: mef.check_pairable(ka, kb, "t", D,
+                                                          D2),
+           "different decode settings", "v2")
     assert issubclass(mef.UnfairPairError, ValueError)
     print(f"    fairness: model-only difference ok, {len(cases)} sampler "
           "differences refused")
@@ -437,11 +480,15 @@ def test_planner(tmp_path):
           "loaded, per-model subsets, dropped-after-skip")
 
 
-def mirror_entry(local_root, info_row, pid, color):
+D_TEST = mef.decode_settings({"repo": mef.VAE_REPO, "revision": "vae-rev"})
+
+
+def mirror_entry(local_root, info_row, pid, color, decode=D_TEST):
     e = info_row["entries"][pid]
     mef.store_local_entry(local_root, e["rel"], tiny_png(color),
                           {"hash": e["hash"], "key": e["key"],
-                           "meta": {"seconds": 2.5, "device": "cpu"}})
+                           "meta": {"seconds": 2.5, "device": "cpu"}},
+                          decode)
 
 
 def run_make_blind(d):
@@ -456,6 +503,7 @@ def run_make_blind(d):
 
 
 def test_pair_dir_assembly(tmp_path):
+    D = D_TEST
     ps = prompts_n(3)
     ids = [p["id"] for p in ps]
     local = tmp_path / "cache"
@@ -465,12 +513,16 @@ def test_pair_dir_assembly(tmp_path):
         mirror_entry(local, a, pid, (200, 0, 0))
         mirror_entry(local, b, pid, (0, 0, 200))
     pimg = mef.pair_image_rel(a["entries"][ids[0]], b["entries"][ids[0]],
-                              mef.pair_label(ps[0]), ("run1raw", "run2"))
+                              mef.pair_label(ps[0]), ("run1raw", "run2"), D)
+    assert pimg != mef.pair_image_rel(
+        a["entries"][ids[0]], b["entries"][ids[0]], mef.pair_label(ps[0]),
+        ("run1raw", "run2"), mef.decode_settings({"repo": "x",
+                                                  "revision": "y"}))
     (local / (pimg + ".png")).parent.mkdir(parents=True, exist_ok=True)
     (local / (pimg + ".png")).write_bytes(tiny_png((9, 9, 9)))
     settings = mef.sampler_settings(28, 4.5, TE)
     d = tmp_path / "run1raw_vs_run2_x"
-    mef.assemble_pair_dir(d, ps, ("run1raw", "run2"), [a, b], settings,
+    mef.assemble_pair_dir(d, ps, ("run1raw", "run2"), [a, b], settings, D,
                           local, run_id="eval_x")
     names = sorted(x.name for x in d.iterdir())
     want = sorted([f"{i}_{s}.png" for i in ids for s in ("base", "ft")]
@@ -483,25 +535,53 @@ def test_pair_dir_assembly(tmp_path):
     assert doc["labels"] == {"base": "run1raw", "ft": "run2"}
     assert doc["pair"] == ["run1raw", "run2"]
     assert doc["weights"] == {"base": a["identity"], "ft": b["identity"]}
-    assert doc["settings"] == settings
+    assert doc["settings"] == settings and doc["decode"] == D
+    assert doc["incomplete"] == []
     assert doc["entries"][ids[0]] == {"base": a["entries"][ids[0]]["rel"],
                                       "ft": b["entries"][ids[0]]["rel"]}
+    assert [p["id"] for p in doc["prompts"]] == ids
     for p in doc["prompts"]:
         assert {"id", "source", "caption"} <= set(p)
         assert p["seconds"] == {"base": 2.5, "ft": 2.5}
     page = (d / "index.html").read_text()
     assert "<th>run1raw</th><th>run2</th>" in page
     assert "Krea 2: run2 vs run1raw" in page and "cfg_batch True" in page
+    assert "vae-rev" in page
     out = run_make_blind(d)
     if out is not None:
         assert "3 pairs" in out, out
-    # a side missing in the mirror: shown as not generated
-    (local / (b["entries"][ids[2]]["rel"] + ".png")).unlink()
+    # an existing non-empty pair dir is never written over
+    raises(ValueError, lambda: mef.assemble_pair_dir(
+        d, ps, ("run1raw", "run2"), [a, b], settings, D, local),
+        "already exists and is not empty")
+    # a side missing in the mirror: the prompt is left out of "prompts"
+    # (make_blind.py still works) and listed as incomplete
+    (local / (b["entries"][ids[2]]["rel"] + mef.png_suffix(D))).unlink()
     d2 = tmp_path / "partial"
-    mef.assemble_pair_dir(d2, ps, ("run1raw", "run2"), [a, b], settings,
+    d2.mkdir()   # an existing EMPTY dir is fine
+    mef.assemble_pair_dir(d2, ps, ("run1raw", "run2"), [a, b], settings, D,
                           local)
     assert not (d2 / f"{ids[2]}_ft.png").exists()
-    assert "run2: not generated" in (d2 / "index.html").read_text()
+    assert not (d2 / f"{ids[2]}_base.png").exists()
+    doc2 = json.loads((d2 / "prompts.json").read_text())
+    assert [p["id"] for p in doc2["prompts"]] == ids[:2]
+    assert doc2["incomplete"] == [{"id": ids[2], "caption": ps[2]["caption"],
+                                   "have": ["base"]}], doc2["incomplete"]
+    assert ids[2] not in doc2["entries"]
+    page2 = (d2 / "index.html").read_text()
+    import html as _html
+    assert _html.escape(f"incomplete, left out of this dir: {ids[2]} (has "
+                        "['base'])") in page2, page2
+    out = run_make_blind(d2)
+    if out is not None:
+        assert "2 pairs" in out, out
+    # PNGs decoded under other decode settings (another VAE) are not used
+    d4 = tmp_path / "othervae"
+    D2 = mef.decode_settings({"repo": mef.VAE_REPO, "revision": "other"})
+    mef.assemble_pair_dir(d4, ps, ("run1raw", "run2"), [a, b], settings, D2,
+                          local)
+    doc4 = json.loads((d4 / "prompts.json").read_text())
+    assert doc4["prompts"] == [] and len(doc4["incomplete"]) == 3
     # FAIRNESS: b's entries sampled with other steps -> refused, nothing
     # written
     c = fake_info("run2", "k/run2", R2_ID, ps, {})
@@ -513,15 +593,30 @@ def test_pair_dir_assembly(tmp_path):
         mirror_entry(local, c, pid, (0, 200, 0))
     d3 = tmp_path / "unfair"
     raises(mef.UnfairPairError, lambda: mef.assemble_pair_dir(
-        d3, ps, ("run1raw", "run2"), [a, c], settings, local),
+        d3, ps, ("run1raw", "run2"), [a, c], settings, D, local),
         "steps: 28 vs 20", f"prompt {ids[0]}")
     assert not d3.exists()
     # a mirror sidecar whose key is not the planned one: not used
     bad = copy.deepcopy(b)
     bad["entries"][ids[0]]["key"] = c["entries"][ids[0]]["key"]
-    assert not mef.local_entry_ok(local, bad["entries"][ids[0]])
-    print("    pair dir: exact make_blind layout, labels, entries, missing "
-          "side, unfair pair refused before writing")
+    assert not mef.local_entry_ok(local, bad["entries"][ids[0]], D)
+    assert mef.local_entry_ok(local, b["entries"][ids[0]], D)
+    assert not mef.local_entry_ok(local, b["entries"][ids[0]], D2)
+    # output dirs: computed up front, duplicates refused
+    assert mef.pair_dirs([("a", "b"), ("c", "d")], "", tmp_path, "s") == [
+        tmp_path / "a_vs_b_s", tmp_path / "c_vs_d_s"]
+    assert mef.pair_dirs([("a", "b")], str(tmp_path / "o"), tmp_path,
+                         "s") == [tmp_path / "o"]
+    assert mef.pair_dirs([("a", "b"), ("c", "d")], str(tmp_path / "o"),
+                         tmp_path, "s")[1] == tmp_path / "o" / "c_vs_d_s"
+    raises(ValueError, lambda: mef.pair_dirs(
+        [("x_vs_y", "z"), ("x", "y_vs_z")], "", tmp_path, "s"),
+        "would both be written to")
+    mef.check_dirs_free([tmp_path / "nope", d2.parent / "empty"])
+    raises(ValueError, lambda: mef.check_dirs_free([d]), "not empty")
+    print("    pair dir: exact make_blind layout, decode settings, existing "
+          "dir refused, incomplete prompts left out (make_blind ok), other "
+          "VAE not used, unfair pair refused before writing, dir names")
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +643,8 @@ class World:
         self.patch = {
             "VOL_DATA": str(vol / "data"), "VOL_TEXT": str(vol / "te"),
             "VOL_BASE": str(vol / "base"), "VOL_FT_ROOT": str(vol / "ft"),
-            "VOL_R2": str(vol / "r2"), "OOD_SIZE": (32, 48),
+            "VOL_R2": str(vol / "r2"), "VOL_VAE": str(vol / "vae"),
+            "OOD_SIZE": (32, 48),
         }
         self.gen_root = vol / "gen"
         self.local = self.tmp / "local-cache"
@@ -559,6 +655,7 @@ class World:
         te, _ = make_tiny_text_encoder_dir(Path(self.patch["VOL_TEXT"]))
         mef.write_marker(te, mef.TEXT_REPO, mef.TEXT_PATTERNS,
                          revision="te-sha")
+        self.set_vae("vae-sha-1")
         base = Path(self.patch["VOL_BASE"])
         base.mkdir(parents=True)
         make_tiny_dit(base / mef.BASE_FILE, 0)
@@ -576,6 +673,13 @@ class World:
         self.impl_kw = dict(text_overrides=TEXT_OVERRIDES,
                             model_cfg=Krea2Config(**TINY), log=quiet)
         self.stub_vae = StubVAE
+
+    def set_vae(self, revision):
+        vae = Path(self.patch["VOL_VAE"])
+        (vae / "vae").mkdir(parents=True, exist_ok=True)
+        (vae / "vae" / "config.json").write_text("{}")
+        mef.write_marker(vae, mef.VAE_REPO, mef.VAE_PATTERNS,
+                         revision=revision)
 
     def head(self, key):
         src, etag = self.objects[key]
@@ -630,17 +734,25 @@ class World:
                                       if k.startswith("load_")))
             return json.loads(json.dumps(res))   # Modal: plain JSON
 
-        def decode_map(chunks_):
+        def decode_map(chunks_, decode):
             world.decode_calls.extend(chunks_)
+            current = mef.decode_settings(mef.vae_identity())   # patched
             return [mef.decode_tasks(json.loads(json.dumps(c)),
                                      world.gen_root,
-                                     lambda: world.stub_vae(4), log=quiet)
+                                     lambda: world.stub_vae(4), decode,
+                                     current=current, log=quiet)
                     for c in chunks_]
+        world.prepare_calls = getattr(world, "prepare_calls", 0)
+
+        def counted_prepare(**pkw):
+            world.prepare_calls += 1
+            return prepare(**pkw)
 
         ms, ps = mef.resolve_models(models, pairs)
         with self.patched():
             return mef.run_eval(
-                prepare=prepare, generate=generate, decode_map=decode_map,
+                prepare=counted_prepare, generate=generate,
+                decode_map=decode_map,
                 models=ms, pairs=ps, n_dataset=0, n_ood=2,
                 local_root=self.local, out_root=self.out_root, stamp=stamp,
                 log=quiet, **{"steps": 2, **kw})
@@ -725,6 +837,37 @@ def test_end_to_end_tiny(tmp_path):
     res5 = w.run(f"base=hf-base,run1={r1k}", "", "t5", steps=3,
                  cache_only=True)
     assert res5["todo"] == {"base": ids, "run1": ids}
+
+    # an existing non-empty --out is refused before any remote work
+    n_prep = w.prepare_calls
+    raises(SystemExit, lambda: w.run(f"base=hf-base,run1={r1k}", "", "t8",
+                                     out=str(d1)),
+           "already exists and is not empty")
+    assert w.prepare_calls == n_prep
+    # --cache-only never downloads the parquet: none on the volume -> stop
+    pq = Path(w.patch["VOL_DATA"]) / mef.PARQUET
+    pq.rename(pq.with_suffix(".bak"))
+    try:
+        raises(SystemExit, lambda: w.run(f"base=hf-base,run1={r1k}", "",
+                                         "t9", cache_only=True),
+               "--cache-only does not download it")
+    finally:
+        pq.with_suffix(".bak").rename(pq)
+
+    # another VAE revision: latents reused (no generate), every needed
+    # entry decoded again into its own PNG; the old PNGs stay
+    n_vol_png = len(list(w.gen_root.rglob("*.png")))
+    w.set_vae("vae-sha-2")
+    w.generate_calls.clear(), w.decode_calls.clear()
+    res7 = w.run(f"base=hf-base,run1={r1k}", "", "t7")
+    assert res7["todo"] == {} and not w.generate_calls
+    ent7 = [t for c in w.decode_calls for t in c if t["kind"] == "entry"]
+    assert len(ent7) == 4, ent7
+    assert len(list(w.gen_root.rglob("*.png"))) == n_vol_png + 4
+    doc7 = json.loads((res7["dirs"][0] / "prompts.json").read_text())
+    assert doc7["decode"]["vae"]["revision"] == "vae-sha-2"
+    assert doc1["decode"]["vae"]["revision"] == "vae-sha-1"
+    assert [p["id"] for p in doc7["prompts"]] == ids
 
     # --no-cache: every entry regenerated and re-decoded
     w.generate_calls.clear(), w.decode_calls.clear()
