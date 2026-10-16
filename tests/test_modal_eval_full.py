@@ -21,7 +21,10 @@ weights:
     encoder (attn cudnn = dot_product_attention's xla path on CPU):
     latent shapes, same seed for both models (identical checkpoints give
     identical latents), padded == compacted text, deadline skipping
-  * decode (stub VAE), pair image, prompts.json / index.html writing
+  * decode_tasks (stub VAE, PNG cached on the "volume", lazy VAE, fairness
+    before a pair image), pair image, prompts.json / index.html writing
+  * generate_impl cfg_batch (default) vs the two-call path, per-model
+    prompt subsets
 
     python tests/test_modal_eval_full.py      # or: pytest tests/test_modal_eval_full.py
 """
@@ -43,6 +46,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 sys.path.insert(0, str(REPO / "scripts"))
+
+import io
 
 import numpy as np
 
@@ -217,14 +222,27 @@ def test_cli_and_estimate(tmp_path):
                        capture_output=True, text=True, timeout=120)
     assert p.returncode == 0 and "--only-prompts" in p.stdout, p.stderr
     assert mef.check_gpu("b300") == "B300"
-    prompts = [{"width": 1024, "height": 1024}] * 10
+    prompts = [{"id": f"{i:02d}", "width": 1024, "height": 1024}
+               for i in range(10)]
     e = mef.estimate(prompts, 28, 4.5, "H100")
-    sample_s = 10 * 2 * 14.0
-    want_s = mef.EST_LOAD_S + mef.EST_COMPILE_S + sample_s
+    sample_s = 10 * 2 * mef.EST_S_PER_MP_IMAGE["H100"]
+    want_s = (mef.EST_START_S + 2 * mef.EST_MODEL_LOAD_S + mef.EST_COMPILE_S
+              + sample_s)
     assert abs(e["minutes"] - want_s / 60) < 1e-9 and e["images"] == 20
+    assert e["models"] == 2
     usd_h = 3.95 + mef.GENERATE_CPU * 0.0472 + mef.GENERATE_MEM_GIB * 0.00799
     assert abs(e["usd"] - want_s / 3600 * usd_h) < 1e-9
     assert mef.estimate(prompts, 28, 0, "H100")["minutes"] < e["minutes"]
+    # N models, cached entries cost nothing, fully cached -> 0
+    ids = [p["id"] for p in prompts]
+    e3 = mef.estimate(prompts, 28, 4.5, "H100",
+                      {"a": ids, "b": ids[:4], "c": []})
+    want3 = (mef.EST_START_S + 2 * mef.EST_MODEL_LOAD_S + mef.EST_COMPILE_S
+             + 14 * mef.EST_S_PER_MP_IMAGE["H100"])
+    assert abs(e3["minutes"] - want3 / 60) < 1e-9, e3
+    assert e3["images"] == 14 and e3["models"] == 2, e3
+    assert mef.estimate(prompts, 28, 4.5, "H100", {"a": [], "b": []}) == {
+        "minutes": 0.0, "usd": 0.0, "images": 0, "models": 0}
     print("    local --only-prompts / --help / --gpu validation, estimate")
 
 
@@ -390,11 +408,10 @@ def test_keys_and_labels(tmp_path):
             assert "--labels" in str(e)
         else:
             raise AssertionError(f"--labels {bad!r} accepted")
-    assert mef.side_paths() == (("base", "/vol/base/raw.safetensors"),
-                                ("ft", "/vol/ft/run1/model.safetensors"))
-    assert mef.side_paths("x/ft.safetensors", mef.R2_KEY) == (
-        ("base", "/vol/ft/run1/model.safetensors"),
-        ("ft", "/vol/r2/x/ft.safetensors"))
+    assert mef.model_path(mef.HF_BASE) == Path("/vol/base/raw.safetensors")
+    assert mef.model_path(mef.R2_KEY) == Path("/vol/ft/run1/model.safetensors")
+    assert mef.model_path("x/ft.safetensors") == Path(
+        "/vol/r2/x/ft.safetensors")
     assert mef.check_sides(mef.R2_KEY, "", "a,b") == ("a", "b")
     for args in (("a/../b", "", "base,ft"), (mef.R2_KEY, "/x", "base,ft"),
                  (mef.R2_KEY, "", "same,same")):
@@ -464,13 +481,8 @@ def test_keys_and_labels(tmp_path):
 
     # labels on the outputs (files keep the side names)
     prompts = tiny_prompts()[:1]
-    lat = tmp_path / "lat"
-    lat.mkdir()
     p = prompts[0]
-    np.save(lat / f"{p['id']}_base.npy", np.zeros(
-        (1, 4, p["height"] // 8, p["width"] // 8), np.float32))
-    dec = mef.decode_items(prompts, lat, StubVAE(4), log=lambda *_: None,
-                           labels=("run1-ema", "run1-raw"))
+    dec = [{"id": p["id"], "png": {"base": b"png bytes"}}]
     out = tmp_path / "out"
     mef.write_outputs(out, prompts, dec, {"weights": w, "env": {}, "rows": []},
                       title="t", labels=("run1-ema", "run1-raw"))
@@ -669,6 +681,20 @@ def test_generate_tiny(tmp_path):
         err = float(np.abs(x - y).max() / np.abs(y).max())
         assert err < 5e-2, (p["id"], err)
 
+    # cfg_batch (the default, one batch-2 forward) vs the two-call path
+    assert res["env"]["cfg_batch"] is True, res["env"]
+    out4 = tmp_path / "lat4"
+    res4 = mef.generate_impl(prompts, (("base", a, [prompts[1]["id"]]),),
+                             te_dir, out4, cfg_batch=False, **kw)
+    assert [r["id"] for r in res4["rows"]] == [prompts[1]["id"]], res4["rows"]
+    assert res4["env"]["cfg_batch"] is False
+    assert sorted(x.name for x in out4.iterdir()) == [
+        f"{prompts[1]['id']}_base.npy"]
+    x = np.load(out4 / f"{prompts[1]['id']}_base.npy")
+    y = np.load(out / f"{prompts[1]['id']}_base.npy")
+    err = float(np.abs(x - y).max() / np.abs(y).max())
+    assert err < 5e-2, err   # bf16 DiT: batched == two calls up to rounding
+
     # a deadline in the past: nothing sampled, every sample reported skipped
     res3 = mef.generate_impl(prompts, (("base", a), ("ft", b)), te_dir,
                              tmp_path / "lat3", deadline=time.time() - 1, **kw)
@@ -698,60 +724,142 @@ class StubVAE:
         return SimpleNamespace(sample=torch.tanh(x))
 
 
+def fake_entry(root, prompt, model, latent, steps=2, **settings_kw):
+    """A cache entry for (model identity dict, prompt) under root."""
+    settings = mef.sampler_settings(steps, 4.5, {"repo": "te", "revision": "r"},
+                                    **settings_kw)
+    key = mef.entry_key(settings, prompt, model)
+    rel = mef.write_entry(root, key, latent, {"seconds": 1.5,
+                                              "device": "cpu"})
+    return {"rel": rel, "key": key}
+
+
 def test_decode_and_outputs(tmp_path):
     from PIL import Image
 
     prompts = tiny_prompts()
-    lat_dir = tmp_path / "lat"
-    lat_dir.mkdir()
+    root = tmp_path / "gen"
     rng = np.random.default_rng(0)
-    for p, models in zip(prompts, (("base", "ft"), ("base",), ())):
-        for m in models:
-            np.save(lat_dir / f"{p['id']}_{m}.npy", rng.standard_normal(
-                (1, 4, p["height"] // 8, p["width"] // 8)).astype(np.float32))
-    dec = mef.decode_items(prompts, lat_dir, StubVAE(4), log=lambda *_: None)
-    assert [d["missing"] for d in dec] == [[], ["ft"], ["base", "ft"]]
-    assert sorted(dec[0]["png"]) == ["base", "ft", "pair"]
-    assert sorted(dec[1]["png"]) == ["base", "pair"] and dec[2]["png"] == {}
-    import io
+    ma = {"repo": mef.BASE_REPO, "revision": "abc", "file": mef.BASE_FILE,
+          "size": 1}
+    mb = {"key": mef.R2_KEY, "etag": "e9", "size": 2,
+          "last_modified": "2026-10-14T03:00:00+00:00"}
+    ents = {}
+    for p in prompts[:2]:
+        for name, m in (("base", ma), ("ft", mb)):
+            ents[(p["id"], name)] = fake_entry(
+                root, p, m, rng.standard_normal(
+                    (1, 4, p["height"] // 8, p["width"] // 8)).astype(
+                    np.float32))
+    p0 = prompts[0]
+    e0b, e0f = ents[(p0["id"], "base")], ents[(p0["id"], "ft")]
+    loads = []
 
-    img = Image.open(io.BytesIO(dec[0]["png"]["base"]))
-    assert img.size == (prompts[0]["width"], prompts[0]["height"])
+    def vae_loader():
+        loads.append(1)
+        return StubVAE(4)
+
+    tasks = [{"kind": "entry", **e0b}, {"kind": "entry", **e0f},
+             {"kind": "pair", "name": "pair base:ft, prompt 00", "rel": "x",
+              "a": e0b, "b": e0f, "label": mef.pair_label(p0),
+              "labels": ["base", "ft"]}]
+    vae_a = {"repo": mef.VAE_REPO, "revision": "vae-1"}
+    D = mef.decode_settings(vae_a)
+    dec = mef.decode_tasks(tasks, root, vae_loader, D, current=D,
+                           log=lambda *_: None)
+    assert loads == [1], loads   # the VAE loads lazily, once
+    assert [d["kind"] for d in dec] == ["entry", "entry", "pair"]
+    assert dec[0]["decoded"] and dec[0]["sidecar"]["key"] == e0b["key"]
+    assert dec[0]["decode"] == D
+    assert (root / (e0b["rel"] + mef.png_suffix(D))).is_file()
+    img = Image.open(io.BytesIO(dec[0]["png"]))
+    assert img.size == (p0["width"], p0["height"])
     # decode math (sample.py): x * std + mean, tanh stub, [-1, 1] -> uint8
-    z = np.load(lat_dir / f"{prompts[0]['id']}_base.npy")[0, :3] * 2.0 + 0.5
+    with np.load(root / (e0b["rel"] + ".npz")) as z:
+        lat0 = z["latent"]
+    z = lat0[0, :3] * 2.0 + 0.5
     want = ((np.clip(np.tanh(z), -1, 1) * 0.5 + 0.5) * 255.0).astype(np.uint8)
     got = np.asarray(img)[::8, ::8].transpose(2, 0, 1)
     assert np.abs(got.astype(int) - want.astype(int)).max() <= 1
-    pair = Image.open(io.BytesIO(dec[0]["png"]["pair"]))
-    assert pair.size[0] == 2 * prompts[0]["width"]
-    assert pair.size[1] > prompts[0]["height"]
+    pair = Image.open(io.BytesIO(dec[2]["png"]))
+    assert pair.size[0] == 2 * p0["width"] and pair.size[1] > p0["height"]
+    assert dec[2]["rel"] == "x"
+    # second call: the PNGs come from the volume, no VAE
+    dec2 = mef.decode_tasks(tasks[:2], root, vae_loader, D,
+                            log=lambda *_: None)
+    assert loads == [1] and not dec2[0]["decoded"]
+    assert dec2[0]["png"] == dec[0]["png"]
+    # another VAE identity: the cached PNG is not reused, the latents are
+    # decoded again into a PNG of its own
+    D2 = mef.decode_settings({**vae_a, "revision": "vae-2"})
+    assert mef.png_suffix(D2) != mef.png_suffix(D)
+    dec3 = mef.decode_tasks(tasks[:1], root, vae_loader, D2,
+                            log=lambda *_: None)
+    assert dec3[0]["decoded"] and loads == [1, 1] and dec3[0]["decode"] == D2
+    assert (root / (e0b["rel"] + mef.png_suffix(D))).is_file()
+    assert (root / (e0b["rel"] + mef.png_suffix(D2))).is_file()
+    # the container's own VAE is not the planned one: refused
+    try:
+        mef.decode_tasks(tasks[:1], root, vae_loader, D, current=D2,
+                         log=lambda *_: None)
+    except RuntimeError as e:
+        assert "decode settings" in str(e), e
+    else:
+        raise AssertionError("decode with another VAE accepted")
+    # a key that is not the entry's / a missing entry: refused
+    bad = {**e0b, "key": {**e0b["key"], "model": mb}}
+    for t in ({"kind": "entry", **bad},
+              {"kind": "entry", "rel": e0b["rel"][:-1] + "0", "key": {}}):
+        try:
+            mef.decode_tasks([t], root, vae_loader, D, log=lambda *_: None)
+        except RuntimeError as e:
+            assert "no valid cache entry" in str(e)
+        else:
+            raise AssertionError("bad entry accepted")
+    # fairness inside decode: entries with other steps are not paired
+    e_other = fake_entry(root, p0, mb, lat0, steps=3)
+    try:
+        mef.decode_tasks([{**tasks[2], "b": e_other}], root, vae_loader, D,
+                         log=lambda *_: None)
+    except mef.UnfairPairError as e:
+        assert "sampler.steps" not in str(e) and "steps: 2 vs 3" in str(e), e
+    else:
+        raise AssertionError("unfair pair composed")
     one = mef.make_pair(np.zeros((32, 16, 3), np.uint8), None, "x")
     assert one.size[0] == 32
 
-    weights = {"base": {"repo": mef.BASE_REPO, "revision": "abc",
-                        "file": mef.BASE_FILE, "size": 1},
-               "ft": {"key": mef.R2_KEY, "etag": "e9", "size": 2,
-                      "last_modified": "2026-10-14T03:00:00+00:00"}}
-    gen = {"weights": weights, "env": {"steps": 2}, "rows": [{"id": prompts[0]["id"], "model": "base",
-                     "seconds": 1.234}, {"id": prompts[0]["id"],
-                                         "model": "ft", "seconds": 2.0}]}
-    prompts[0]["caption"] = 'a <b>"quoted"</b> & caption'
+    # write_outputs: bytes or Path sources
+    weights = {"base": ma, "ft": mb}
+    gen = {"weights": weights, "env": {"steps": 2},
+           "rows": [{"id": p0["id"], "model": "base", "seconds": 1.234},
+                    {"id": p0["id"], "model": "ft", "seconds": 2.0},
+                    {"id": p0["id"], "model": "pair", "seconds": None}]}
+    src = tmp_path / "src.png"
+    src.write_bytes(dec[1]["png"])
+    decoded = [{"id": prompts[1]["id"], "png": {"base": dec[0]["png"],
+                                                 "pair": dec[2]["png"]}},
+               {"id": p0["id"], "png": {"base": dec[0]["png"], "ft": src,
+                                        "pair": dec[2]["png"]}}]
+    p0["caption"] = 'a <b>"quoted"</b> & caption'
     out = tmp_path / "out"
-    paths = mef.write_outputs(out, prompts, list(reversed(dec)), gen,
-                              title="t", info_lines=["steps 2"]
-                              + mef.weights_lines(weights))
+    paths = mef.write_outputs(out, prompts, decoded, gen, title="t",
+                              info_lines=["steps 2"]
+                              + mef.weights_lines(weights),
+                              extra={"pair": ["base", "ft"]})
     names = sorted(p.name for p in paths)
     i0, i1 = prompts[0]["id"], prompts[1]["id"]
     assert names == sorted([f"{i0}_base.png", f"{i0}_ft.png",
                             f"{i0}_pair.png", f"{i1}_base.png",
                             f"{i1}_pair.png", "prompts.json",
                             "generate.json", "index.html"]), names
+    assert (out / f"{i0}_ft.png").read_bytes() == dec[1]["png"]
     doc = json.loads((out / "prompts.json").read_text())
     assert doc["weights"] == weights and doc["settings"] == {"steps": 2}
+    assert doc["pair"] == ["base", "ft"]
     pj = doc["prompts"]
     assert pj[0]["seconds"] == {"base": 1.23, "ft": 2.0}
     assert pj[1]["files"] == {"base": True, "ft": False, "pair": True}
-    for k in ("id", "source", "caption", "width", "height", "seed"):
+    for k in ("id", "source", "caption", "width", "height", "seed", "mu"):
         assert k in pj[0], k
     page = (out / "index.html").read_text()
     assert f'src="{i0}_base.png"' in page and f'src="{i0}_ft.png"' in page
@@ -759,7 +867,8 @@ def test_decode_and_outputs(tmp_path):
     assert "ft: not generated" in page and "steps 2" in page
     assert "etag e9" in page and "@ abc" in page
     assert "/home/" not in page and str(tmp_path) not in page
-    print("    decode (stub VAE) math, pair image, prompts.json, index.html")
+    print("    decode_tasks (stub VAE) math, lazy VAE, volume PNG cache, "
+          "fairness, pair image, prompts.json, index.html")
 
 
 if __name__ == "__main__":

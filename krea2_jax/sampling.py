@@ -67,15 +67,27 @@ def _text_tokens(params, lora, cfg, txt, txt_mask, lora_scale):
     )
 
 
+def cfg_batchable(tok, pos, mask, untok, unpos, unmask):
+    """True when the conditional and unconditional branch inputs have the
+    same shapes and dtypes, so they can be concatenated along the batch axis
+    into one 2B forward (static: shapes/dtypes are known at trace time)."""
+    return all(
+        a.shape == b.shape and a.dtype == b.dtype
+        for a, b in ((tok, untok), (pos, unpos), (mask, unmask))
+    )
+
+
 @partial(
     jax.jit,
     static_argnames=(
         "cfg", "guidance", "lora_scale", "qchunk", "attn_impl", "attn_mesh",
+        "cfg_batch",
     ),
 )
 def _euler_step(
     params, lora, cfg, x, tok, t_curr, dt, pos, mask, untok, unpos, unmask,
     guidance, lora_scale, qchunk, attn_impl="ref", attn_mesh=None,
+    cfg_batch=False,
 ):
     t = jnp.full((x.shape[0],), t_curr, dtype=x.dtype)
     fwd = partial(
@@ -83,6 +95,19 @@ def _euler_step(
         qchunk=qchunk, remat=False, attn_impl=attn_impl, attn_mesh=attn_mesh,
         attn_shard="heads",
     )
+    if (guidance and cfg_batch
+            and cfg_batchable(tok, pos, mask, untok, unpos, unmask)):
+        # one forward at batch 2B: [cond; uncond]. dit_forward is per-sample
+        # throughout (timestep vectors, RoPE positions, key masks, the
+        # cudnn/aiter valid-prefix reorder), so each half equals its own
+        # B-batch forward up to float summation order.
+        B = x.shape[0]
+        cat = lambda a, b: jnp.concatenate([a, b], axis=0)
+        v2 = fwd(cat(x, x), None, cat(t, t), cat(pos, unpos),
+                 cat(mask, unmask), txt_tokens=cat(tok, untok))
+        v, uv = v2[:B], v2[B:]
+        v = v + guidance * (v - uv)
+        return x + dt * v
     v = fwd(x, None, t, pos, mask, txt_tokens=tok)
     if guidance:
         uv = fwd(x, None, t, unpos, unmask, txt_tokens=untok)
@@ -109,11 +134,21 @@ def sample_latents(
     attn_impl="ref",   # "ref", "splash" (fused TPU kernel) or "cudnn"
     attn_mesh=None,    # mesh to split splash heads over (multi-device)
     compact=True,      # drop padded text tokens before sampling
+    cfg_batch=False,   # CFG: cond + uncond in ONE forward at batch 2B
 ):
     """Euler-integrate the flow ODE. Returns latents (B, C, H/8, W/8).
 
     The text branch (text fusion + txtmlp) is independent of t, so it runs
     once per prompt; each step only runs the image/text transformer blocks.
+
+    cfg_batch: with guidance > 0, run the conditional and unconditional
+    branches as one dit_forward at batch 2B (concatenated along the batch
+    axis) instead of two calls at batch B. Same math up to float summation
+    order (bigger GEMMs may pick other kernels on GPU, so not bitwise equal
+    to the default path). Needs cond/uncond text inputs of the same shapes
+    (e.g. both padded to the same text_rows with compact=False); otherwise
+    it falls back to the two-call path (decided at trace time). The default
+    False traces exactly the previous two-call step.
     """
     align = cfg.vae_compression * cfg.patch
     if height % align or width % align:
@@ -158,5 +193,6 @@ def sample_latents(
             guidance=float(guidance) if use_cfg else 0.0,
             lora_scale=lora_scale, qchunk=qchunk,
             attn_impl=attn_impl, attn_mesh=attn_mesh,
+            cfg_batch=bool(cfg_batch) and use_cfg,
         )
     return unpatchify(x, cfg.patch, cfg.channels, lat_h, lat_w)
