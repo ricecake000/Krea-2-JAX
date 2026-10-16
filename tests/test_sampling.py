@@ -6,6 +6,10 @@ Checks that the inference-side shortcuts leave outputs unchanged:
   * splash attention with heads split across devices == reference attention,
     for each head layout (KV split, KV expanded, replicated)
   * `sample_latents` end to end, compacted vs padded text, with CFG + LoRA
+  * CFG batching (`cfg_batch=True`: cond + uncond in one 2B forward) ==
+    the two-call step, B=1 and B=2, attn ref and cudnn (xla path on CPU);
+    falls back to the two-call path (bit-identical) when the cond / uncond
+    text shapes differ
 
     python tests/test_sampling.py
 """
@@ -42,7 +46,7 @@ from krea2_jax.model import (
     splash_attention,
     text_tokens_forward,
 )
-from krea2_jax.sampling import compact_text, sample_latents
+from krea2_jax.sampling import cfg_batchable, compact_text, sample_latents
 
 assert len(jax.devices()) == 8, jax.devices()
 mesh = make_mesh()
@@ -165,5 +169,90 @@ err = rel_err(lat_pad, lat_cmp)
 print(f"sample_latents compacted vs padded text: max rel err {err:.3e}")
 # steps run in bf16 (the sampler's latent dtype), so allow bf16 rounding
 assert err < 2e-2, err
+
+# ---------------------------------------------------------------------------
+# CFG batching: one 2B forward == two B forwards
+# ---------------------------------------------------------------------------
+
+def run_cfg(nb, cfg_batch, attn_impl="ref", un=(untxt, untxt_mask),
+            compact=False, steps=3):
+    return np.asarray(sample_latents(
+        params, cfg, jnp.asarray(txt[:nb]), jnp.asarray(txt_mask[:nb]),
+        untxt=jnp.asarray(un[0][:nb]), untxt_mask=jnp.asarray(un[1][:nb]),
+        lora=lora, lora_scale=0.5, height=latH * 8, width=latW * 8,
+        steps=steps, guidance=4.5, seed=0, compact=compact,
+        attn_impl=attn_impl, cfg_batch=cfg_batch,
+    ).astype(jnp.float32))
+
+
+for attn_impl in ("ref", "cudnn"):
+    for nb in (1, 2):
+        two = run_cfg(nb, False, attn_impl)
+        one = run_cfg(nb, True, attn_impl)
+        assert one.shape == two.shape == (nb, 4, latH, latW), one.shape
+        err = float(np.abs(one - two).max())
+        print(f"cfg_batch ({attn_impl}, B={nb}, 3 steps) vs two calls: "
+              f"max abs err {err:.3e} (|x| max {np.abs(two).max():.2f})")
+        assert err < 1e-5, (attn_impl, nb, err)
+        assert not np.array_equal(two, run_cfg(nb, False, attn_impl,
+                                               steps=2))   # steps matter
+
+# the batched path really traces one 2B forward (and the default does not)
+import krea2_jax.sampling as _smp
+
+seen = []
+_orig_fwd = _smp.dit_forward
+_smp.dit_forward = lambda *a, **k: (seen.append(a[2].shape[0]),
+                                    _orig_fwd(*a, **k))[1]
+try:
+    _smp._euler_step.clear_cache()
+    run_cfg(2, True, steps=1)
+    assert seen == [4], seen
+    seen.clear()
+    _smp._euler_step.clear_cache()
+    run_cfg(2, False, steps=1)
+    assert seen == [2, 2], seen
+finally:
+    _smp.dit_forward = _orig_fwd
+    _smp._euler_step.clear_cache()
+
+# fallback: uncond text with another length (and with compaction, other
+# lengths after compaction) -> the two-call path, bit-identical
+short_un = (untxt[:, :64], untxt_mask[:, :64])
+tok_c = jnp.zeros((2, 128, 8)); tok_u = jnp.zeros((2, 64, 8))
+pos_c, mask_c = build_positions_and_mask(jnp.asarray(txt_mask), htok, wtok)
+pos_u, mask_u = build_positions_and_mask(jnp.asarray(short_un[1]), htok, wtok)
+assert cfg_batchable(tok_c, pos_c, mask_c, tok_c, pos_c, mask_c)
+assert not cfg_batchable(tok_c, pos_c, mask_c, tok_u, pos_u, mask_u)
+for nb in (1, 2):
+    two = run_cfg(nb, False, un=short_un)
+    one = run_cfg(nb, True, un=short_un)
+    assert np.array_equal(one, two), float(np.abs(one - two).max())
+long_mask = txt_mask.copy()
+long_mask[:, :70] = True   # compacts to 128 rows, the uncond to 64
+assert compact_text(txt, long_mask)[0].shape[1] == 128
+two = np.asarray(sample_latents(
+    params, cfg, jnp.asarray(txt), jnp.asarray(long_mask),
+    untxt=jnp.asarray(untxt), untxt_mask=jnp.asarray(untxt_mask),
+    height=latH * 8, width=latW * 8, steps=2, guidance=4.5, seed=0,
+    compact=True, cfg_batch=False).astype(jnp.float32))
+one = np.asarray(sample_latents(
+    params, cfg, jnp.asarray(txt), jnp.asarray(long_mask),
+    untxt=jnp.asarray(untxt), untxt_mask=jnp.asarray(untxt_mask),
+    height=latH * 8, width=latW * 8, steps=2, guidance=4.5, seed=0,
+    compact=True, cfg_batch=True).astype(jnp.float32))
+assert np.array_equal(one, two)
+# no CFG: cfg_batch is a no-op
+assert np.array_equal(
+    np.asarray(sample_latents(params, cfg, jnp.asarray(txt[:1]),
+                              jnp.asarray(txt_mask[:1]), height=latH * 8,
+                              width=latW * 8, steps=2, guidance=0.0,
+                              compact=False, cfg_batch=True)),
+    np.asarray(sample_latents(params, cfg, jnp.asarray(txt[:1]),
+                              jnp.asarray(txt_mask[:1]), height=latH * 8,
+                              width=latW * 8, steps=2, guidance=0.0,
+                              compact=False)))
+print("cfg_batch fallback (different text lengths) / no-CFG: bit-identical "
+      "to the two-call path")
 
 print("ALL SAMPLING TESTS PASSED")
