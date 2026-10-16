@@ -67,10 +67,11 @@ Generated-image cache (Volume `krea2-eval-cache`):
         hashes to the file name and the .npz exists
   /vol/gen/<SAMPLER_VERSION>/<model_id>/<entry_hash>.<dtag>.png  decoded
         image; dtag = 12 hex of the decode settings (DECODE_VERSION, the
-        VAE identity: repo + revision from the volume marker (+ file sizes
-        when no revision), VAE dtype, torch / diffusers pins). A PNG is only
-        reused under the same decode settings; latents are re-decoded under
-        new ones. Written by `decode`; all removed when the .npz is
+        VAE identity: repo + revision from the volume marker, or without a
+        revision the sha256 of its files (cached in .cache/ by size +
+        mtime), VAE dtype, torch / diffusers pins). A PNG is only reused
+        under the same decode settings (never when neither revision nor
+        digest is known); latents are re-decoded under new ones. Written by `decode`; all removed when the .npz is
         rewritten.
   local mirror /home/mj/krea2-ops/eval/cache/<same relative path>.<dtag>.png
         + .<dtag>.json (sidecar + "decode"), copied back by `decode`; a
@@ -739,18 +740,69 @@ def read_sidecar(root, rel):
     return doc
 
 
+VAE_DIGEST_CACHE = ".cache/eval_vae_digest.json"   # under the VAE dir
+
+
+def vae_content_digest(vae_dir):
+    """sha256 over the marker's files (weights + configs: relative path and
+    content, sorted), cached in vae_dir/VAE_DIGEST_CACHE keyed by every
+    file's (path, size, mtime_ns) so it is only recomputed when a file
+    changes (.cache/ is outside the download marker). None when it cannot be
+    determined (unreadable files)."""
+    vae_dir = Path(vae_dir)
+    try:
+        files = sorted(json.loads((vae_dir / MARKER).read_text())["files"])
+        sig = {rel: [(vae_dir / rel).stat().st_size,
+                     (vae_dir / rel).stat().st_mtime_ns] for rel in files}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    cache = vae_dir / VAE_DIGEST_CACHE
+    try:
+        doc = json.loads(cache.read_text())
+        if doc.get("files") == sig and doc.get("sha256"):
+            return doc["sha256"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    h = hashlib.sha256()
+    try:
+        for rel in files:
+            h.update(rel.encode() + b"\0")
+            with open(vae_dir / rel, "rb") as f:
+                for block in iter(lambda: f.read(1 << 24), b""):
+                    h.update(block)
+            h.update(b"\0")
+    except OSError:
+        return None
+    digest = h.hexdigest()
+    try:
+        _atomic_write(cache, json.dumps({"files": sig, "sha256": digest}))
+    except OSError:
+        pass   # read-only: recomputed next time
+    return digest
+
+
 def vae_identity(vae_dir=None):
     """{repo, revision} of the volume's VAE (vae_dir, default VOL_VAE) from
-    its download marker, plus the marker's file sizes when no revision was
-    recorded; None when it is not completely downloaded."""
+    its download marker. Without a recorded revision: {repo, revision: None,
+    sha256: vae_content_digest} (None when even that is unknown: then PNGs
+    are never reused, see png_reusable). None when the VAE is not
+    completely downloaded."""
     vae_dir = VOL_VAE if vae_dir is None else vae_dir
     if not marker_ok(vae_dir):
         return None
     m = json.loads((Path(vae_dir) / MARKER).read_text())
     ident = {"repo": m.get("repo", VAE_REPO), "revision": m.get("revision")}
     if not ident["revision"]:
-        ident["files"] = m.get("files")
+        ident["sha256"] = vae_content_digest(vae_dir)
     return ident
+
+
+def png_reusable(decode):
+    """Cached PNGs (volume, local mirror, pair images) may be reused only
+    when the VAE is identified by a revision or a content digest; otherwise
+    every needed PNG is decoded again in each run."""
+    vae = (decode or {}).get("vae") or {}
+    return bool(vae.get("revision") or vae.get("sha256"))
 
 
 def decode_settings(vae):
@@ -780,7 +832,7 @@ def entry_status(root, key, decode=None):
     ok = (doc is not None and doc["key"] == key
           and entry_file(root, rel, ".npz").is_file())
     return {"latent": ok,
-            "png": bool(ok and decode is not None and entry_file(
+            "png": bool(ok and png_reusable(decode) and entry_file(
                 root, rel, png_suffix(decode)).is_file())}
 
 
@@ -1191,6 +1243,7 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
     settings = {**settings, "text_encoder": text_encoder_identity()}
     out["settings"] = settings
     decode = out["decode"] = decode_settings(vae_identity())
+    commit()   # the VAE digest cache, if one was computed
     client = []
 
     def r2_ident(key):
@@ -1716,7 +1769,8 @@ def decode_tasks(tasks, root, vae_loader, decode, current=None, log=print):
             raise RuntimeError(f"{rel}: no valid cache entry with the "
                                "requested key")
         png = entry_file(root, rel, png_suffix(decode))
-        decoded = not png.is_file()
+        reuse = png_reusable(decode)
+        decoded = not (reuse and png.is_file())
         t0 = time.time()
         if decoded:
             if not vae:
@@ -1724,7 +1778,8 @@ def decode_tasks(tasks, root, vae_loader, decode, current=None, log=print):
             with np.load(npz) as z:
                 lat = z["latent"]
             data = png_bytes(decode_latent(vae[0], lat))
-            _atomic_write(png, data)
+            if reuse:
+                _atomic_write(png, data)
         else:
             data = png.read_bytes()
         log(f"{rel}: {'decoded' if decoded else 'cached PNG'} in "
@@ -1888,10 +1943,12 @@ def local_png_sidecar(local_root, rel, decode):
     return doc
 
 
-def local_entry_ok(local_root, entry, decode):
+def local_entry_ok(local_root, entry, decode, reuse=True):
     """The local mirror holds this entry's PNG decoded under `decode`, with
-    a sidecar of exactly its key."""
-    if not entry:
+    a sidecar of exactly its key. reuse (planning: may a cached PNG stand
+    in for a decode?) is also False when not png_reusable(decode); the pair
+    dir assembly passes reuse=False (the run just fetched the PNGs)."""
+    if not entry or (reuse and not png_reusable(decode)):
         return False
     doc = local_png_sidecar(local_root, entry["rel"], decode)
     return (doc is not None and doc["key"] == entry["key"]
@@ -1978,7 +2035,7 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
         files, keys, decodes = {}, {}, {}
         for side, m in (("base", ma), ("ft", mb)):
             e = m["entries"].get(pid)
-            if not local_entry_ok(local_root, e, decode):
+            if not local_entry_ok(local_root, e, decode, reuse=False):
                 continue
             doc = local_png_sidecar(local_root, e["rel"], decode)
             files[side] = entry_file(local_root, e["rel"], png_suffix(decode))
@@ -2073,7 +2130,8 @@ def decode_plan(prompts, pairs, models_info, local_root, decode,
                 continue
             label = pair_label(p)
             prel = pair_image_rel(ea, eb, label, (a, b), decode)
-            if (use_cache and (a, pid) not in regenerated
+            if (use_cache and png_reusable(decode)
+                    and (a, pid) not in regenerated
                     and (b, pid) not in regenerated
                     and entry_file(local_root, prel, ".png").is_file()):
                 continue

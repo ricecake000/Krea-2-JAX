@@ -254,13 +254,86 @@ def test_decode_identity(tmp_path):
     assert d == {"decode_version": mef.DECODE_VERSION, "vae": v,
                  "vae_dtype": "float32", "torch": mef.TORCH_PIN,
                  "diffusers": "diffusers==0.40.0"}, d
-    # no recorded revision: the file sizes stand in for it
+    assert mef.png_reusable(d)
+    # no recorded revision: a content digest of the files, cached by
+    # (path, size, mtime); a same-size replacement gets another digest
     mef.write_marker(vdir, mef.VAE_REPO, mef.VAE_PATTERNS)
     v2 = mef.vae_identity(vdir)
-    assert v2 == {"repo": mef.VAE_REPO, "revision": None,
-                  "files": {"vae/w.safetensors": 5}}, v2
-    assert mef.png_suffix(mef.decode_settings(v2)) != mef.png_suffix(d)
-    print("    VAE identity (revision, else file sizes), decode settings")
+    assert v2["revision"] is None and len(v2["sha256"]) == 64, v2
+    assert set(v2) == {"repo", "revision", "sha256"}, v2
+    assert (vdir / mef.VAE_DIGEST_CACHE).is_file()
+    assert "eval_vae_digest" not in json.dumps(json.loads(
+        (vdir / mef.MARKER).read_text())["files"])   # outside the marker
+    calls = []
+    real_sha = mef.hashlib.sha256
+    mef.hashlib.sha256 = lambda *a: calls.append(1) or real_sha(*a)
+    try:
+        assert mef.vae_identity(vdir) == v2 and not calls   # cached
+        st = (vdir / "vae" / "w.safetensors").stat()
+        (vdir / "vae" / "w.safetensors").write_bytes(b"y" * 5)   # same size
+        os.utime(vdir / "vae" / "w.safetensors",
+                 ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        v3 = mef.vae_identity(vdir)
+        assert calls, "digest not recomputed after a change"
+    finally:
+        mef.hashlib.sha256 = real_sha
+    assert v3["sha256"] != v2["sha256"], (v2, v3)
+    d2, d3 = mef.decode_settings(v2), mef.decode_settings(v3)
+    assert mef.png_reusable(d2) and mef.png_suffix(d2) != mef.png_suffix(d3)
+    # same-size different-content VAE -> other tag -> decoded again
+    from test_modal_eval_full import StubVAE
+
+    root = tmp_path / "gen"
+    p = prompts_n(1)[0]
+    s = mef.sampler_settings(2, 4.5, TE)
+    lat = np.zeros((1, 4, 4, 4), np.float32)
+    ka = mef.entry_key(s, p, HF_ID)
+    kb = mef.entry_key(s, p, R2_ID)
+    ea = {"kind": "entry", "rel": mef.write_entry(root, ka, lat, {}),
+          "key": ka}
+    eb = {"kind": "entry", "rel": mef.write_entry(root, kb, lat, {}),
+          "key": kb}
+    loads = []
+
+    def loader():
+        loads.append(1)
+        return StubVAE(4)
+
+    r2 = mef.decode_tasks([ea], root, loader, d2, current=d2, log=quiet)
+    r2b = mef.decode_tasks([ea], root, loader, d2, current=d2, log=quiet)
+    r3 = mef.decode_tasks([ea], root, loader, d3, current=d3, log=quiet)
+    assert r2[0]["decoded"] and not r2b[0]["decoded"] and r3[0]["decoded"]
+    assert len(loads) == 2
+    assert mef.entry_status(root, ka, d2)["png"]
+    assert not mef.entry_status(root, kb, d3)["png"]
+    # a pair of images decoded under the two VAEs is refused
+    raises(mef.UnfairPairError, lambda: mef.check_pairable(
+        ka, kb, "mixed", d2, d3), "different decode settings")
+    raises(RuntimeError, lambda: mef.decode_tasks(
+        [ea], root, loader, d2, current=d3, log=quiet), "decode settings")
+    # neither revision nor digest: never reused (always decoded again,
+    # nothing cached), but the run still works
+    d0 = mef.decode_settings({"repo": mef.VAE_REPO, "revision": None,
+                              "sha256": None})
+    assert not mef.png_reusable(d0) and not mef.png_reusable(None)
+    n_png = len(list(root.rglob("*.png")))
+    for _ in range(2):
+        r0 = mef.decode_tasks([ea, {"kind": "pair", "name": "p", "rel": "x",
+                                    "a": ea, "b": eb, "label": "l",
+                                    "labels": ["a", "b"]}], root, loader, d0,
+                              current=d0, log=quiet)
+        assert r0[0]["decoded"] and r0[1]["png"]
+    assert len(list(root.rglob("*.png"))) == n_png
+    (root / (ea["rel"] + mef.png_suffix(d0))).write_bytes(b"stale")
+    assert not mef.entry_status(root, ka, d0)["png"]
+    local = tmp_path / "local"
+    mef.store_local_entry(local, ea["rel"], b"png", {"hash": "h", "key": ka},
+                          d0)
+    e = {"rel": ea["rel"], "key": ka}
+    assert not mef.local_entry_ok(local, e, d0)          # planning: no reuse
+    assert mef.local_entry_ok(local, e, d0, reuse=False)  # assembly: fresh
+    print("    VAE identity (revision, else a cached content digest; same-size "
+          "replacement re-decodes, mixed pair refused; unknown -> no reuse)")
 
 
 def test_fairness(tmp_path):
@@ -868,6 +941,25 @@ def test_end_to_end_tiny(tmp_path):
     assert doc7["decode"]["vae"]["revision"] == "vae-sha-2"
     assert doc1["decode"]["vae"]["revision"] == "vae-sha-1"
     assert [p["id"] for p in doc7["prompts"]] == ids
+
+    # VAE without revision and without a determinable digest: no PNG reuse,
+    # every needed entry decoded again, the pair dir still complete
+    w.set_vae(None)
+    real_digest = mef.vae_content_digest
+    mef.vae_content_digest = lambda vae_dir: None
+    try:
+        for stamp in ("t10", "t11"):
+            w.generate_calls.clear(), w.decode_calls.clear()
+            r = w.run(f"base=hf-base,run1={r1k}", "", stamp)
+            assert not w.generate_calls
+            assert sum(t["kind"] == "entry" for c in w.decode_calls
+                       for t in c) == 4
+            assert sum(t["kind"] == "pair" for c in w.decode_calls
+                       for t in c) == 2
+            assert sorted(dir_bytes(r["dirs"][0])) == sorted(b1)
+    finally:
+        mef.vae_content_digest = real_digest
+    w.set_vae("vae-sha-2")
 
     # --no-cache: every entry regenerated and re-decoded
     w.generate_calls.clear(), w.decode_calls.clear()
