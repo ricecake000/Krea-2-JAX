@@ -5,8 +5,9 @@ originals archive (rclone remote), writing only the wanted members to disk.
     python scripts/fetch_originals.py --ids ids.json          # json list or txt (one id per line)
     python scripts/fetch_originals.py --ids ids.txt --mode stream --jobs 2
 
-Archive layout (`--remote`, default gdrive:danbooru_pipeline/selection_v2/
-originals): `orig-XXXX.tar` (members `<id>.<ext>`, plain ustar) and
+Archive layout (`--remote`, default
+gdrive_main:danbooru_pipeline/selection_v2/originals):
+`orig-XXXX.tar` (members `<id>.<ext>`, plain ustar) and
 `orig-XXXX.parquet` (index: id, rank, score, size, ext, w, h, artist,
 copyright, status, error) whose ok rows are in the tar's member order.
 
@@ -48,7 +49,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-REMOTE = "gdrive:danbooru_pipeline/selection_v2/originals"
+REMOTE = "gdrive_main:danbooru_pipeline/selection_v2/originals"
 CACHE = Path("/home/mj/.cache/krea2-orig")
 DEFAULT_RCLONE = "/home/mj/.local/bin/rclone"
 REVIEW_TABS = ("A", "B", "C", "E")   # the tabs the user may act on (D = control)
