@@ -216,12 +216,13 @@ def test_loader_order_and_batches(ds, batches):
 
 
 def test_loader_deterministic_and_resume(ds, batches, tmpl):
-    assert all(same(a, b) for a, b in zip(batches, take(ds, 11, prefetch=1, workers=1)))
+    again = take(ds, 11, prefetch=1, workers=1)
+    assert len(again) == 11 and all(same(a, b) for a, b in zip(batches, again))
     assert not all(same(a, b) for a, b in zip(batches, take(ds, 3, seed=8)))
-    for k in (1, 3, 5, 8):
-        assert all(same(b, batches[k + s]) for s, b in enumerate(take(ds, 3, start_step=k)))
     fresh = BucketDataset(ds.data_dir, tmpl, img_tokens=IT)
-    assert all(same(b, batches[4 + s]) for s, b in enumerate(take(fresh, 3, start_step=4)))
+    for d, k in ((ds, 1), (ds, 3), (ds, 5), (ds, 8), (fresh, 4)):
+        got = take(d, 3, start_step=k)
+        assert len(got) == 3 and all(same(b, batches[k + s]) for s, b in enumerate(got))
 
 
 def test_fingerprint(ds, tmp_path):

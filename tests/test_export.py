@@ -1,6 +1,7 @@
 """Full-FT checkpoint I/O on the tiny model: official safetensors export, param
 shardings, orbax train-state round trip, scripts/export_full.py."""
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -12,9 +13,9 @@ import optax
 import pytest
 from safetensors import safe_open
 
-from helpers import REPO
-from krea2_jax.checkpoint import (load_krea2_params, official_key_shapes, param_shardings,
-                                  save_krea2_params)
+from helpers import REPO, TINY
+from krea2_jax.checkpoint import (init_lora, load_krea2_params, load_lora, official_key_shapes,
+                                  param_shardings, save_krea2_params, save_lora)
 from krea2_jax.fullft_ckpt import latest_step, make_manager, restore_state, save_state, wait
 
 NAMES = ("sharded bf16", "sharded fp32", "local fp32")
@@ -66,7 +67,7 @@ def assert_trees_equal(want, got):
 
 
 @pytest.mark.parametrize("name", NAMES)
-def test_save_reproduces_official_bf16(loaded, tiny_ckpt, name, tmp_path):
+def test_save_reproduces_official_bf16(loaded, tiny_ckpt, ref, name, tmp_path):
     """load -> save reproduces the official bf16 file bit for bit; loads strict into torch."""
     import torch
     from safetensors.torch import load_file
@@ -81,7 +82,36 @@ def test_save_reproduces_official_bf16(loaded, tiny_ckpt, name, tmp_path):
         written = {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
     assert official_key_shapes(loaded[name]) == written
     assert official_key_shapes(abstract(loaded[name], sharded=False)) == written
-    tiny_ckpt[3].load_state_dict(got, strict=True)
+    ref.SingleStreamDiT(ref.SingleMMDiTConfig(**TINY)).load_state_dict(got, strict=True)
+
+
+def test_lora_round_trip(loaded, tmp_path):
+    lora = init_lora(loaded["local fp32"], jax.random.PRNGKey(0), rank=4, targets="full")
+    keys = iter(jax.random.split(jax.random.PRNGKey(1), len(jax.tree.leaves(lora))))
+    lora = jax.tree.map(lambda a: jax.random.normal(next(keys), a.shape, a.dtype), lora)
+    save_lora(str(tmp_path / "l.safetensors"), lora, rank=4, alpha=8)
+    got, meta = load_lora(str(tmp_path / "l.safetensors"))
+    assert (meta["rank"], meta["alpha"]) == ("4", "8") and jax.tree.structure(got) == jax.tree.structure(lora)
+    for a, b in zip(jax.tree.leaves(lora), jax.tree.leaves(got)):
+        assert np.asarray(a).any() and b.dtype == a.dtype
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+WQ, A, B = "blocks.0.attn.wq", np.ones((4, 8), np.float32), np.ones((8, 4), np.float32)
+
+
+@pytest.mark.parametrize("flat,meta,match", [
+    ({f"{WQ}.lora_A.weight": A, f"{WQ}.lora_B.weight": B}, {"rank": "4"}, None),
+    ({f"{WQ}.lora_A.weight": A}, None, "missing"),
+    ({"blocks.0.attn.projetor.lora_A.weight": A, "blocks.0.attn.projetor.lora_B.weight": B}, None, "unknown LoRA"),
+    ({f"{WQ}.lora_A.weight": A, "blocks.1.attn.wq.lora_A.weight": A, f"{WQ}.lora_B.weight": B}, None, "layers"),
+    ({f"{WQ}.lora_A.weight": A, f"{WQ}.lora_B.weight": B}, {"targets": "attn"}, "do not match targets"),
+    ({f"{WQ}.lora_A.weight": A, f"{WQ}.lora_B.weight": B}, {"rank": "8"}, "metadata says rank 8")])
+def test_load_lora_rejects_malformed(flat, meta, match, tmp_path):
+    from safetensors.numpy import save_file
+    save_file(flat, str(tmp_path / "bad.safetensors"), metadata=meta)
+    with pytest.raises(ValueError, match=match) if match else contextlib.nullcontext():
+        load_lora(str(tmp_path / "bad.safetensors"))
 
 
 def test_save_is_atomic(tmp_path):

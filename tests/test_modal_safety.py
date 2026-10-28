@@ -2,6 +2,7 @@
 plain modules (no Modal SDK, no network)."""
 
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -88,7 +89,7 @@ def test_select_ckpt_objects_refusals(objs, tree, match):
 
 class FakeS3:
     def __init__(self):
-        self.objects, self.uploads = {}, 0
+        self.objects, self.uploads, self.cut = {}, 0, 0
 
     def head_object(self, Bucket, Key):
         if Key not in self.objects:
@@ -96,7 +97,8 @@ class FakeS3:
         return {"ContentLength": len(self.objects[Key][0]), "ETag": '"e"', "Metadata": dict(self.objects[Key][1])}
 
     def upload_file(self, filename, bucket, key, ExtraArgs=None, Config=None):
-        self.objects[key] = (open(filename, "rb").read(), (ExtraArgs or {}).get("Metadata") or {})
+        data = open(filename, "rb").read()
+        self.objects[key] = (data[:len(data) - self.cut], (ExtraArgs or {}).get("Metadata") or {})
         self.uploads += 1
 
 
@@ -109,6 +111,36 @@ def test_upload_skip_only_on_same_size_and_metadata(tmp_path):
     assert [up(m1), up(m1), up(m1, force=True), up(m2)] == ["uploaded", "skipped", "uploaded", "uploaded"]
     s3.objects["k/x"] = (s3.objects["k/x"][0], {})
     assert up(m2) == "uploaded" and s3.objects["k/x"][1] == m2 and s3.uploads == 4
+    f.write_bytes(b"abcd" * 100)
+    assert up(m2) == "uploaded" and len(s3.objects["k/x"][0]) == 400 and s3.uploads == 5
+    s3.cut = 1
+    with pytest.raises(RuntimeError, match="uploaded object has 399 bytes"):
+        up(m2, force=True)
+
+
+class FakeHf:
+    def __init__(self, role, private, auth_ok):
+        self.role, self.private, self.auth_ok, self.calls = role, private, auth_ok, []
+
+    def __getattr__(self, name):
+        def call(*a, **kw):
+            self.calls.append(name)
+            if name == "auth_check" and not self.auth_ok:
+                raise PermissionError("403 Forbidden")
+            return {"whoami": {"name": OWNER, "auth": {"accessToken": {"role": self.role}}}, "repo_exists": True,
+                    "repo_info": SimpleNamespace(private=self.private, sha="c0ffee")}.get(name)
+        return call
+
+
+@pytest.mark.parametrize("role,private,auth_ok,err,last", [
+    ("read", True, True, "token role read", "whoami"), ("write", True, False, "403 Forbidden", "auth_check"),
+    ("write", False, True, "not private", "repo_info")])
+def test_finalize_refuses_before_publishing(tmp_path, role, private, auth_ok, err, last):
+    api, ran = FakeHf(role, private, auth_ok), []
+    r = mcl.finalize_impl(SimpleNamespace(reload=lambda: None, commit=lambda: None), api=api, out_dir=tmp_path,
+                          runner=lambda *a, **kw: ran.append(a), python="py")
+    assert not r["ok"] and err in r["error"] and api.calls[-1] == last and not ran
+    assert "upload_large_folder" not in api.calls and ("create_repo" in api.calls) == (last == "repo_info")
 
 
 TE = {"repo": mef.TEXT_REPO, "revision": "te-rev-1"}
