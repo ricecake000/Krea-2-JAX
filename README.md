@@ -241,7 +241,7 @@ applies `with_sharding_constraint` to every `linear` output and to the scan
 carry at block entry/exit; with it the block body contains only per-layer
 weight all-gathers and gradient reductions (verdict line
 `activation collectives: NONE`). It changes no math (outputs and gradients
-match `off` to fp32 rounding; `tests/test_aiter_attention.py`), so keep it
+match `off` to fp32 rounding; `tests/test_model.py`), so keep it
 on; `off` exists for A/B comparisons. Both `--act-sharding` and `--attn` are
 recorded in the checkpoint's run config and only warn when changed on
 `--resume`.
@@ -257,8 +257,8 @@ buffers and of the reduce-scattered weight grads into the stacked grads
 `train_full.py`, `bench_step.py` and `aot_analysis.py`) loads the blocks as
 a list of 28 per-layer arrays (`load_krea2_params(unstack=("blocks",))`)
 and runs them in an unrolled Python loop, so the graph has no slice, DUS or
-while loop at all (numerics identical; `tests/test_layer_loop.py` checks
-the compiled HLO). The cost is compile time (28 copies of the block body).
+while loop at all (numerics identical; `tests/test_model.py` checks
+outputs and grads against scan). The cost is compile time (28 copies of the block body).
 Exports are the same official keys and bytes either way, but orbax
 checkpoints are not interchangeable between modes (the train-state tree
 differs): `layer_loop` is a hard resume key. LoRA training stays on `scan`.
@@ -1011,46 +1011,17 @@ CPU-only numerical verification against the official PyTorch code
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install einops optax
-python tests/test_parity.py        # forward parity (~4e-7, asserts <2e-4), LoRA == merged
-python tests/test_train_and_io.py  # train step, save/load, merge script
-python tests/test_sharding.py      # 8-device FSDP parity (emulated on CPU)
-python tests/test_train_full.py    # full fine-tuning: loss, export parity, resume,
-                                   # padded image rows inert, per-sample mu
-python tests/test_resume_new_dataset.py  # --resume-new-dataset: switch onto a new dataset
-                                         # version (batch ids), run2 resumes, refusals
-python tests/test_export.py        # official-layout export, param_shardings, orbax round trip
-python tests/test_data.py          # streaming loaders: fixed-res cache + bucketed latents/captions
-python tests/test_qwen3_text.py    # JAX Qwen3-VL text tower (parity parts need transformers)
-python tests/test_cache_latents.py # krea2-latents-v1 cache builder (stub VAE)
-python tests/test_aiter_attention.py  # padded-group-mode emulation == reference attn;
-                                      # dit_forward aiter == ref (outputs + grads);
-                                      # act_sharding on == off
-python tests/test_act_sharding.py  # real-config AOT: abstract params == torch meta
-                                   # state_dict; no activation collectives when on
-python tests/test_scripts_smoke.py # aot_analysis / bench_step / parity scripts (tiny model)
-python tests/test_sampling.py      # sampler: text caching, text compaction, head-sharded splash
-python tests/test_layer_loop.py    # --layer-loop unroll == scan (outputs + grads), list-block
-                                   # checkpoint I/O + shardings, no slice/DUS in the HLO
-python tests/test_modal_eval_full.py  # Modal eval: prompt selection, caption format, tiny
-                                      # generate path, decode/index writing (no Modal)
-python tests/test_modal_export_full.py  # Modal export: minimal orbax download (fake R2),
-                                        # export_full + upload flow, weight-drift report
-python tests/test_modal_coherence.py    # Modal coherence: partial restore == full restore,
-                                        # metrics, null-model simulation, fake-R2 flow
-python tests/test_score_borders.py      # dataset border score: synthetic insets vs
-                                        # silhouettes (WebP), shard id validation, two-pass
-                                        # thumbnails, fake-tar run + review page (node),
-                                        # side patterns, 4-state review logic, --rerender
-python tests/test_datafilter_apply.py   # review -> patch dir: crop geometry on synthetic
-                                        # originals, bucket choice, dataset resize reuse,
-                                        # caption phrase add / strip, token budget, e2e
-python tests/test_patch_latents.py      # latent patch: unpatched fingerprint == main's,
-                                        # patched latents/captions/removals load + verify,
-                                        # validation, chained patches, fake-Hub upload
-python tests/test_fetch_originals.py    # originals fetch with a fake rclone: ranged reads,
-                                        # stream fallback / early stop, resume, retries
+pip install einops optax pytest
+python -m pytest -q tests/     # ~3 min on 4 CPU cores
 ```
+
+What the suite guards (test code is capped at 10 % of the code lines, so only must-fail checks are kept):
+`test_parity.py` / `test_model.py` forward + gradient parity vs the official torch model, attention backends
+(cudnn / aiter emulation / splash) and `--layer-loop unroll` == scan, real-config abstract params == torch keys;
+`test_export.py` bit-exact official-layout export and orbax round trip; `test_train_full.py` loss, masking, resume
+refusals and exact resume; `test_data.py` / `test_cache_latents.py` / `test_patch_latents.py` latent manifest and
+loader integrity; `test_qwen3_text.py` text tower config and loader; `test_sampling.py` text caching / cfg batch;
+`test_modal_safety.py` HF token / upload / export-object safety; `test_vae_fast.py` (skipped without diffusers).
 
 All of these run on CPU (8 emulated devices where sharding is involved).
 The attention and act-sharding tests also pass under JAX 0.11 (the version
