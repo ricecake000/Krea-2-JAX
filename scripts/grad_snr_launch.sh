@@ -131,24 +131,51 @@ te = {s.rfilename: s for s in HfApi().repo_info("Qwen/Qwen3-VL-4B-Instruct",
                                                files_metadata=True).siblings}
 # file-level, authenticated: an 8-byte Range GET on the resolve URL of every
 # gated / private file the VM fetches (metadata alone does not prove download
-# rights); the token is only in the request header, never printed
-import struct, urllib.request
+# rights). Redirects are NEVER followed (urllib would copy the Authorization
+# header to the redirect host): 200/206 = the bytes, a 30x to an https
+# Location = authorized (the Location is not contacted; only its host is
+# printed); a relative Location stays on huggingface.co and is re-requested;
+# 401/403/404 or anything else fails. The token is never printed.
+import struct, urllib.error, urllib.parse, urllib.request
 from huggingface_hub import hf_hub_url
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+opener = urllib.request.build_opener(NoRedirect)
+hosts = set()
 def head8(repo, name, rev, repo_type=None):
     url = hf_hub_url(repo, name, revision=rev, repo_type=repo_type)
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok, "Range": "bytes=0-7"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        b = r.read(8)
-    assert len(b) == 8, (repo, name, len(b))
-    return b
-n = struct.unpack("<Q", head8("krea/Krea-2-Raw", "raw.safetensors", "6b0ece7fffb640c5e3bcbe0a7f10f66b8e60a603"))[0]
-assert n == 43720, f"raw.safetensors header length {n}"
+    for _ in range(3):
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok, "Range": "bytes=0-7"})
+        try:
+            with opener.open(req, timeout=60) as r:
+                b = r.read(8)
+            assert r.status in (200, 206) and len(b) == 8, (repo, name, r.status, len(b))
+            return b
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location") or ""
+            if e.code not in (301, 302, 303, 307, 308):
+                raise SystemExit(f"{repo}/{name}: HTTP {e.code} (no download rights?)")
+            if loc.startswith("/"):
+                url = "https://huggingface.co" + loc   # same origin
+                continue
+            u = urllib.parse.urlsplit(loc)
+            assert u.scheme == "https" and u.netloc, f"{repo}/{name}: redirect to a non-https Location (host {u.netloc!r})"
+            hosts.add(u.netloc)
+            return None
+    raise SystemExit(f"{repo}/{name}: too many same-origin redirects")
+b = head8("krea/Krea-2-Raw", "raw.safetensors", "6b0ece7fffb640c5e3bcbe0a7f10f66b8e60a603")
+n = struct.unpack("<Q", b)[0] if b else None
+assert n in (None, 43720), f"raw.safetensors header length {n}"
 head8("ricecake/danbooru-curated-v2-latents", "latents/manifest.json", sys.argv[3], "dataset")
 for s in sorted(spec["shards"]):
     head8("ricecake/danbooru-curated-v2-latents", "latents/" + s, sys.argv[3], "dataset")
 gb = (raw["raw.safetensors"].size + sum(ds[n].size for n in need)
       + sum(s.size for n, s in te.items() if n.endswith((".json", ".safetensors", ".txt")))) / 1e9
-print(f"REMOTE_OK Raw downloadable with the token (authenticated Range GET, header {n} B), latents manifest + shards downloadable, dataset {sys.argv[3][:8]} has the {len(spec['shards'])} shards "
+print(f"REMOTE_OK Raw downloadable with the token (authenticated Range GET, no redirect followed: "
+      f"{'header ' + str(n) + ' B' if n else 'authorized https redirect'}; redirect hosts {sorted(hosts)}), latents manifest + shards downloadable, dataset {sys.argv[3][:8]} has the {len(spec['shards'])} shards "
       f"(LFS sha256 == samples digests), Qwen rev ebb281ec ok; VM downloads {gb:.1f} GB")
 EOF
 

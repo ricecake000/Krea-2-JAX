@@ -66,7 +66,10 @@ subset of P):
     coordinates; a skewed shared direction is the weak case (the jackknife
     bound keeps it at <= 5% false positives in the scratch calibration), and
     a rare-event null whose samples usually coincide with a real-mean twin
-    cannot be controlled by any finite-N test. The N needed for detection at
+    cannot be controlled by any finite-N test without giving up most of the
+    power (P_null(reject) >= P(no rare draw) x P_twin(reject)). A GO is
+    therefore conditional on that assumption: a reason to run phase 2, not
+    5% evidence of signal. The N needed for detection at
     z = 2 null sd is N* = max(2c / ((1 - c) S/N_b) with c = 2 sd_null,
     N t_{G-1} / (||mu||^2 / se_jackknife)) (both statistics grow ~ N) (sd_null
     from the sign-flip null; a present signal inflates it, so N* overstates
@@ -255,22 +258,28 @@ def bin_stats(H, Q, n, z=2.0, alpha=0.05):
 
 
 def reweight_nonneg(M, D):
-    """Exact max over w >= 0, w != 0 of w'Mw / sum_b D_b w_b^2 (D > 0): with
+    """Exact max over w >= 0, w != 0 of w'Mw / sum_b D_b w_b^2: with
     u = sqrt(D) w it is the Rayleigh quotient of A = D^-1/2 M D^-1/2 on the
     nonnegative orthant, attained (KKT) at an eigenvector of some principal
     submatrix A_SS with all entries of one sign on its support S; every
-    support is enumerated (K <= 12). -> (w normalized to sum 1, max) or
-    (None, nan) when some D_b <= 0."""
+    support is enumerated (K <= 12). Bins with D_b <= 0 and M_bb <= 0 (no
+    noise, no signal) are left out of every support; a bin with D_b <= 0 but
+    M_bb > 0 (signal without noise: unbounded S/N) is reported instead of a
+    number. -> (w normalized to sum 1 or None, max or nan, [zero-noise
+    signal bins])."""
     M = np.asarray(M, np.float64)
     D = np.asarray(D, np.float64)
     K = len(D)
-    if K > 12 or not np.all(D > 0):
-        return None, float("nan")
-    dm = 1.0 / np.sqrt(D)
+    zero_noise_signal = [b for b in range(K) if D[b] <= 0 and M[b, b] > 0]
+    ok = [b for b in range(K) if D[b] > 0]
+    if K > 12 or zero_noise_signal or not ok:
+        return None, float("nan"), zero_noise_signal
+    dm = np.zeros(K)
+    dm[ok] = 1.0 / np.sqrt(D[ok])
     A = dm[:, None] * M * dm[None, :]
     best, best_u = -np.inf, None
-    for r in range(1, K + 1):
-        for sup in itertools.combinations(range(K), r):
+    for r in range(1, len(ok) + 1):
+        for sup in itertools.combinations(ok, r):
             idx = list(sup)
             lam, vec = np.linalg.eigh(A[np.ix_(idx, idx)])
             for j in range(r):
@@ -279,7 +288,7 @@ def reweight_nonneg(M, D):
                     best, best_u = float(lam[j]), (idx, v)
     w = np.zeros(K)
     w[best_u[0]] = best_u[1] * dm[best_u[0]]
-    return w / w.sum(), best
+    return w / w.sum(), best, []
 
 
 def cross_stats(C, Q, n):
@@ -314,7 +323,7 @@ def cross_stats(C, Q, n):
             out["snr_" + k] = _div(mix, x)
             out["gain_" + k] = _div(v["a_uniform"], x)
         # stable key set: undefined -> NaN (jackknife replicates may differ)
-        w, snr_d = reweight_nonneg(M, K * tr)
+        w, snr_d, _ = reweight_nonneg(M, K * tr)
         out["snr_d_reweight"] = snr_d
         out["gain_d_reweight"] = _div(snr_d, out["snr_a_uniform"])
         for b in range(K):
@@ -330,7 +339,9 @@ def cross_stats(C, Q, n):
     d = np.diag(M)
     cos = [[float(M[a, b] / math.sqrt(d[a] * d[b])) if d[a] > 0 and d[b] > 0
             else None for b in range(K)] for a in range(K)]
-    return {"K": K, "M": M.tolist(), "cos": cos, "E2": e2.tolist(), **jk}
+    zns = reweight_nonneg(M, K * (e2 - d))[2]
+    return {"K": K, "M": M.tolist(), "cos": cos, "E2": e2.tolist(),
+            "d_zero_noise_signal_bins": zns, **jk}
 
 
 def p_gain_bounds(per_bin):
@@ -396,7 +407,12 @@ def build_report(state, z=2.0, alpha=0.05):
                     "%.1f null sd of the split-half cos (the sign-flip sd is "
                     "inflated by a present signal, so n_needed overstates N "
                     "for a bin that is already detectable), maxed with N * "
-                    "t / (mu2 / se) for the jackknife bound; S/N is biased "
+                    "t / (mu2 / se) for the jackknife bound. GO is CONDITIONAL "
+                    "on sign-symmetric group sums / no unobserved heavy tail: "
+                    "a rare-event zero-mean null can give a false GO at any "
+                    "finite N (controlling size there would cost most of the "
+                    "power), so GO is a reason to run phase 2, not 5%% "
+                    "evidence of signal; S/N is biased "
                     "upward at small N (~1.07x at N 32), CIs approximate"
                     % (alpha, z))}
     for b in bins:
@@ -482,7 +498,11 @@ def report_text(rep):
                              ("c1_importance", "(c1) importance q_b ~ sqrt(E|g_b|^2)"),
                              ("c2_neyman", "(c2) stratified Neyman n_b ~ sqrt(trS_b)"),
                              ("d_reweight", "(d) objective reweight w* (changes objective)")):
-                if "snr_" + k in cs:
+                if k == "d_reweight" and cs.get("d_zero_noise_signal_bins"):
+                    lines.append(f"  {label:<48} unbounded: bins "
+                                 f"{cs['d_zero_noise_signal_bins']} have signal "
+                                 "but zero estimated noise")
+                elif "snr_" + k in cs:
                     lines.append(f"  {label:<48} S/N {_ci(cs['snr_' + k])}  gain "
                                  f"{_ci(cs['gain_' + k], '.4f')}")
             K = cs["K"]
@@ -500,6 +520,10 @@ def report_text(rep):
                          f"{_g(gb['mixmax'][k], '.4f')}")
     if "go" in rep:
         lines.append(f"-- {rep['go']['verdict']}: {rep['go']['why']}")
+        if rep["go"]["verdict"] == "GO":
+            lines.append("   (conditional on the sign-symmetry / no-unobserved-"
+                         "tail assumption of the rule above: a reason to run "
+                         "phase 2, not 5% evidence of signal)")
     return "\n".join(lines)
 
 
@@ -859,6 +883,17 @@ def make_sample_fn(cfg, hp, treedef, p_idx, n_leaves, img_tokens):
     return jax.jit(fn, donate_argnums=(2,))
 
 
+def _sha256_array(x):
+    """sha256 of an array's C-order bytes (memmap slices included), read in
+    64 MiB pieces"""
+    x = np.ascontiguousarray(x).reshape(-1)
+    h = hashlib.sha256()
+    step = (64 << 20) // max(x.itemsize, 1)
+    for s in range(0, x.size, step):
+        h.update(np.ascontiguousarray(x[s:s + step]).tobytes())
+    return h.hexdigest()
+
+
 def _pair_rows(a, b):
     import jax.numpy as jnp
     x = a * b
@@ -946,6 +981,14 @@ def run_jax(args):
             return float("inf")
         return args.deadline_min * 60 - (time.time() - t_start)
 
+    def deadline_check(where, need_s=0.0):
+        """exit 6 (PARTIAL, like a per-bin stop) when less than need_s is
+        left before `where`"""
+        if not left_s() > need_s:
+            print(f"DEADLINE_STOP before {where} ({left_s():.0f} s left, "
+                  f"need {need_s:.0f} s)", flush=True)
+            sys.exit(6)
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     Path(args.scratch).mkdir(parents=True, exist_ok=True)
@@ -961,6 +1004,9 @@ def run_jax(args):
     N = args.n_per_bin
     if N < 2 * G:
         raise SystemExit(f"--n-per-bin {N} < 2 * groups {G}")
+    if args.timing_samples < 1:
+        raise SystemExit("--timing-samples must be >= 1 (the deadline "
+                         "estimate needs a measured s/sample)")
 
     # --- parameter subsets on the abstract tree (no weights yet) ---
     abs_p = abstract_krea2_params(cfg, dtype=jnp.bfloat16, unstack=("blocks",))
@@ -1055,13 +1101,12 @@ def run_jax(args):
     print(f"using remat {hp.remat_policy}, attn {hp.attn}", flush=True)
 
     # --- inputs ---
-    if left_s() < 300:
-        raise SystemExit(f"DEADLINE_STOP before loading the inputs "
-                         f"({left_s():.0f} s left)")
+    deadline_check("loading the inputs", 300)
     if args.verify_shards:
         verify_shards(args, args.samples)
     ids, caps, x0_np, hw_s, bucket = load_samples(args, cfg, N)
     ctxs, te_id = text_contexts(args, cfg, caps)
+    deadline_check("loading Raw")
     t0 = time.time()
     params = load_dit_bf16(args.base_ckpt, cfg)
     leaves = jax.tree.leaves(params)
@@ -1104,7 +1149,11 @@ def run_jax(args):
     def bin_est(sps):
         # conservative: 1.25 x the samples + Grams / P' transfer / host
         # cross products (~3 s per earlier bin) + --bin-overhead-s
+        if not (np.isfinite(sps) and sps > 0):
+            return float("inf")  # fail closed: no bin without a valid timing
         return 1.25 * N * sps + args.bin_overhead_s + 3 * K
+
+    deadline_check("timing")
 
     acc = zeros_acc()
     acc, sq, loss, t = one(comp, acc, K // 2, 0)
@@ -1116,6 +1165,9 @@ def run_jax(args):
         jax.block_until_ready(loss)
         ts.append(time.time() - t0)
     timing["ref_s_per_sample"] = float(np.median(ts))
+    if not (np.isfinite(timing["ref_s_per_sample"]) and timing["ref_s_per_sample"] > 0):
+        raise SystemExit(f"invalid timing {timing['ref_s_per_sample']} s/sample")
+    deadline_check("the bins")
     print(f"timing ({hp.attn}, remat {hp.remat_policy}): "
           f"{timing['ref_s_per_sample']:.3f} s/sample (median of {len(ts)})",
           flush=True)
@@ -1188,14 +1240,11 @@ def run_jax(args):
             raise SystemExit(f"--resume: {mm_path} has shape {mm.shape} "
                              f"{mm.dtype}, expected {(K, G, c_size)} float32")
         for b in sorted(state["bins"]):
-            want = np.asarray(state["bins"][b]["cross_norm2"], np.float64)
-            got = np.array([float(np.sum(np.asarray(mm[int(b), g], np.float64) ** 2))
-                            for g in range(G)])
-            if not np.allclose(got, want, rtol=1e-6, atol=0):
-                raise SystemExit(
-                    f"--resume: {mm_path} bin {b} group norms^2 "
-                    f"{[float(f'{x:.6g}') for x in got]} != state.json "
-                    f"{[float(f'{x:.6g}') for x in want]} (wrong or stale scratch)")
+            want = state["bins"][b].get("cross_sha256")
+            got = _sha256_array(mm[int(b)])
+            if got != want:
+                raise SystemExit(f"--resume: {mm_path} bin {b} sha256 {got} != "
+                                 f"state.json {want} (wrong or stale scratch)")
         print(f"resume: {mm_path} matches bins {sorted(state['bins'])}", flush=True)
     else:
         mm = np.lib.format.open_memmap(str(mm_path), mode="w+",
@@ -1209,7 +1258,7 @@ def run_jax(args):
         if str(b) in state["bins"]:
             continue
         need = max(bin_est(timing["ref_s_per_sample"]), 1.1 * (bin_s or 0))
-        if left_s() < need:
+        if not left_s() > need:
             print(f"DEADLINE_STOP before bin {b}: {left_s():.0f} s left < "
                   f"{need:.0f} s per bin", flush=True)
             stopped = True
@@ -1250,8 +1299,7 @@ def run_jax(args):
             "H": H.tolist(), "Q": Q.tolist(), "loss": losses, "t": tvals,
             "t_range": [t_of(lo), t_of(hi)], "seconds": bin_s,
             "sq_total": sq_tot,
-            "cross_norm2": [float(np.sum(X[g].astype(np.float64) ** 2))
-                            for g in range(G)]}
+            "cross_sha256": _sha256_array(X)}
         del X
         rep, txt = write_outputs(out, state, extra)
         print(f"bin {b} done in {bin_s:.0f} s ({bin_s / N:.2f} s/sample); "

@@ -16,5 +16,5 @@ def test_bin_stats_planted_mean(snr):
 
 
 def test_reweight_nonneg_exact():  # clipping the top eigenvector gives [.5, .5, 0] (2.0)
-    w, v = gs.reweight_nonneg(np.outer([1, 1, -1.9], [1, 1, -1.9]), np.ones(3))
+    w, v, _ = gs.reweight_nonneg(np.outer([1, 1, -1.9], [1, 1, -1.9]), np.ones(3))
     assert np.allclose(w, [0, 0, 1]) and np.isclose(v, 3.61)
