@@ -13,3 +13,8 @@ def test_bin_stats_planted_mean(snr):
     r = gs.bin_stats(S @ S.T, [np.sum(g[k::G] ** 2) for k in range(G)], [N // G] * G)
     true = mu @ mu / np.sum(sig ** 2)
     assert r["snr"]["lo"] <= true <= r["snr"]["hi"] and r["detectable"] == (snr > 0)
+
+
+def test_reweight_nonneg_exact():  # clipping the top eigenvector gives [.5, .5, 0] (2.0)
+    w, v = gs.reweight_nonneg(np.outer([1, 1, -1.9], [1, 1, -1.9]), np.ones(3))
+    assert np.allclose(w, [0, 0, 1]) and np.isclose(v, 3.61)

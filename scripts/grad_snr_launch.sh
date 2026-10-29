@@ -7,7 +7,8 @@
 #   PHASE 1 = smoke (extreme bins, N 32, go/no-go), 2 = measure (all 8 bins, N 64 unless --n)
 # dry: samples (select from the local filtered metadata.parquet, sha256-checked against the dataset commit) -> bundle
 #   (git archive HEAD + samples.json; refuses a dirty tree: commit first) -> checks (bundle size <= 30 MB, scripts
-#   parse, the HF token reaches the gated Raw repo and the dataset commit, sizes of the files the VM will fetch) ->
+#   parse, repo metadata + LFS sha256 of the files the VM will fetch, and an authenticated 8-byte Range GET of
+#   raw.safetensors, the latents manifest and every shard, i.e. the token can really download them) ->
 #   the cost estimate and the exact launch command. DRY_OK / DRY_FAIL.
 # run: dry, then colab_job.sh --gpu G4 (BILLED, needs --confirm-billed), then unpacks the download into the stage dir
 #   and prints the report. Results: $GRADSNR_STAGE/phase<P>-<ts>/out/ (state.json, report.json, report.txt, logs).
@@ -68,7 +69,7 @@ TEARDOWN = 2.0         # pack + download + unassign
 if phase == 1:
     compiles, samples = 3, 1 + 3 + 2 + 4 + nbins * n   # 2 remat candidates worst case + cudnn; warmup, timing
 else:
-    compiles, samples = 2, nbins * n
+    compiles, samples = 2, 1 + 3 + nbins * n                  # warmup + timing (deadline estimate)
 est = SETUP + compiles * COMPILE + LOAD + samples * S_PER_SAMPLE / 60 + nbins * BIN_END + TEARDOWN
 cap = cap or def_cap or int(math.ceil(est * 1.4 + 10))
 line = (f"COST phase={phase} est_min={est:.0f} est_cu={est / 60 * cu_h:.1f} cap_min={cap} "
@@ -128,9 +129,26 @@ for s, dig in spec["shards"].items():
 te = {s.rfilename: s for s in HfApi().repo_info("Qwen/Qwen3-VL-4B-Instruct",
                                                revision="ebb281ec70b05090aa6165b016eac8ec08e71b17",
                                                files_metadata=True).siblings}
+# file-level, authenticated: an 8-byte Range GET on the resolve URL of every
+# gated / private file the VM fetches (metadata alone does not prove download
+# rights); the token is only in the request header, never printed
+import struct, urllib.request
+from huggingface_hub import hf_hub_url
+def head8(repo, name, rev, repo_type=None):
+    url = hf_hub_url(repo, name, revision=rev, repo_type=repo_type)
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok, "Range": "bytes=0-7"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        b = r.read(8)
+    assert len(b) == 8, (repo, name, len(b))
+    return b
+n = struct.unpack("<Q", head8("krea/Krea-2-Raw", "raw.safetensors", "6b0ece7fffb640c5e3bcbe0a7f10f66b8e60a603"))[0]
+assert n == 43720, f"raw.safetensors header length {n}"
+head8("ricecake/danbooru-curated-v2-latents", "latents/manifest.json", sys.argv[3], "dataset")
+for s in sorted(spec["shards"]):
+    head8("ricecake/danbooru-curated-v2-latents", "latents/" + s, sys.argv[3], "dataset")
 gb = (raw["raw.safetensors"].size + sum(ds[n].size for n in need)
       + sum(s.size for n, s in te.items() if n.endswith((".json", ".safetensors", ".txt")))) / 1e9
-print(f"REMOTE_OK Raw gated access ok, dataset {sys.argv[3][:8]} has the {len(spec['shards'])} shards "
+print(f"REMOTE_OK Raw downloadable with the token (authenticated Range GET, header {n} B), latents manifest + shards downloadable, dataset {sys.argv[3][:8]} has the {len(spec['shards'])} shards "
       f"(LFS sha256 == samples digests), Qwen rev ebb281ec ok; VM downloads {gb:.1f} GB")
 EOF
 

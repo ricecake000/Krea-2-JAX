@@ -46,18 +46,29 @@ subset of P):
           weight 1/(K q_b): V = (mean_b sqrt(E||g_b||^2))^2 - ||mu||^2
       (c2) stratified Neyman allocation, objective unchanged: n_b ~
           sqrt(tr Sigma_b): V = (mean_b sqrt(tr Sigma_b))^2
-      (d) objective reweighting w (changes the objective), equal
+      (d) objective reweighting w >= 0 (changes the objective), equal
           allocation: S/N(w) = w'Mw / (K sum_b w_b^2 tr Sigma_b), maximized
-          by the top generalized eigenvector of (M, K diag tr Sigma),
-          clipped to w >= 0 and normalized to sum 1;
+          exactly over the nonnegative orthant (every support enumerated,
+          reweight_nonneg), w normalized to sum 1;
     S/N = ||mu||^2 / V, gains = S/N / S/N(a), all with jackknife CIs. When
     the per-sample S/N is << 1 the gains of (b)/(c) are ratios of second
     moments, i.e. well measured even where ||mu||^2 itself is noisy.
+    ||mu||^2 and tr Sigma are unbiased, their ratio (S/N) is not: biased
+    upward at small N (mean 1.07x the truth at N = 32, G = 8, Gaussian);
+    the jackknife CIs are approximate (t_{G-1}, G - 1 = 7 df).
   * Detectability rule (written into the report): E cos(S_A, S_B) ~
     r / (1 + r), r = (N/2) S/N_b, and the null sd of the cos does not depend
     on N (~1/sqrt(d_eff)); a bin is detectable when the sign-flip p of both
-    the split-half cos and U is <= 0.05; the N needed for detection at
-    z = 2 null sd is N* = 2c / ((1 - c) S/N_b) with c = 2 sd_null (sd_null
+    the split-half cos and U is <= 0.05 AND the jackknife 95% lower bound of
+    ||mu_b||^2 is > 0. The sign-flip null assumes the group sums are about
+    sign-symmetric under mu = 0: true for symmetric heavy tails and
+    per-sample scale mixtures, close for skewness spread over many
+    coordinates; a skewed shared direction is the weak case (the jackknife
+    bound keeps it at <= 5% false positives in the scratch calibration), and
+    a rare-event null whose samples usually coincide with a real-mean twin
+    cannot be controlled by any finite-N test. The N needed for detection at
+    z = 2 null sd is N* = max(2c / ((1 - c) S/N_b) with c = 2 sd_null,
+    N t_{G-1} / (||mu||^2 / se_jackknife)) (both statistics grow ~ N) (sd_null
     from the sign-flip null; a present signal inflates it, so N* overstates
     the N of an already detectable bin; exact in the noise-dominated case).
 
@@ -158,7 +169,7 @@ def jackknife(fn, G):
     reps = [fn(np.arange(G) != g) for g in range(G)]
     out = {}
     for k, v in full.items():
-        r = np.array([x[k] for x in reps], np.float64)
+        r = np.array([x.get(k, float("nan")) for x in reps], np.float64)
         if not _fin(v) or not np.all(np.isfinite(r)):
             out[k] = {"est": v if _fin(v) else None, "se": None, "lo": None,
                       "hi": None}
@@ -213,8 +224,14 @@ def bin_stats(H, Q, n, z=2.0, alpha=0.05):
     tr = jk["trS"]["est"]
     snr = jk["snr"]["est"]
     c = z * sd_cos
-    n_needed = (int(math.ceil(2 * c / ((1 - c) * snr)))
-                if _fin(snr) and snr > 0 and c < 1 else None)
+    n_cos = (int(math.ceil(2 * c / ((1 - c) * snr)))
+             if _fin(snr) and snr > 0 and c < 1 else None)
+    # the jackknife bound: mu2 / se grows ~ N in the noise-dominated regime
+    m2, se = jk["mu2"]["est"], jk["mu2"]["se"]
+    n_jk = (int(math.ceil(n.sum() * t975(G - 1) / (m2 / se)))
+            if _fin(m2) and m2 > 0 and se else None)
+    n_needed = (max(n_cos, n_jk) if n_cos is not None and n_jk is not None
+                else None)
     return {
         "N": int(n.sum()), "groups": G, **jk,
         "split_cos": cos_obs,
@@ -228,9 +245,41 @@ def bin_stats(H, Q, n, z=2.0, alpha=0.05):
                                  else None),
         "p_cos": p_cos, "U": u_obs, "z_U": _div(u_obs, sd_u), "p_U": p_u,
         "patterns": int(len(eps)),
-        "detectable": bool(p_cos <= alpha and p_u <= alpha),
+        # sign-flip (assumes ~sign-symmetric group sums) AND the jackknife
+        # lower bound of ||mu||^2 > 0 (scratch calibration: false positives
+        # <= 5% on Gaussian / t2.5 / lognormal-scaled / skewed nulls)
+        "detectable": bool(p_cos <= alpha and p_u <= alpha
+                           and _fin(jk["mu2"]["lo"]) and jk["mu2"]["lo"] > 0),
         "n_needed": n_needed,
     }
+
+
+def reweight_nonneg(M, D):
+    """Exact max over w >= 0, w != 0 of w'Mw / sum_b D_b w_b^2 (D > 0): with
+    u = sqrt(D) w it is the Rayleigh quotient of A = D^-1/2 M D^-1/2 on the
+    nonnegative orthant, attained (KKT) at an eigenvector of some principal
+    submatrix A_SS with all entries of one sign on its support S; every
+    support is enumerated (K <= 12). -> (w normalized to sum 1, max) or
+    (None, nan) when some D_b <= 0."""
+    M = np.asarray(M, np.float64)
+    D = np.asarray(D, np.float64)
+    K = len(D)
+    if K > 12 or not np.all(D > 0):
+        return None, float("nan")
+    dm = 1.0 / np.sqrt(D)
+    A = dm[:, None] * M * dm[None, :]
+    best, best_u = -np.inf, None
+    for r in range(1, K + 1):
+        for sup in itertools.combinations(range(K), r):
+            idx = list(sup)
+            lam, vec = np.linalg.eigh(A[np.ix_(idx, idx)])
+            for j in range(r):
+                v = vec[:, j] * (1.0 if vec[:, j].sum() >= 0 else -1.0)
+                if np.all(v > 1e-12) and lam[j] > best:
+                    best, best_u = float(lam[j]), (idx, v)
+    w = np.zeros(K)
+    w[best_u[0]] = best_u[1] * dm[best_u[0]]
+    return w / w.sum(), best
 
 
 def cross_stats(C, Q, n):
@@ -264,19 +313,12 @@ def cross_stats(C, Q, n):
         for k, x in v.items():
             out["snr_" + k] = _div(mix, x)
             out["gain_" + k] = _div(v["a_uniform"], x)
-        if np.all(tr > 0):
-            dm = 1.0 / np.sqrt(K * tr)
-            lam, vec = np.linalg.eigh(dm[:, None] * M * dm[None, :])
-            w = dm * vec[:, -1]
-            w = w * (1.0 if w.sum() >= 0 else -1.0)
-            wc = np.clip(w, 0, None)
-            wc = wc / wc.sum() if wc.sum() > 0 else np.full(K, 1.0 / K)
-            out["snr_d_reweight_eig"] = float(lam[-1])
-            out["snr_d_reweight"] = float(wc @ M @ wc / (K * np.sum(wc ** 2 * tr)))
-            out["gain_d_reweight"] = _div(out["snr_d_reweight"],
-                                          out["snr_a_uniform"])
-            for b in range(K):
-                out[f"w_d_{b}"] = float(wc[b])
+        # stable key set: undefined -> NaN (jackknife replicates may differ)
+        w, snr_d = reweight_nonneg(M, K * tr)
+        out["snr_d_reweight"] = snr_d
+        out["gain_d_reweight"] = _div(snr_d, out["snr_a_uniform"])
+        for b in range(K):
+            out[f"w_d_{b}"] = float(w[b]) if w is not None else float("nan")
         for b in range(K):
             out[f"q_c1_{b}"] = float(np.sqrt(e2[b]) / np.sqrt(e2).sum())
             out[f"n_c2_{b}"] = _div(float(np.sqrt(max(tr[b], 0))),
@@ -348,10 +390,15 @@ def build_report(state, z=2.0, alpha=0.05):
     K = cfg["bins"]
     rep = {"config": cfg, "bins_done": bins, "bins": {},
            "rule": ("detectable: sign-flip p <= %.2f for split-half cos AND "
-                    "U; n_needed = 2c/((1-c) snr), c = %.1f null sd of the "
-                    "split-half cos (the sign-flip sd is inflated by a "
-                    "present signal, so n_needed overstates N for a bin that "
-                    "is already detectable)" % (alpha, z))}
+                    "U AND jackknife 95%% lower bound of ||mu||^2 > 0 "
+                    "(assumes ~sign-symmetric group sums under mu = 0; see "
+                    "the script docstring); n_needed = 2c/((1-c) snr), c = "
+                    "%.1f null sd of the split-half cos (the sign-flip sd is "
+                    "inflated by a present signal, so n_needed overstates N "
+                    "for a bin that is already detectable), maxed with N * "
+                    "t / (mu2 / se) for the jackknife bound; S/N is biased "
+                    "upward at small N (~1.07x at N 32), CIs approximate"
+                    % (alpha, z))}
     for b in bins:
         H, Q = state_arrays(state, b)
         r = state["bins"][str(b)]
@@ -363,6 +410,9 @@ def build_report(state, z=2.0, alpha=0.05):
         rep["bins"][str(b)] = {
             "t_range": r["t_range"], "t_mean": float(np.mean(r["t"])),
             "loss_mean": float(np.mean(r["loss"])), "seconds": r["seconds"],
+            # outlier diagnostic for the sign-symmetry assumption
+            "sq_max_over_median": (float(np.max(r["sq_total"]) / np.median(r["sq_total"]))
+                                   if r.get("sq_total") else None),
             "P": bin_stats(H.sum(axis=0), Q.sum(axis=0), n, z, alpha),
             "Pcross": bin_stats(H[cross_mask].sum(axis=0),
                                 Q[cross_mask].sum(axis=0), n, z, alpha),
@@ -412,6 +462,10 @@ def report_text(rep):
                 f"{_g(s['split_cos'], '.4f'):>7} {_g(s['null_cos_sd'], '.4f'):>8} "
                 f"{s['p_cos']:6.3f} {s['p_U']:6.3f} {'yes' if s['detectable'] else 'no':>4} "
                 f"{s['n_needed'] if s['n_needed'] is not None else 'inf':>7}")
+    lines.append("per-sample ||g||^2 on P, max / median per bin (outlier check "
+                 "of the sign-flip assumption): " + ", ".join(
+                     f"{b}: {_g(r.get('sq_max_over_median'), '.2f')}"
+                     for b, r in rep["bins"].items()))
     cs = rep.get("cross")
     if cs:
         lines.append("-- cross-bin cos(mu_a, mu_b) on P' (bins " +
@@ -492,18 +546,29 @@ def decode_state_from_log(path):
     return json.loads(gzip.decompress(base64.b64decode(last)))
 
 
+def _write_json(path, obj):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, path)
+
+
 def write_outputs(out, state, extra=None):
+    """Persist the raw state FIRST (state.json + the GRADSNR_STATE log
+    line), then the derived report; a failing report never loses a bin."""
     out = Path(out)
-    rep = build_report(state)
-    if extra:
-        rep.update(extra)
-    for name, obj in (("state.json", state), ("report.json", rep)):
-        tmp = out / (name + ".tmp")
-        tmp.write_text(json.dumps(obj, indent=1))
-        os.replace(tmp, out / name)
-    txt = report_text(rep)
-    (out / "report.txt").write_text(txt + "\n")
+    _write_json(out / "state.json", state)
     print(f"{STATE_TAG} {encode_state(state)}", flush=True)
+    try:
+        rep = build_report(state)
+        if extra:
+            rep.update(extra)
+        _write_json(out / "report.json", rep)
+        txt = report_text(rep)
+    except Exception as e:  # the raw state is safe; report offline later
+        import traceback
+        traceback.print_exc()
+        rep, txt = {"error": repr(e)}, f"REPORT_FAILED {e!r} (state.json is saved)"
+    (out / "report.txt").write_text(txt + "\n")
     return rep, txt
 
 
@@ -874,6 +939,13 @@ def run_jax(args):
     from krea2_jax.config import KREA2_CONFIG
 
     t_start = time.time()
+
+    def left_s():
+        """seconds left before --deadline-min (inf without one)"""
+        if not args.deadline_min:
+            return float("inf")
+        return args.deadline_min * 60 - (time.time() - t_start)
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     Path(args.scratch).mkdir(parents=True, exist_ok=True)
@@ -983,6 +1055,9 @@ def run_jax(args):
     print(f"using remat {hp.remat_policy}, attn {hp.attn}", flush=True)
 
     # --- inputs ---
+    if left_s() < 300:
+        raise SystemExit(f"DEADLINE_STOP before loading the inputs "
+                         f"({left_s():.0f} s left)")
     if args.verify_shards:
         verify_shards(args, args.samples)
     ids, caps, x0_np, hw_s, bucket = load_samples(args, cfg, N)
@@ -1021,48 +1096,60 @@ def run_jax(args):
         return f(p_leaves, rest, acc, x0_dev[j], hw_dev, ctx, tm, key,
                  np.float32(lo), np.float32(hi))
 
-    # --- timing (smoke) ---
+    # --- timing (both modes: the per-bin time estimate of the deadline) ---
     timing = {}
     extra = {"env": env, "aot": aot, "te_id": te_id}
-    if args.mode == "smoke":
-        acc = zeros_acc()
-        acc, sq, loss, t = one(comp, acc, K // 2, 0)
+    n_left = len(run_bins)
+
+    def bin_est(sps):
+        # conservative: 1.25 x the samples + Grams / P' transfer / host
+        # cross products (~3 s per earlier bin) + --bin-overhead-s
+        return 1.25 * N * sps + args.bin_overhead_s + 3 * K
+
+    acc = zeros_acc()
+    acc, sq, loss, t = one(comp, acc, K // 2, 0)
+    jax.block_until_ready(loss)
+    ts = []
+    for j in range(1, 1 + args.timing_samples):
+        t0 = time.time()
+        acc, sq, loss, t = one(comp, acc, K // 2, j % N)
         jax.block_until_ready(loss)
-        ts = []
-        for j in range(1, 1 + args.timing_samples):
-            t0 = time.time()
-            acc, sq, loss, t = one(comp, acc, K // 2, j % N)
-            jax.block_until_ready(loss)
-            ts.append(time.time() - t0)
-        timing["ref_s_per_sample"] = float(np.median(ts))
-        print(f"timing ({hp.attn}, remat {hp.remat_policy}): "
-              f"{timing['ref_s_per_sample']:.3f} s/sample (median of {len(ts)})",
-              flush=True)
-        if args.try_cudnn and hp.attn != "cudnn":
-            try:
-                c2, row = compile_for(hp.remat_policy, "cudnn")
-                aot.append(row)
-                g_ref, _, _, _ = one(comp, zeros_acc(), K // 2, 0)
-                g_cud, _, _, _ = one(c2, zeros_acc(), K // 2, 0)
-                cosv = (sum(grams.dot(a, b) for a, b in zip(g_ref, g_cud))
-                        / math.sqrt(sum(grams.dot(a, a) for a in g_ref)
-                                    * sum(grams.dot(b, b) for b in g_cud)))
-                del g_ref, g_cud
-                a2 = zeros_acc()
-                ts2 = []
-                for j in range(1 + args.timing_samples):
-                    t0 = time.time()
-                    a2, sq, loss, t = one(c2, a2, K // 2, j % N)
-                    jax.block_until_ready(loss)
-                    ts2.append(time.time() - t0)
-                timing["cudnn_s_per_sample"] = float(np.median(ts2[1:]))
-                timing["cudnn_grad_cos_vs_ref"] = float(cosv)
-                del a2, c2
-            except Exception as e:  # optional speed-up only
-                timing["cudnn_error"] = repr(e)[:500]
-            print("cudnn: " + json.dumps(timing), flush=True)
-        del acc
-        extra["timing"] = timing
+        ts.append(time.time() - t0)
+    timing["ref_s_per_sample"] = float(np.median(ts))
+    print(f"timing ({hp.attn}, remat {hp.remat_policy}): "
+          f"{timing['ref_s_per_sample']:.3f} s/sample (median of {len(ts)})",
+          flush=True)
+    cud_est = aot[-1]["compile_s"] * 1.5 + 8 * timing["ref_s_per_sample"] + 60
+    if (args.mode == "smoke" and args.try_cudnn and hp.attn != "cudnn"
+            and left_s() - cud_est < n_left * bin_est(timing["ref_s_per_sample"])):
+        timing["cudnn_skipped"] = (f"deadline: {left_s():.0f} s left, the "
+                                   f"trial ~{cud_est:.0f} s + {n_left} bins")
+        print("cudnn trial skipped: " + timing["cudnn_skipped"], flush=True)
+    elif args.mode == "smoke" and args.try_cudnn and hp.attn != "cudnn":
+        try:
+            c2, row = compile_for(hp.remat_policy, "cudnn")
+            aot.append(row)
+            g_ref, _, _, _ = one(comp, zeros_acc(), K // 2, 0)
+            g_cud, _, _, _ = one(c2, zeros_acc(), K // 2, 0)
+            cosv = (sum(grams.dot(a, b) for a, b in zip(g_ref, g_cud))
+                    / math.sqrt(sum(grams.dot(a, a) for a in g_ref)
+                                * sum(grams.dot(b, b) for b in g_cud)))
+            del g_ref, g_cud
+            a2 = zeros_acc()
+            ts2 = []
+            for j in range(1 + args.timing_samples):
+                t0 = time.time()
+                a2, sq, loss, t = one(c2, a2, K // 2, j % N)
+                jax.block_until_ready(loss)
+                ts2.append(time.time() - t0)
+            timing["cudnn_s_per_sample"] = float(np.median(ts2[1:]))
+            timing["cudnn_grad_cos_vs_ref"] = float(cosv)
+            del a2, c2
+        except Exception as e:  # optional speed-up only
+            timing["cudnn_error"] = repr(e)[:500]
+        print("cudnn: " + json.dumps(timing), flush=True)
+    del acc
+    extra["timing"] = timing
 
     # --- state (resume) ---
     config = {"bins": K, "groups": G, "n_per_bin": N, "seed": args.seed,
@@ -1088,31 +1175,56 @@ def run_jax(args):
                  "leaves": [{"path": paths[i], "size": s, "cross": i in c_idx}
                             for i, s in zip(p_idx, sizes)],
                  "bins": {}, "cross": {}}
-    mm = np.lib.format.open_memmap(
-        str(Path(args.scratch) / "cross_sums.npy"),
-        mode="r+" if (Path(args.scratch) / "cross_sums.npy").exists()
-        and args.resume else "w+", dtype=np.float32, shape=(K, G, c_size))
+    mm_path = Path(args.scratch) / "cross_sums.npy"
+    if state["bins"]:
+        # resumed bins: their P' group sums must be in this scratch memmap,
+        # else every later cross-bin product with them would be silently 0
+        if not mm_path.exists():
+            raise SystemExit(f"--resume: {mm_path} is missing (the P' sums of "
+                             f"bins {sorted(state['bins'])} live only there); "
+                             "start a fresh --out instead")
+        mm = np.load(str(mm_path), mmap_mode="r+")
+        if mm.shape != (K, G, c_size) or mm.dtype != np.float32:
+            raise SystemExit(f"--resume: {mm_path} has shape {mm.shape} "
+                             f"{mm.dtype}, expected {(K, G, c_size)} float32")
+        for b in sorted(state["bins"]):
+            want = np.asarray(state["bins"][b]["cross_norm2"], np.float64)
+            got = np.array([float(np.sum(np.asarray(mm[int(b), g], np.float64) ** 2))
+                            for g in range(G)])
+            if not np.allclose(got, want, rtol=1e-6, atol=0):
+                raise SystemExit(
+                    f"--resume: {mm_path} bin {b} group norms^2 "
+                    f"{[float(f'{x:.6g}') for x in got]} != state.json "
+                    f"{[float(f'{x:.6g}') for x in want]} (wrong or stale scratch)")
+        print(f"resume: {mm_path} matches bins {sorted(state['bins'])}", flush=True)
+    else:
+        mm = np.lib.format.open_memmap(str(mm_path), mode="w+",
+                                       dtype=np.float32, shape=(K, G, c_size))
 
     # --- bins ---
     rep = None
     bin_s = None
+    stopped = False
     for b in run_bins:
         if str(b) in state["bins"]:
             continue
-        elapsed = (time.time() - t_start) / 60
-        if args.deadline_min and bin_s and elapsed + bin_s / 60 > args.deadline_min:
-            print(f"deadline: {elapsed:.1f} min used, a bin takes "
-                  f"{bin_s / 60:.1f} min; stopping before bin {b}", flush=True)
+        need = max(bin_est(timing["ref_s_per_sample"]), 1.1 * (bin_s or 0))
+        if left_s() < need:
+            print(f"DEADLINE_STOP before bin {b}: {left_s():.0f} s left < "
+                  f"{need:.0f} s per bin", flush=True)
+            stopped = True
             break
         t0 = time.time()
         accs = [zeros_acc() for _ in range(G)]
         L = len(p_idx)
         Q = np.zeros((L, G))
-        losses, tvals = [], []
+        losses, tvals, sq_tot = [], [], []
         for j in range(N):
             g = j % G
             accs[g], sq, loss, t = one(comp, accs[g], b, j)
-            Q[:, g] += np.asarray(sq, np.float64)
+            sq = np.asarray(sq, np.float64)
+            Q[:, g] += sq
+            sq_tot.append(float(sq.sum()))
             losses.append(float(loss))
             tvals.append(float(t))
             if not np.isfinite(losses[-1]) or not np.all(np.isfinite(Q[:, g])):
@@ -1131,12 +1243,16 @@ def run_jax(args):
                         @ X[:, s:s + step].astype(np.float64).T)
             lo_b, hi_b = sorted((a, b))
             state["cross"][f"{lo_b},{hi_b}"] = (Cab if a < b else Cab.T).tolist()
-        del accs, X
+        del accs
         lo, hi = edges(b)
         bin_s = time.time() - t0
         state["bins"][str(b)] = {
             "H": H.tolist(), "Q": Q.tolist(), "loss": losses, "t": tvals,
-            "t_range": [t_of(lo), t_of(hi)], "seconds": bin_s}
+            "t_range": [t_of(lo), t_of(hi)], "seconds": bin_s,
+            "sq_total": sq_tot,
+            "cross_norm2": [float(np.sum(X[g].astype(np.float64) ** 2))
+                            for g in range(G)]}
+        del X
         rep, txt = write_outputs(out, state, extra)
         print(f"bin {b} done in {bin_s:.0f} s ({bin_s / N:.2f} s/sample); "
               f"t {min(tvals):.4f}..{max(tvals):.4f}, loss "
@@ -1150,6 +1266,10 @@ def run_jax(args):
         rep, txt = write_outputs(out, state, {**extra, "go": rep["go"]})
     print(txt, flush=True)
     print(f"total {time.time() - t_start:.0f} s", flush=True)
+    missing = [b for b in run_bins if str(b) not in state["bins"]]
+    if stopped or missing:
+        print(f"PARTIAL: bins {missing} not measured (deadline)", flush=True)
+        sys.exit(6)
 
 
 def parse_args(argv=None):
@@ -1211,8 +1331,13 @@ def parse_args(argv=None):
                     help="smoke: phase-2 fixed minutes (setup, downloads, "
                          "compile, load) in the go/no-go budget")
     ap.add_argument("--deadline-min", type=float, default=0,
-                    help="stop before a bin that would end after this many "
-                         "minutes of the script (0: no limit)")
+                    help="minutes of the script: refuse to load inputs with "
+                         "< 5 min left, skip the cuDNN trial and stop before "
+                         "any bin (also the first) that would not finish "
+                         "(1.25 x N x measured s/sample + overhead); exit 6 "
+                         "when bins are left out (0: no limit)")
+    ap.add_argument("--bin-overhead-s", type=float, default=60.0,
+                    help="fixed seconds per bin in the deadline estimate")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--allow-any-gpu", action="store_true")
