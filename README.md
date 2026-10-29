@@ -745,6 +745,35 @@ modal run scripts/modal_coherence.py --run run1 --step 1513
 .venv/bin/python scripts/modal_coherence.py --sim-only   # simulation table only (local)
 ```
 
+### Gradient signal / noise per timestep bin (Colab G4)
+
+`scripts/grad_snr.py` asks whether reweighting or stratifying the training
+timestep distribution would raise the gradient S/N enough to matter, at base
+Raw on one bucket (832x1216). K = 8 equal-probability bins of the actual
+training t distribution, the same N images in every bin (fresh noise), per-
+sample gradients (B = 1, exactly train_full's loss and text path) of a
+parameter subset P, summed into G = 8 interleaved group accumulators on the
+GPU. Unbiased `||mu_b||^2` from image-disjoint group pairs, `tr Sigma_b`,
+per-sample S/N with delete-one-group jackknife CIs, split-half cosine with
+the exact sign-flip null, the N needed for detection; on a smaller P' the
+cross-bin `cos(mu_a, mu_b)` and the payoff: predicted per-sample S/N under
+(a) the current t distribution, (b) proportional stratification, (c)
+importance sampling / Neyman allocation (objective unchanged), (d) objective
+reweighting. Formulas and modes in the script's docstring. Phase 1 (`smoke`)
+checks the platform, AOT-compiles for memory, times a sample and runs the two
+extreme bins with N = 32, then prints GO / NO-GO for phase 2 (`measure`, all
+bins). Kit: `scripts/grad_snr_launch.sh` (laptop; samples, bundle = `git
+archive HEAD`, remote checks, cost, colab_job.sh) + `scripts/grad_snr_vm.sh`
+(VM: pinned jax[cuda13] 0.11.0, pinned-revision downloads, sha256 / encoder
+identity checks).
+
+```bash
+scripts/grad_snr_launch.sh dry 1                    # checks + cost + the launch command, nothing billed
+scripts/grad_snr_launch.sh run 1 --confirm-billed   # phase 1 (BILLED, G4 8.9 CU/h)
+scripts/grad_snr_launch.sh run 2 --confirm-billed --n 64
+.venv/bin/python scripts/grad_snr.py --mode report --out <stage>/out   # re-print a report
+```
+
 ### Dataset filter: inset / border score on Modal
 
 `scripts/modal_score_borders.py` scores every image of
@@ -1021,7 +1050,8 @@ What the suite guards (test code is capped at 10 % of the code lines, so only mu
 `test_export.py` bit-exact official-layout export and orbax round trip; `test_train_full.py` loss, masking, resume
 refusals and exact resume; `test_data.py` / `test_cache_latents.py` / `test_patch_latents.py` latent manifest and
 loader integrity; `test_qwen3_text.py` text tower config and loader; `test_sampling.py` text caching / cfg batch;
-`test_modal_safety.py` HF token / upload / export-object safety; `test_vae_fast.py` (skipped without diffusers).
+`test_modal_safety.py` HF token / upload / export-object safety; `test_grad_snr.py` S/N estimator on planted
+gradients; `test_vae_fast.py` (skipped without diffusers).
 
 All of these run on CPU (8 emulated devices where sharding is involved).
 The attention and act-sharding tests also pass under JAX 0.11 (the version
@@ -1055,6 +1085,8 @@ scripts/
   modal_eval_full.py  # Modal: full FT vs base side-by-side images + contact sheet
   modal_export_full.py  # Modal: export a tree of an R2 orbax checkpoint + weight drift
   modal_coherence.py  # Modal: update coherence of an R2 train state (f32) + null model
+  grad_snr.py       # jax: gradient S/N per timestep bin + stratification payoff (Colab G4)
+  grad_snr_launch.sh / grad_snr_vm.sh  # its Colab kit (laptop driver / VM job)
   modal_score_borders.py  # Modal: inset/border score of the dataset + review page
   datafilter_apply.py  # review actions -> patch dir (crops from originals, captions)
   modal_patch_latents.py  # Modal + local: data-filter patch -> new latents version
