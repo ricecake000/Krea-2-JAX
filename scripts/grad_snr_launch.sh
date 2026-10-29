@@ -8,7 +8,10 @@
 #   bins in the same session (or a fresh measurement at a larger N_m; rule in grad_snr.py). B = the CU allowed after
 #   the gate (default 15). The colab_job.sh wall cap -m (the real money guard) = wall_cap_min of COST_GO_MAX, whose
 #   max_min adds the pinned post-cap allowances (CJ_ENV below) = the worst-case billed minutes.
-# dry: samples (select from the local filtered metadata.parquet, sha256-checked against the dataset commit) -> bundle
+# dry: samples (select from the local filtered metadata.parquet, sha256-checked against the dataset commit) -> the
+#   memory pre-flight (grad_snr.py --mode aot with the job's args: CPU AOT of the exact per-sample step under jax
+#   0.11.0 = the VM's pin, GPU peak estimate calibrated on the G4; DRY_FAIL unless a remat candidate fits 0.92 x the
+#   G4 limit; $GRADSNR_STAGE/auto-<ts>/aot.log + aot.json) -> bundle
 #   (git archive HEAD + samples.json; refuses a dirty tree: commit first) -> checks (bundle size <= 30 MB, scripts
 #   parse, repo metadata + LFS sha256 of the files the VM will fetch, and an authenticated 8-byte Range GET of
 #   raw.safetensors, the latents manifest and every shard, i.e. the token can really download them) ->
@@ -24,6 +27,7 @@ cd "$(dirname "$0")/.."
 REPO=$PWD
 M=(systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=0 taskset -c 4-7 nice -n 10)
 PY=${GRADSNR_PY:-$REPO/.venv/bin/python}
+AOT_PY=${GRADSNR_AOT_PY:-$HOME/krea2-ops/mi350x/venv-jax0110/bin/python}   # jax 0.11.0 CPU (--mode aot checks it)
 COLAB_JOB=${COLAB_JOB:-$HOME/maxdiffusion-krea2-run/colab/colab_job.sh}
 STAGE_ROOT=${GRADSNR_STAGE:-$HOME/colab_upload/krea2-gradsnr}
 META=${GRADSNR_METADATA:-/home/mj/krea2-ops/eval/datafilter/latents_v2_patched/metadata.parquet}
@@ -60,6 +64,7 @@ case "$CMD" in dry|run) ;; *) die "$USAGE" ;; esac
 [ -z "$CAP" ] || [[ "$CAP" =~ ^[1-9][0-9]*$ ]] || die "--cap-min must be a positive integer"
 MODE=auto
 [ -x "$PY" ] || die "no python at $PY"
+[ -x "$AOT_PY" ] || die "no jax 0.11.0 python at $AOT_PY (GRADSNR_AOT_PY) for the memory pre-flight"
 [ -f "$COLAB_JOB" ] || die "colab_job.sh not found at $COLAB_JOB"
 [ -f "$HF_TOKEN_FILE" ] || die "no HF token file $HF_TOKEN_FILE"
 git diff --quiet HEAD -- || die "uncommitted changes: the bundle is git archive HEAD, commit first"
@@ -129,6 +134,13 @@ if [ ! -f "$SAMPLES" ]; then
     --revision "$DATA_REV" --out "$SAMPLES"
 fi
 cp "$SAMPLES" "$STAGE/samples.json"
+ARGS=(--bins 8 --n-per-bin "$N" --budget-cu "$BUDGET")
+ARGS+=(${EXTRA[@]+"${EXTRA[@]}"})
+
+# ---- memory pre-flight (free, ~15-30 s): the step the VM AOT-checks before loading anything, estimated here ----
+"${M[@]}" "$AOT_PY" -I scripts/grad_snr.py "${ARGS[@]}" --mode aot --out "$STAGE" --samples "$STAGE/samples.json" \
+  > "$STAGE/aot.log" 2>&1 || { tail -n 3 "$STAGE/aot.log" >&2; die "memory pre-flight: no remat candidate fits the G4 (or the pre-flight failed; $STAGE/aot.log)"; }
+grep -E '^(aot: |AOT_OK )' "$STAGE/aot.log" || die "memory pre-flight printed no verdict ($STAGE/aot.log)"
 git archive --prefix=repo/ -o "$STAGE/gradsnr_in.tar" HEAD
 tar -rf "$STAGE/gradsnr_in.tar" -C "$STAGE" samples.json
 SZ=$(stat -c %s "$STAGE/gradsnr_in.tar")
@@ -214,8 +226,6 @@ print(f"REMOTE_OK Raw downloadable with the token (authenticated Range GET, no r
       f"(LFS sha256 == samples digests), Qwen rev ebb281ec ok; VM downloads {gb:.1f} GB")
 EOF
 
-ARGS=(--bins 8 --n-per-bin "$N" --budget-cu "$BUDGET")
-ARGS+=(${EXTRA[@]+"${EXTRA[@]}"})
 JOB="tar xOf /root/gradsnr_in.tar repo/scripts/grad_snr_vm.sh > /root/grad_snr_vm.sh && bash /root/grad_snr_vm.sh $MODE $CAP ${ARGS[*]}"
 UPS=(-u "$STAGE/gradsnr_in.tar:/root/gradsnr_in.tar" -u "$SECRET_DIR/hf_token:/root/hf_token")
 DOWNS=(-d "/content/gradsnr_out.tgz:$STAGE/gradsnr_out.tgz")
