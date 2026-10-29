@@ -1587,8 +1587,13 @@ def run_jax(args):
                 H = np.stack([grams.gram(accs, k) for k in range(L)])
                 slots.acquire()  # waits while 2 P' copies are in flight
                 try:
-                    X = np.stack([np.concatenate([np.asarray(accs[g][k]).ravel()
-                                                  for k in c_pos]) for g in range(G)])
+                    X = np.empty((G, c_size), np.float32)  # filled in place
+                    for g in range(G):
+                        o = 0
+                        for k in c_pos:
+                            a = np.asarray(accs[g][k]).ravel()
+                            X[g, o:o + a.size] = a
+                            o += a.size
                 except BaseException:
                     slots.release()
                     raise
