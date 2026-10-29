@@ -2,16 +2,19 @@
 # Laptop driver of the gradient S/N measurement on one Colab G4 (scripts/grad_snr.py, VM side scripts/grad_snr_vm.sh).
 # The billed part goes through ~/maxdiffusion-krea2-run/colab/colab_job.sh (3 dead-man switches, its own state and
 # endpoint ownership); this script never calls `colab` itself.
-#   scripts/grad_snr_launch.sh dry PHASE [--n N] [--cap-min M] [-- grad_snr.py args]
-#   scripts/grad_snr_launch.sh run PHASE --confirm-billed [--n N] [--cap-min M] [-- grad_snr.py args]
-#   PHASE 1 = smoke (extreme bins, N 32, go/no-go), 2 = measure (all 8 bins, N 64 unless --n)
+#   scripts/grad_snr_launch.sh dry [--n N] [--budget-cu B] [--cap-min M] [-- grad_snr.py args]
+#   scripts/grad_snr_launch.sh run --confirm-billed [--n N] [--budget-cu B] [--cap-min M] [-- grad_snr.py args]
+#   ONE session, grad_snr.py --mode auto: bins 0 and 7 at N (default 64), the go/no-go gate, and on GO the other
+#   bins in the same session (or a fresh measurement at a larger N_m; rule in grad_snr.py). B = the CU allowed after
+#   the gate (default 15). The colab_job.sh wall cap -m (the real money guard) = COST_GO_MAX.
 # dry: samples (select from the local filtered metadata.parquet, sha256-checked against the dataset commit) -> bundle
 #   (git archive HEAD + samples.json; refuses a dirty tree: commit first) -> checks (bundle size <= 30 MB, scripts
 #   parse, repo metadata + LFS sha256 of the files the VM will fetch, and an authenticated 8-byte Range GET of
 #   raw.safetensors, the latents manifest and every shard, i.e. the token can really download them) ->
 #   the cost estimate and the exact launch command. DRY_OK / DRY_FAIL.
 # run: dry, then colab_job.sh --gpu G4 (BILLED, needs --confirm-billed), then unpacks the download into the stage dir
-#   and prints the report. Results: $GRADSNR_STAGE/phase<P>-<ts>/out/ (state.json, report.json, report.txt, logs).
+#   and prints the gate line and both reports. Results: $GRADSNR_STAGE/auto-<ts>/out/{smoke,measure}/ (state.json,
+#   report.json, report.txt) + logs.
 # Secret: the HF token (~/.cache/huggingface/token) is copied into a fresh 0700 mktemp dir, uploaded as
 #   /root/hf_token, deleted locally on exit and on the VM right after the downloads; never printed or in argv.
 # Laptop python runs under systemd-run MemoryMax=12G, taskset -c 4-7, nice 10.
@@ -31,59 +34,76 @@ MAX_UPLOAD_B=30000000        # one colab upload = one base64 PUT (~31 MB worked,
 CU_H=8.90                    # G4, measured 2026-10-27
 die() { echo "ERROR: $*" >&2; [ "${CMD:-dry}" = dry ] && echo DRY_FAIL; exit 1; }
 
-CMD=${1:-}; PHASE=${2:-}; shift 2 || true
-N=""; CAP=""; CONFIRM=0; EXTRA=()
+USAGE="usage: grad_snr_launch.sh dry|run [--confirm-billed] [--n N] [--budget-cu B] [--cap-min M] [-- grad_snr.py args]"
+CMD=${1:-}; shift || true
+N=64; BUDGET=15; CAP=""; CONFIRM=0; EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    1|2) die "the PHASE argument is gone: one session runs the gate and phase 2 (grad_snr.py --mode auto); $USAGE" ;;
     --n) N=$2; shift 2 ;;
+    --budget-cu) BUDGET=$2; shift 2 ;;
     --cap-min) CAP=$2; shift 2 ;;
     --confirm-billed) CONFIRM=1; shift ;;
     --) shift; EXTRA=("$@"); break ;;
-    *) die "unknown argument $1" ;;
+    *) die "unknown argument $1; $USAGE" ;;
   esac
 done
-case "$CMD" in dry|run) ;; *) die "usage: grad_snr_launch.sh dry|run 1|2 [--n N] [--cap-min M] [--confirm-billed] [-- args]" ;; esac
-case "$PHASE" in
-  1) MODE=smoke; N=${N:-32}; RUNBINS=2; DEF_CAP=60 ;;
-  2) MODE=measure; N=${N:-64}; RUNBINS=8; DEF_CAP=0 ;;
-  *) die "PHASE must be 1 or 2" ;;
-esac
+case "$CMD" in dry|run) ;; *) die "$USAGE" ;; esac
+[[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -ge 16 ] || die "--n must be an integer >= 16 (2 x 8 groups)"
+[[ "$BUDGET" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--budget-cu must be a number"
+[ -z "$CAP" ] || [[ "$CAP" =~ ^[1-9][0-9]*$ ]] || die "--cap-min must be a positive integer"
+MODE=auto
 [ -x "$PY" ] || die "no python at $PY"
 [ -f "$COLAB_JOB" ] || die "colab_job.sh not found at $COLAB_JOB"
 [ -f "$HF_TOKEN_FILE" ] || die "no HF token file $HF_TOKEN_FILE"
 git diff --quiet HEAD -- || die "uncommitted changes: the bundle is git archive HEAD, commit first"
 HEAD_SHA=$(git rev-parse HEAD)
 
-# ---- cost estimate (assumptions stated; s/sample is the one that matters, phase 1 measures it) ----
-read -r EST_MIN EST_CAP COST_LINE < <(python3 -I - "$PHASE" "$N" "$RUNBINS" "$CU_H" "${CAP:-0}" "$DEF_CAP" <<'EOF'
+# ---- cost estimate (assumptions stated; s/sample is the one that matters, the run measures it) ----
+{ read -r EST_NOGO; read -r CAP; read -r NOGO_LINE; read -r GO_LINE; } < <(python3 -I - "$N" "$BUDGET" "$CU_H" "${CAP:-0}" <<'EOF'
 import math, sys
-phase, n, nbins, cu_h, cap, def_cap = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+n, budget_cu, cu_h, cap_arg = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
 S_PER_SAMPLE = 4.0     # assumed: B300 measured 0.86 s/sample (bench_step fwdbwd, ref attention, 4608 tokens);
                        # RTX PRO 6000 ~1/4.5 of its bf16 tensor rate and ~1/4.4 of its HBM bandwidth -> ~4 s
-SETUP = 12.0           # create + upload 2, uv/jax install 2, downloads ~37 GB (Raw 26.3, Qwen 8.9, 4 shards 1.9)
-                       # at ~150 MB/s 4.2, raw sha256 1, text-encoder identity hash 0.5, slack 2.3
-COMPILE = 3.0          # per AOT compile of the unrolled 28-block grad step
-LOAD = 3.0             # Raw 26 GB to the device + text states
-BIN_END = 0.5          # per bin: Grams, P' transfer, host cross-bin products
+K = 8
+CREATE = 2.0           # create + upload (billed from create)
+HUB = 0.5              # downloader venv (huggingface_hub, hf_xet), then the background downloads start
+DL_IN = 1.5            # latents 1.9 GB + Qwen 8.9 GB at ~150 MB/s (assumed undisturbed by the parallel install)
+DL_RAW = 3.0 + 1.0     # Raw 26.3 GB at ~150 MB/s + its sha256
+INSTALL = 2.0          # uv venv + jax etc., in parallel with the downloads
+COMPILE = 3.0          # ref AOT compile of the unrolled 28-block grad step; the cuDNN candidate compiles on a
+                       # second thread at the same time (assumed hidden: >= 2 free cores)
+INPUTS = 1.5           # shard sha256, latents, Qwen identity hash + 128 text states (after COMPILE, Qwen ready)
+LOAD = 3.0             # Raw 26 GB to the device, once its marker (downloaded + sha256) is there
+BIN_END = 0.5          # per bin: Grams + P' transfer on the GPU path (host cross products overlap the next bin)
 TEARDOWN = 2.0         # pack + download + unassign
-if phase == 1:
-    compiles, samples = 3, 1 + 3 + 2 + 4 + nbins * n   # 2 remat candidates worst case + cudnn; warmup, timing
-else:
-    compiles, samples = 2, 1 + 3 + nbins * n                  # warmup + timing (deadline estimate)
-est = SETUP + compiles * COMPILE + LOAD + samples * S_PER_SAMPLE / 60 + nbins * BIN_END + TEARDOWN
-cap = cap or def_cap or int(math.ceil(est * 1.4 + 10))
-line = (f"COST phase={phase} est_min={est:.0f} est_cu={est / 60 * cu_h:.1f} cap_min={cap} "
-        f"cap_cu={cap / 60 * cu_h:.1f} (G4 {cu_h} CU/h; samples {samples} at {S_PER_SAMPLE} s/sample assumed = "
-        f"{samples * S_PER_SAMPLE / 60:.0f} min; setup {SETUP:.0f} + {compiles} compiles x {COMPILE:.0f} + load "
-        f"{LOAD:.0f} + bins {nbins} x {BIN_END} + teardown {TEARDOWN:.0f} min)")
-print(f"{est:.0f} {cap} {line}")
+CONT = 1.0             # gate -> phase 2 (reports, memmap re-create on a fresh measurement)
+# critical path: the downloads and install -> compile -> inputs run side by side; Raw loads after both
+ready = CREATE + max(HUB + DL_IN + DL_RAW, HUB + INSTALL + COMPILE + INPUTS) + LOAD
+pre = 1 + 3 + 2 + 4    # warmup + 3 timing samples; cuDNN gradient pair + warmup + 3 timing samples
+gate = ready + pre * S_PER_SAMPLE / 60 + 2 * (n * S_PER_SAMPLE / 60 + BIN_END) + TEARDOWN
+rest = CONT + (K - 2) * (n * S_PER_SAMPLE / 60 + BIN_END)
+gate_cap = int(math.ceil(gate * 1.4 + 10))
+budget_min = int(math.ceil(budget_cu / cu_h * 60))
+cap = cap_arg or gate_cap + budget_min
+nogo = (f"COST_NOGO est_min={gate:.0f} est_cu={gate / 60 * cu_h:.1f} (setup to Raw on the device {ready:.0f} min = "
+        f"create {CREATE:.0f} + max(downloads {HUB + DL_IN + DL_RAW:.0f}, install + compile + inputs "
+        f"{HUB + INSTALL + COMPILE + INPUTS:.0f}) + load {LOAD:.0f}; {pre} timing samples + 2 gate bins x N {n} at "
+        f"{S_PER_SAMPLE} s/sample assumed = {(pre + 2 * n) * S_PER_SAMPLE / 60:.0f} min; teardown {TEARDOWN:.0f}; "
+        f"G4 {cu_h} CU/h)")
+go = (f"COST_GO_MAX cap_min={cap} cap_cu={cap / 60 * cu_h:.1f} (" + (
+      f"--cap-min {cap}" if cap_arg else
+      f"gate stage ceil({gate:.0f} x 1.4 + 10) = {gate_cap} + post-gate budget ceil({budget_cu:g} CU / {cu_h} x 60) "
+      f"= {budget_min}") + f" min = the colab_job.sh wall cap; expected GO with N_m = N {n}: "
+      f"~{gate + rest:.0f} min / {(gate + rest) / 60 * cu_h:.1f} CU)")
+print(f"{gate:.0f}\n{cap}\n{nogo}\n{go}")
 EOF
-)
-CAP=$EST_CAP
+) || die "cost estimate failed"
+[[ "$CAP" =~ ^[1-9][0-9]*$ ]] || die "bad cap $CAP"
 
 # ---- samples + bundle ----
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-STAGE=$STAGE_ROOT/phase$PHASE-$TS
+STAGE=$STAGE_ROOT/auto-$TS
 case "$STAGE" in *:*) die "stage path must not contain ':'" ;; esac
 mkdir -p "$STAGE"
 SAMPLES=$STAGE_ROOT/samples.json
@@ -179,26 +199,29 @@ print(f"REMOTE_OK Raw downloadable with the token (authenticated Range GET, no r
       f"(LFS sha256 == samples digests), Qwen rev ebb281ec ok; VM downloads {gb:.1f} GB")
 EOF
 
-ARGS=(--bins 8 --n-per-bin "$N")
-[ "$PHASE" = 1 ] && ARGS+=(--run-bins 0,7)
+ARGS=(--bins 8 --n-per-bin "$N" --budget-cu "$BUDGET")
 ARGS+=(${EXTRA[@]+"${EXTRA[@]}"})
 JOB="tar xOf /root/gradsnr_in.tar repo/scripts/grad_snr_vm.sh > /root/grad_snr_vm.sh && bash /root/grad_snr_vm.sh $MODE $CAP ${ARGS[*]}"
 UPS=(-u "$STAGE/gradsnr_in.tar:/root/gradsnr_in.tar" -u "$SECRET_DIR/hf_token:/root/hf_token")
 DOWNS=(-d "/content/gradsnr_out.tgz:$STAGE/gradsnr_out.tgz")
-echo "$COST_LINE"
-echo "LAUNCH (billed): bash $COLAB_JOB -s gradsnr-p$PHASE --gpu G4 -m $CAP -u $STAGE/gradsnr_in.tar:/root/gradsnr_in.tar -u <0700 tmp>/hf_token:/root/hf_token ${DOWNS[*]} -- '$JOB'"
+echo "$NOGO_LINE"
+echo "$GO_LINE"
+echo "LAUNCH (billed): bash $COLAB_JOB -s gradsnr-auto --gpu G4 -m $CAP -u $STAGE/gradsnr_in.tar:/root/gradsnr_in.tar -u <0700 tmp>/hf_token:/root/hf_token ${DOWNS[*]} -- '$JOB'"
 if [ "$CMD" = dry ]; then echo DRY_OK; exit 0; fi
-[ "$CONFIRM" = 1 ] || die "run is billed (~$EST_MIN min, cap $CAP min at $CU_H CU/h): pass --confirm-billed"
+[ "$CONFIRM" = 1 ] || die "run is billed (~$EST_NOGO min on NO-GO, at most the cap $CAP min at $CU_H CU/h): pass --confirm-billed"
 set +e
-bash "$COLAB_JOB" -s "gradsnr-p$PHASE" --gpu G4 -m "$CAP" "${UPS[@]}" "${DOWNS[@]}" -- "$JOB"
+bash "$COLAB_JOB" -s gradsnr-auto --gpu G4 -m "$CAP" "${UPS[@]}" "${DOWNS[@]}" -- "$JOB"
 RC=$?
 set -e
 cleanup; SECRET_DIR=""
 echo "colab_job rc=$RC"
 if [ -f "$STAGE/gradsnr_out.tgz" ]; then
   tar xzf "$STAGE/gradsnr_out.tgz" -C "$STAGE" && mv "$STAGE/gradsnr_out" "$STAGE/out"
-  cat "$STAGE/out/report.txt" 2> /dev/null || true
+  for s in smoke measure; do
+    if [ -f "$STAGE/out/$s/report.txt" ]; then echo "==== $s: $STAGE/out/$s/report.txt"; cat "$STAGE/out/$s/report.txt"; fi
+  done
+  grep -h '^GRADSNR_GATE ' "$STAGE/out/grad_snr.log" 2> /dev/null || echo "no GRADSNR_GATE line (the gate was not reached)"
 else
-  echo "no gradsnr_out.tgz; if job.log has a GRADSNR_STATE line: $PY scripts/grad_snr.py --mode report --out . --from-log <run dir>/job.log"
+  echo "no gradsnr_out.tgz; if job.log has GRADSNR_STATE lines: $PY scripts/grad_snr.py --mode report --out . --from-log <run dir>/job.log [--stage smoke|measure]"
 fi
 exit "$RC"

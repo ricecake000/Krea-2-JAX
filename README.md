@@ -759,19 +759,26 @@ the exact sign-flip null, the N needed for detection; on a smaller P' the
 cross-bin `cos(mu_a, mu_b)` and the payoff: predicted per-sample S/N under
 (a) the current t distribution, (b) proportional stratification, (c)
 importance sampling / Neyman allocation (objective unchanged), (d) objective
-reweighting. Formulas and modes in the script's docstring. Phase 1 (`smoke`)
-checks the platform, AOT-compiles for memory, times a sample and runs the two
-extreme bins with N = 32, then prints GO / NO-GO for phase 2 (`measure`, all
-bins). Kit: `scripts/grad_snr_launch.sh` (laptop; samples, bundle = `git
-archive HEAD`, remote checks, cost, colab_job.sh) + `scripts/grad_snr_vm.sh`
-(VM: pinned jax[cuda13] 0.11.0, pinned-revision downloads, sha256 / encoder
-identity checks).
+reweighting. Formulas and modes in the script's docstring. One billed
+session (`--mode auto`): it checks the platform, AOT-compiles for memory
+while the inputs download (a cuDNN attention candidate compiles alongside
+and is used only if its gradient matches ref, cos >= 0.999, and it is >= 10%
+faster), times a sample, runs the two extreme bins at N = 64 and evaluates
+the pre-registered GO / NO-GO gate. NO-GO stops there; GO continues with
+the other six bins in the same state (or, when only the projection says
+GO, a fresh measurement of all bins at the projected N), sized to the CU
+budget after the gate and the time left. The gate snapshot lands in
+`out/smoke/`, the result in `out/measure/`. Kit:
+`scripts/grad_snr_launch.sh` (laptop; samples, bundle = `git archive HEAD`,
+remote checks, cost: NO-GO estimate and the hard cap, colab_job.sh) +
+`scripts/grad_snr_vm.sh` (VM: background pinned-revision downloads with
+ready markers, pinned jax[cuda13] 0.11.0, sha256 / encoder identity
+checks).
 
 ```bash
-scripts/grad_snr_launch.sh dry 1                    # checks + cost + the launch command, nothing billed
-scripts/grad_snr_launch.sh run 1 --confirm-billed   # phase 1 (BILLED, G4 8.9 CU/h)
-scripts/grad_snr_launch.sh run 2 --confirm-billed --n 64
-.venv/bin/python scripts/grad_snr.py --mode report --out <stage>/out   # re-print a report
+scripts/grad_snr_launch.sh dry                     # checks + cost + the launch command, nothing billed
+scripts/grad_snr_launch.sh run --confirm-billed    # gate + phase 2 in one session (BILLED, G4 8.9 CU/h)
+.venv/bin/python scripts/grad_snr.py --mode report --out <stage>/out   # re-print (out/measure, else out/smoke)
 ```
 
 ### Dataset filter: inset / border score on Modal
