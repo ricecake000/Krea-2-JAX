@@ -226,12 +226,14 @@ print(f"REMOTE_OK Raw downloadable with the token (authenticated Range GET, no r
       f"(LFS sha256 == samples digests), Qwen rev ebb281ec ok; VM downloads {gb:.1f} GB")
 EOF
 
-JOB="tar xOf /root/gradsnr_in.tar repo/scripts/grad_snr_vm.sh > /root/grad_snr_vm.sh && bash /root/grad_snr_vm.sh $MODE $CAP ${ARGS[*]}"
+# job.sh on the VM is parsed by bash once: each argument shell-escaped, so the VM's argv == the pre-flight's ARGS
+VM_ARGV=$(printf '%q ' "$MODE" "$CAP" "${ARGS[@]}")
+JOB="tar xOf /root/gradsnr_in.tar repo/scripts/grad_snr_vm.sh > /root/grad_snr_vm.sh && bash /root/grad_snr_vm.sh ${VM_ARGV% }"
 UPS=(-u "$STAGE/gradsnr_in.tar:/root/gradsnr_in.tar" -u "$SECRET_DIR/hf_token:/root/hf_token")
 DOWNS=(-d "/content/gradsnr_out.tgz:$STAGE/gradsnr_out.tgz")
 echo "$NOGO_LINE"
 echo "$GO_LINE"
-echo "LAUNCH (billed): env ${CJ_ENV[*]} bash $COLAB_JOB -s gradsnr-auto --gpu G4 -m $CAP -u $STAGE/gradsnr_in.tar:/root/gradsnr_in.tar -u <0700 tmp>/hf_token:/root/hf_token ${DOWNS[*]} -- '$JOB'"
+echo "LAUNCH (billed): env ${CJ_ENV[*]} bash $COLAB_JOB -s gradsnr-auto --gpu G4 -m $CAP -u $STAGE/gradsnr_in.tar:/root/gradsnr_in.tar -u <0700 tmp>/hf_token:/root/hf_token ${DOWNS[*]} -- $(printf '%q' "$JOB")"
 if [ "$CMD" = dry ]; then echo DRY_OK; exit 0; fi
 [ "$CONFIRM" = 1 ] || die "run is billed (~$EST_NOGO min on NO-GO, at most $MAX_MIN min at $CU_H CU/h): pass --confirm-billed"
 set +e
