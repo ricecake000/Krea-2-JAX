@@ -582,6 +582,13 @@ def report_text(rep):
             lines.append("   (conditional on the sign-symmetry / no-unobserved-"
                          "tail assumption of the rule above: a reason to run "
                          "phase 2, not 5% evidence of signal)")
+    if "budget" in rep:
+        bu = rep["budget"]
+        lines.append(f"-- post-gate budget {bu['budget_cu']:g} CU: bins admitted until "
+                     f"{bu['budget_end_after_gate_s']:.0f} s after the gate (reserve "
+                     f"{bu['reserve_s']:.0f} s); spent {bu['spent_after_gate_s']:.0f} s "
+                     f"= {bu['spent_after_gate_cu']:.2f} CU after the gate; "
+                     + (bu["stop"] or "no stop"))
     return "\n".join(lines)
 
 
@@ -1534,21 +1541,24 @@ def run_jax(args):
         return np.lib.format.open_memmap(str(mm_path), mode="w+",
                                          dtype=np.float32, shape=(K, G, c_size))
 
-    def run_stage(stage, out_dir, state, mm, bins, n, key0, sps, extra_s):
+    def run_stage(stage, out_dir, state, mm, bins, n, key0, sps, extra_s,
+                  budget_end=None):
         """The bins (in order; those already in state skipped) at n samples
-        into state / out_dir. GPU part here; the host part of a bin (memmap
+        into state / out_dir; a bin starts only if its estimate fits before
+        the deadline and before budget_end (epoch s; auto: the post-gate CU
+        budget). GPU part here; the host part of a bin (memmap
         row, cross products with every earlier bin, state, outputs) on ONE
         serial worker thread while the next bin runs, <= 2 host copies of
         the P' sums in flight. A worker error is re-raised here (before the
-        next bin, at the latest at the end). -> (stopped, (rep, txt) of the
-        last bin or None)."""
+        next bin, at the latest at the end). -> (the stop line or None,
+        (rep, txt) of the last bin or None)."""
         L = len(p_idx)
         ex = ThreadPoolExecutor(max_workers=1)
         slots = threading.Semaphore(2)
         futs = []
         done = {int(x) for x in state["bins"]}  # main-thread view
         bin_s = None
-        stopped = False
+        stopped = None
 
         def host_part(b, X, H, Q, losses, tvals, sq_tot, secs):
             try:
@@ -1586,9 +1596,14 @@ def run_jax(args):
                 need = max(bin_est(sps, n, K, args.bin_overhead_s),
                            1.1 * (bin_s or 0))
                 if not left_s() > need:
-                    emit(f"DEADLINE_STOP before bin {b}: {left_s():.0f} s left "
-                         f"< {need:.0f} s per bin")
-                    stopped = True
+                    stopped = (f"DEADLINE_STOP before bin {b}: {left_s():.0f} s "
+                               f"left < {need:.0f} s per bin")
+                elif budget_end is not None and not budget_end - time.time() > need:
+                    stopped = (f"BUDGET_STOP before bin {b}: "
+                               f"{budget_end - time.time():.0f} s of the post-gate "
+                               f"CU budget left < {need:.0f} s per bin")
+                if stopped:
+                    emit(stopped)
                     break
                 t0 = time.time()
                 accs = [zeros_acc() for _ in range(G)]
@@ -1686,7 +1701,7 @@ def run_jax(args):
             last = write_outputs(out, state, {**extra, "go": go}, "smoke")
         rep, missing = finish(args.mode, out, state, last, extra, run_bins)
         if stopped or missing:
-            emit(f"PARTIAL: bins {missing} not measured (deadline)")
+            emit(f"PARTIAL: bins {missing} not measured ({stopped or 'deadline'})")
             sys.exit(6)
         return
 
@@ -1698,7 +1713,7 @@ def run_jax(args):
                               base_key, sps, extra)
     if stopped:
         finish("smoke", sm_dir, state, last, extra, run_bins[:2])
-        emit("PARTIAL: the gate bins did not finish (deadline)")
+        emit(f"PARTIAL: the gate bins did not finish ({stopped})")
         sys.exit(6)
     rep = build_report(state)
     det = [b for b, r in rep["bins"].items() if r["P"]["detectable"]]
@@ -1708,6 +1723,7 @@ def run_jax(args):
     # bins' own rate if that is slower (the per-bin deadline uses the same)
     sps_plan = max([sps] + [state["bins"][str(b)]["seconds"] / N
                             for b in run_bins[:2]])
+    t_gate = time.time()
     gate = gate_decision(det, min(ns) if ns else None, N, K, G, sps_plan,
                          n_ship, args.budget_cu, overhead_min, left_s(),
                          args.bin_overhead_s)
@@ -1731,11 +1747,25 @@ def run_jax(args):
         state = new_state(n_m, args.seed + 1)
     emit(f"phase 2: {gate['action']} at N {n_m} (bins "
          f"{[b for b in range(K) if str(b) not in state['bins']]})")
+    # the post-gate CU budget is enforced, not only planned: no bin starts
+    # unless it fits before gate time + budget - the overhead reserve (the
+    # same reserve gate_decision sized the plan with: worker drain, reports)
+    budget_end = t_gate + args.budget_cu / CU_PER_H["G4"] * 3600 - overhead_min * 60
     stopped, last = run_stage("measure", me_dir, state, mm, list(range(K)), n_m,
-                              key_m, sps_plan, gx)
-    _, missing = finish("measure", me_dir, state, last, gx, list(range(K)))
+                              key_m, sps_plan, gx, budget_end)
+    spent = time.time() - t_gate
+    budget = {"budget_cu": args.budget_cu, "reserve_s": overhead_min * 60,
+              "budget_end_epoch": budget_end,
+              "budget_end_after_gate_s": budget_end - t_gate,
+              "spent_after_gate_s": spent,
+              "spent_after_gate_cu": spent / 3600 * CU_PER_H["G4"],
+              "stop": stopped}
+    _, txt = write_outputs(me_dir, state, {**gx, "budget": budget}, "measure")
+    emit(txt)
+    emit(f"total {time.time() - t_start:.0f} s")
+    missing = [b for b in range(K) if str(b) not in state["bins"]]
     if stopped or missing:
-        emit(f"PARTIAL: bins {missing} not measured (deadline)")
+        emit(f"PARTIAL: bins {missing} not measured ({stopped or 'deadline'})")
         sys.exit(6)
 
 
