@@ -115,7 +115,9 @@ Modes:
            plans bins the deadline would cut: a GO whose bins (K-2 at N or
            K at N_m) do not fit stops instead (verdict GO, action stop).
            cuDNN attention (--try-cudnn) is compiled in a background thread
-           while the ref step compiles and the inputs download / load; it
+           while the ref step compiles and the inputs download / load (after
+           the ref timing it is waited for at most --cudnn-wait-s, never into
+           the reserve of the first bins; still compiling -> ref); it
            is used for ALL bins iff its gradient cos vs ref >= 0.999 AND its
            median s/sample <= 0.90 x ref (decided before the first bin,
            recorded in the config; any cuDNN failure -> ref). Output:
@@ -1109,6 +1111,19 @@ def env_report(args):
     return info
 
 
+_COMPILE_THREADS = []  # background cuDNN compiles (daemon threads)
+
+
+def exit_past_compiles(code):
+    """os._exit(code) while an abandoned cuDNN compile is still inside XLA:
+    interpreter finalization under a running compile could crash or hang and
+    turn the exit code; a no-op otherwise"""
+    if any(th.is_alive() for th in _COMPILE_THREADS):
+        emit(f"abandoned cuDNN compile still running: hard exit {code}")
+        sys.stderr.flush()
+        os._exit(code)
+
+
 def _ready(path):
     try:
         return Path(path).read_text().strip() == "ok"
@@ -1333,6 +1348,7 @@ def run_jax(args):
 
         th = threading.Thread(target=run, daemon=True)
         th.start()
+        _COMPILE_THREADS.append(th)
         return th, box
 
     # the cuDNN candidate compiles on a background thread (shapes only)
@@ -1403,41 +1419,61 @@ def run_jax(args):
     # --- timing (every mode: the per-bin time estimate of the deadline) ---
     timing = {}
     extra = {"env": env, "aot": aot, "te_id": te_id}
-    c2 = None
-    if try_cud:
-        t0 = time.time()
-        for th, _ in cud_futs.values():
-            th.join()
-        res = {r: box.get("r", (None, {"remat": r, "attn": "cudnn",
-                                        "error": "compile thread died"}))
-               for r, (_, box) in cud_futs.items()}
-        aot.extend(row for _, row in res.values())
-        c2, row = res[hp.remat_policy]
-        del res
-        if c2 is None:
-            timing["cudnn_error"] = row["error"]
-        emit(f"cudnn compile joined (waited {time.time() - t0:.0f} s): "
-             + ("ok" if c2 is not None else row["error"]))
     base_key = jax.random.PRNGKey(args.seed)
+
+    def median_s(f, warm):
+        """median s/sample of --timing-samples samples after `warm` warm-up
+        samples (bin K//2)"""
+        a, ts = zeros_acc(), []
+        for j in range(warm + args.timing_samples):
+            t0 = time.time()
+            a, _, loss, _ = one(f, a, K // 2, j % n_load, base_key)
+            jax.block_until_ready(loss)
+            ts.append(time.time() - t0)
+        del a
+        return float(np.median(ts[warm:]))
+
     deadline_check("timing")
-    acc = zeros_acc()
-    acc, sq, loss, t = one(comp, acc, K // 2, 0, base_key)
-    jax.block_until_ready(loss)
-    ts = []
-    for j in range(1, 1 + args.timing_samples):
-        t0 = time.time()
-        acc, sq, loss, t = one(comp, acc, K // 2, j % n_load, base_key)
-        jax.block_until_ready(loss)
-        ts.append(time.time() - t0)
-    del acc
-    ref_sps = timing["ref_s_per_sample"] = float(np.median(ts))
+    busy = any(th.is_alive() for th, _ in cud_futs.values())
+    ref_sps = timing["ref_s_per_sample"] = median_s(comp, 1)
     if not (np.isfinite(ref_sps) and ref_sps > 0):
         raise SystemExit(f"invalid timing {ref_sps} s/sample")
     deadline_check("the bins")
     emit(f"timing ({hp.attn}, remat {hp.remat_policy}): {ref_sps:.3f} "
-         f"s/sample (median of {len(ts)})")
+         f"s/sample (median of {args.timing_samples})")
     n_first = 2 if auto else len(run_bins)
     cud_est = 8 * ref_sps + 60
+    c2 = None
+    if try_cud:
+        # bounded: --cudnn-wait-s, and never into the reserve of the trial +
+        # the first bins; a compile still running is abandoned (daemon
+        # thread, its result never read; main() exits past it)
+        wait = max(0.0, min(args.cudnn_wait_s, left_s() - cud_est - n_first
+                            * bin_est(ref_sps, N, K, args.bin_overhead_s)))
+        t0 = time.time()
+        for th, _ in cud_futs.values():
+            th.join(max(0.0, t0 + wait - time.time()))
+        if any(th.is_alive() for th, _ in cud_futs.values()):
+            timing["cudnn_skipped"] = (f"compile not done after "
+                                       f"{time.time() - t0:.0f} s (wait cap "
+                                       f"{wait:.0f} s): ref")
+            emit("cudnn: " + timing["cudnn_skipped"])
+        else:
+            res = {r: box.get("r", (None, {"remat": r, "attn": "cudnn",
+                                            "error": "compile thread died"}))
+                   for r, (_, box) in cud_futs.items()}
+            aot.extend(row for _, row in res.values())
+            c2, row = res[hp.remat_policy]
+            del res
+            if c2 is None:
+                timing["cudnn_error"] = row["error"]
+            emit(f"cudnn compile joined (waited {time.time() - t0:.0f} s): "
+                 + ("ok" if c2 is not None else row["error"]))
+            if c2 is not None and busy:
+                # the compile ran during the ref timing: time ref again so the
+                # switch rule compares undisturbed numbers
+                ref_sps = timing["ref_s_per_sample"] = median_s(comp, 0)
+                emit(f"timing ({hp.attn}, re-timed): {ref_sps:.3f} s/sample")
     if c2 is not None and (left_s() - cud_est
                            < n_first * bin_est(ref_sps, N, K, args.bin_overhead_s)):
         timing["cudnn_skipped"] = (f"deadline: {left_s():.0f} s left, the "
@@ -1451,15 +1487,7 @@ def run_jax(args):
                     / math.sqrt(sum(grams.dot(a, a) for a in g_ref)
                                 * sum(grams.dot(b, b) for b in g_cud)))
             del g_ref, g_cud
-            a2 = zeros_acc()
-            ts2 = []
-            for j in range(1 + args.timing_samples):
-                t0 = time.time()
-                a2, sq, loss, t = one(c2, a2, K // 2, j % n_load, base_key)
-                jax.block_until_ready(loss)
-                ts2.append(time.time() - t0)
-            del a2
-            timing["cudnn_s_per_sample"] = float(np.median(ts2[1:]))
+            timing["cudnn_s_per_sample"] = median_s(c2, 1)
             timing["cudnn_grad_cos_vs_ref"] = float(cosv)
         except Exception as e:  # optional speed-up only
             timing["cudnn_error"] = repr(e)[:500]
@@ -1766,6 +1794,9 @@ def parse_args(argv=None):
                     default=True, help="smoke: also time --attn cudnn; auto: "
                     "and use it iff cos >= 0.999 and <= 0.90 x ref s/sample")
     ap.add_argument("--timing-samples", type=int, default=3)
+    ap.add_argument("--cudnn-wait-s", type=float, default=300.0,
+                    help="max seconds to wait (after the ref timing) for the "
+                         "background cuDNN compile; still running -> ref")
     ap.add_argument("--budget-cu", type=float, default=15.0,
                     help="smoke: phase-2 CU budget of the go/no-go rule; "
                          "auto: the CU allowed after the gate")
@@ -1827,7 +1858,21 @@ def main(argv=None):
     for k in ("base_ckpt", "text_encoder", "data_dir", "samples"):
         if getattr(args, k) is None:
             raise SystemExit(f"--{k.replace('_', '-')} is required")
-    return run_jax(args)
+    try:
+        run_jax(args)
+    except SystemExit as e:
+        if any(th.is_alive() for th in _COMPILE_THREADS):
+            if e.code is not None and not isinstance(e.code, int):
+                print(e.code, file=sys.stderr)
+            exit_past_compiles(e.code if isinstance(e.code, int) else 1)
+        raise
+    except BaseException:
+        if any(th.is_alive() for th in _COMPILE_THREADS):
+            import traceback
+            traceback.print_exc()
+            exit_past_compiles(1)
+        raise
+    exit_past_compiles(0)
 
 
 if __name__ == "__main__":

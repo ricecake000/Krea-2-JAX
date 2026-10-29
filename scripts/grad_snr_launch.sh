@@ -6,7 +6,8 @@
 #   scripts/grad_snr_launch.sh run --confirm-billed [--n N] [--budget-cu B] [--cap-min M] [-- grad_snr.py args]
 #   ONE session, grad_snr.py --mode auto: bins 0 and 7 at N (default 64), the go/no-go gate, and on GO the other
 #   bins in the same session (or a fresh measurement at a larger N_m; rule in grad_snr.py). B = the CU allowed after
-#   the gate (default 15). The colab_job.sh wall cap -m (the real money guard) = COST_GO_MAX.
+#   the gate (default 15). The colab_job.sh wall cap -m (the real money guard) = wall_cap_min of COST_GO_MAX, whose
+#   max_min adds the pinned post-cap allowances (CJ_ENV below) = the worst-case billed minutes.
 # dry: samples (select from the local filtered metadata.parquet, sha256-checked against the dataset commit) -> bundle
 #   (git archive HEAD + samples.json; refuses a dirty tree: commit first) -> checks (bundle size <= 30 MB, scripts
 #   parse, repo metadata + LFS sha256 of the files the VM will fetch, and an authenticated 8-byte Range GET of
@@ -32,6 +33,11 @@ META_SHA=c1d533433f5376cd1a57bd6a5d0508b9361298ac0be4e7114e236e0d93fb7643   # me
 HF_TOKEN_FILE=${HF_TOKEN_FILE:-$HOME/.cache/huggingface/token}
 MAX_UPLOAD_B=30000000        # one colab upload = one base64 PUT (~31 MB worked, ~113 MB failed)
 CU_H=8.90                    # G4, measured 2026-10-27
+# colab_job.sh knobs pinned for this job, so the printed worst case holds: billing can last past the -m wall cap by
+# the download phase (job done -> hold -> -d downloads; our tgz is a few MB) and, if the driver dies or overruns, the
+# guard's deadline (armed BEFORE the create: wall cap + DOWNLOAD_PHASE_S + GUARD_SLACK_S), its poll and one stop pass
+# up to the unassign (lookup + list + unassign, each timeout -k 10 GUARD_API_TIMEOUT_S)
+CJ_ENV=(DOWNLOAD_PHASE_S=300 GUARD_SLACK_S=600 GUARD_POLL_S=15 GUARD_API_TIMEOUT_S=120)
 die() { echo "ERROR: $*" >&2; [ "${CMD:-dry}" = dry ] && echo DRY_FAIL; exit 1; }
 
 USAGE="usage: grad_snr_launch.sh dry|run [--confirm-billed] [--n N] [--budget-cu B] [--cap-min M] [-- grad_snr.py args]"
@@ -60,9 +66,11 @@ git diff --quiet HEAD -- || die "uncommitted changes: the bundle is git archive 
 HEAD_SHA=$(git rev-parse HEAD)
 
 # ---- cost estimate (assumptions stated; s/sample is the one that matters, the run measures it) ----
-{ read -r EST_NOGO; read -r CAP; read -r NOGO_LINE; read -r GO_LINE; } < <(python3 -I - "$N" "$BUDGET" "$CU_H" "${CAP:-0}" <<'EOF'
+{ read -r EST_NOGO; read -r CAP; read -r MAX_MIN; read -r NOGO_LINE; read -r GO_LINE; } < <(python3 -I - "$N" "$BUDGET" \
+    "$CU_H" "${CAP:-0}" "${CJ_ENV[@]}" <<'EOF'
 import math, sys
 n, budget_cu, cu_h, cap_arg = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
+cj = {k: int(v) for k, v in (a.split("=") for a in sys.argv[5:])}
 S_PER_SAMPLE = 4.0     # assumed: B300 measured 0.86 s/sample (bench_step fwdbwd, ref attention, 4608 tokens);
                        # RTX PRO 6000 ~1/4.5 of its bf16 tensor rate and ~1/4.4 of its HBM bandwidth -> ~4 s
 K = 8
@@ -86,20 +94,27 @@ rest = CONT + (K - 2) * (n * S_PER_SAMPLE / 60 + BIN_END)
 gate_cap = int(math.ceil(gate * 1.4 + 10))
 budget_min = int(math.ceil(budget_cu / cu_h * 60))
 cap = cap_arg or gate_cap + budget_min
+# billed past the wall cap at most: download phase + guard slack + guard poll + one stop pass (3 API calls)
+stop_pass = 3 * (cj["GUARD_API_TIMEOUT_S"] + 10)
+post_s = cj["DOWNLOAD_PHASE_S"] + cj["GUARD_SLACK_S"] + cj["GUARD_POLL_S"] + stop_pass
+max_min = cap + int(math.ceil(post_s / 60))
 nogo = (f"COST_NOGO est_min={gate:.0f} est_cu={gate / 60 * cu_h:.1f} (setup to Raw on the device {ready:.0f} min = "
         f"create {CREATE:.0f} + max(downloads {HUB + DL_IN + DL_RAW:.0f}, install + compile + inputs "
         f"{HUB + INSTALL + COMPILE + INPUTS:.0f}) + load {LOAD:.0f}; {pre} timing samples + 2 gate bins x N {n} at "
         f"{S_PER_SAMPLE} s/sample assumed = {(pre + 2 * n) * S_PER_SAMPLE / 60:.0f} min; teardown {TEARDOWN:.0f}; "
         f"G4 {cu_h} CU/h)")
-go = (f"COST_GO_MAX cap_min={cap} cap_cu={cap / 60 * cu_h:.1f} (" + (
+go = (f"COST_GO_MAX max_min={max_min} max_cu={max_min / 60 * cu_h:.1f} wall_cap_min={cap} (wall cap -m {cap} = " + (
       f"--cap-min {cap}" if cap_arg else
       f"gate stage ceil({gate:.0f} x 1.4 + 10) = {gate_cap} + post-gate budget ceil({budget_cu:g} CU / {cu_h} x 60) "
-      f"= {budget_min}") + f" min = the colab_job.sh wall cap; expected GO with N_m = N {n}: "
-      f"~{gate + rest:.0f} min / {(gate + rest) / 60 * cu_h:.1f} CU)")
-print(f"{gate:.0f}\n{cap}\n{nogo}\n{go}")
+      f"= {budget_min}") + f"; + past the cap at most ceil({post_s} s / 60) = {max_min - cap} min: download phase "
+      f"{cj['DOWNLOAD_PHASE_S']} s + guard slack {cj['GUARD_SLACK_S']} s + guard poll {cj['GUARD_POLL_S']} s + one "
+      f"stop pass to the unassign 3 x ({cj['GUARD_API_TIMEOUT_S']} + 10) s; the create is inside the cap (the guard "
+      f"deadline is armed before it); assumes the Colab API answers (the guard retries until it does); expected GO "
+      f"with N_m = N {n}: ~{gate + rest:.0f} min / {(gate + rest) / 60 * cu_h:.1f} CU)")
+print(f"{gate:.0f}\n{cap}\n{max_min}\n{nogo}\n{go}")
 EOF
 ) || die "cost estimate failed"
-[[ "$CAP" =~ ^[1-9][0-9]*$ ]] || die "bad cap $CAP"
+[[ "$CAP" =~ ^[1-9][0-9]*$ ]] && [[ "$MAX_MIN" =~ ^[1-9][0-9]*$ ]] || die "bad cap $CAP / $MAX_MIN"
 
 # ---- samples + bundle ----
 TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -206,11 +221,11 @@ UPS=(-u "$STAGE/gradsnr_in.tar:/root/gradsnr_in.tar" -u "$SECRET_DIR/hf_token:/r
 DOWNS=(-d "/content/gradsnr_out.tgz:$STAGE/gradsnr_out.tgz")
 echo "$NOGO_LINE"
 echo "$GO_LINE"
-echo "LAUNCH (billed): bash $COLAB_JOB -s gradsnr-auto --gpu G4 -m $CAP -u $STAGE/gradsnr_in.tar:/root/gradsnr_in.tar -u <0700 tmp>/hf_token:/root/hf_token ${DOWNS[*]} -- '$JOB'"
+echo "LAUNCH (billed): env ${CJ_ENV[*]} bash $COLAB_JOB -s gradsnr-auto --gpu G4 -m $CAP -u $STAGE/gradsnr_in.tar:/root/gradsnr_in.tar -u <0700 tmp>/hf_token:/root/hf_token ${DOWNS[*]} -- '$JOB'"
 if [ "$CMD" = dry ]; then echo DRY_OK; exit 0; fi
-[ "$CONFIRM" = 1 ] || die "run is billed (~$EST_NOGO min on NO-GO, at most the cap $CAP min at $CU_H CU/h): pass --confirm-billed"
+[ "$CONFIRM" = 1 ] || die "run is billed (~$EST_NOGO min on NO-GO, at most $MAX_MIN min at $CU_H CU/h): pass --confirm-billed"
 set +e
-bash "$COLAB_JOB" -s gradsnr-auto --gpu G4 -m "$CAP" "${UPS[@]}" "${DOWNS[@]}" -- "$JOB"
+env "${CJ_ENV[@]}" bash "$COLAB_JOB" -s gradsnr-auto --gpu G4 -m "$CAP" "${UPS[@]}" "${DOWNS[@]}" -- "$JOB"
 RC=$?
 set -e
 cleanup; SECRET_DIR=""
