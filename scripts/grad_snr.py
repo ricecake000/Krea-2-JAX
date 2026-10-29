@@ -962,8 +962,13 @@ def run_jax(args):
     for remat in args.remat_candidates.split(","):
         c, row = compile_for(remat, args.attn)
         aot.append(row)
+        # resident outside the executable: the other G - 1 group
+        # accumulators and the N cached text states + latents
+        outside = ((G - 1) * p_size * 4 + N * (args.text_rows * cfg.txtlayers
+                   * cfg.txtdim * 2 + args.img_tokens * feat * 2))
+        row["outside_bytes"] = outside
         fits = (limit is None or row["peak_bytes"] is None
-                or row["peak_bytes"] <= args.mem_margin * limit)
+                or row["peak_bytes"] + outside <= args.mem_margin * limit)
         if fits:
             comp, hp.remat_policy = c, remat
             break
@@ -1185,7 +1190,8 @@ def parse_args(argv=None):
     ap.add_argument("--attn", choices=["ref", "cudnn"], default="ref")
     ap.add_argument("--qchunk", type=int, default=256)
     ap.add_argument("--remat-candidates", default="dots,full",
-                    help="AOT-compiled in order; the first whose peak fits "
+                    help="AOT-compiled in order; the first whose peak + the "
+                         "other G-1 accumulators + cached inputs fit "
                          "--mem-margin x the device limit is used")
     ap.add_argument("--mem-margin", type=float, default=0.92)
     ap.add_argument("--logit-mean", type=float, default=0.0)

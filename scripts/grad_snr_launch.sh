@@ -28,7 +28,7 @@ META_SHA=c1d533433f5376cd1a57bd6a5d0508b9361298ac0be4e7114e236e0d93fb7643   # me
 HF_TOKEN_FILE=${HF_TOKEN_FILE:-$HOME/.cache/huggingface/token}
 MAX_UPLOAD_B=30000000        # one colab upload = one base64 PUT (~31 MB worked, ~113 MB failed)
 CU_H=8.90                    # G4, measured 2026-10-27
-die() { echo "ERROR: $*" >&2; echo DRY_FAIL; exit 1; }
+die() { echo "ERROR: $*" >&2; [ "${CMD:-dry}" = dry ] && echo DRY_FAIL; exit 1; }
 
 CMD=${1:-}; PHASE=${2:-}; shift 2 || true
 N=""; CAP=""; CONFIRM=0; EXTRA=()
