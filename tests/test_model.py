@@ -15,7 +15,8 @@ from krea2_jax.checkpoint import (
     official_key_shapes, param_shardings, save_krea2_params, stack_blocks)
 from krea2_jax.config import KREA2_CONFIG, Krea2Config
 from krea2_jax.model import (
-    build_positions_and_mask_bucketed, dit_forward, varlen_reference_kernel)
+    build_positions_and_mask_bucketed, dit_forward, scaled_dot_product_attention,
+    varlen_reference_kernel)
 
 B, LTXT, NIMG = 8, 6, 64
 HW = np.array([(8, 8), (6, 8), (8, 6), (4, 4)] * 2)
@@ -96,6 +97,17 @@ def test_unroll_list_blocks_matches_scan(tmp_path, mesh):
         dit_forward(ls, cfg, *inp[:5], layer_loop="scan")
     with pytest.raises(ValueError, match="layer_loop"):
         dit_forward(params, cfg, *inp[:5], layer_loop="while")
+
+
+def test_chunked_ref_attention_saves_no_attention_matrix():
+    """Under grad the q-chunk map must not keep every chunk's softmax for the backward:
+    stacked, that is the whole Hq x L x L matrix (5.5 GB per layer of the grad_snr step,
+    a failed billed G4 AOT on 2026-10-29)."""
+    q = jax.ShapeDtypeStruct((1, 4, 64, 8), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((1, 2, 64, 8), jnp.bfloat16)
+    f = functools.partial(scaled_dot_product_attention, qchunk=16)
+    res = jax.tree.leaves(jax.eval_shape(lambda *a: jax.vjp(f, *a)[1], q, kv, kv))
+    assert max(r.size for r in res) < 4 * 64 * 64
 
 
 def test_abstract_params_match_official_module(ref):

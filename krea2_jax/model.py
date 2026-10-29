@@ -158,7 +158,13 @@ def scaled_dot_product_attention(q, k, v, keymask=None, qchunk=512):
     """Exact attention with float32 softmax, GQA, and query chunking.
 
     q: (B, Hq, L, D); k, v: (B, Hk, L, D); keymask: (B, L) bool or None.
-    Query chunking bounds the (heads, chunk, L) float32 logit buffer.
+    Query chunking bounds the (heads, chunk, L) float32 logit buffer, in the
+    backward too: each chunk is checkpointed, so the map's transpose
+    recomputes its logits / softmax instead of stacking them for all L / chunk
+    chunks as residuals (= the whole (heads, L, L) attention matrix in f32 +
+    bf16, 5.5 GB per layer at L = 4352, which XLA:GPU kept alive for all 28
+    layers of an unrolled remat grad step at once); same values, one extra
+    QK^T + softmax per chunk in the backward.
 
     Mask semantics: the reference builds an outer-product (query AND key)
     mask and relies on the fused CUDA kernels returning zeros for fully
@@ -203,7 +209,7 @@ def scaled_dot_product_attention(q, k, v, keymask=None, qchunk=512):
     else:
         n = L // qchunk
         qs = jnp.moveaxis(qg.reshape(B, Hk, G, n, qchunk, D), 3, 0)
-        out = jnp.moveaxis(jax.lax.map(one_chunk, qs), 0, 3)
+        out = jnp.moveaxis(jax.lax.map(jax.checkpoint(one_chunk), qs), 0, 3)
         out = out.reshape(B, Hk, G, L, D)
 
     out = out.reshape(B, Hq, L, D)

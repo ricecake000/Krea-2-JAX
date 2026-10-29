@@ -129,6 +129,24 @@ Modes:
   report   re-print the report of --out (state.json; out/measure or
            out/smoke of an auto run) or of a job.log (--from-log: the last
            GRADSNR_STATE line, of --stage smoke|measure if given)
+  aot      (laptop, jax 0.11.0 CPU, no weights; grad_snr_launch.sh dry) the
+           free pre-flight of auto's memory check: the same AOT compile of
+           the per-sample step (same abstract args, outside bytes with every
+           shipped image loaded) for each --remat-candidates until one fits;
+           GPU peak estimate = the XLA:CPU peak (CPU_AOT_FLAGS: remat
+           barriers kept, memory-optimized schedule) + the output bytes of
+           every while loop inside a rematerialized forward (XLA:GPU kept
+           those of all 28 layers alive at once: the stacked q-chunk softmax
+           of the ref attention before model.py checkpointed each chunk).
+           Calibration, the G4 AOT of 2026-10-29 (pre-fix, the only GPU
+           points): estimate / GPU peak = 1.088 (dots), 1.112 (full), i.e.
+           conservative there; the raw CPU numbers are no proxy (default
+           XLA:CPU deletes the barriers: 1.59 / 1.75 x, and refuses the fixed
+           step; barriers kept, no while term: 0.31 / 0.27 x). Post-fix the
+           estimate is a prediction until a G4 `aot:` line confirms it. Exit
+           0 iff a candidate's estimate + outside <= --mem-margin x
+           --device-limit (default: the G4's bytes_limit); --attn ref only;
+           rows in --out/aot.json
 After every bin: state.json + report.json + report.txt in --out (auto: the
 stage dir) and one `GRADSNR_STATE stage=<stage> <base64 gzip json>` line on
 stdout (the job log is fetched even when the runner hits its wall cap; lines
@@ -157,6 +175,7 @@ import itertools
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import threading
@@ -174,6 +193,15 @@ TRAIN_TE_ID = "ec5d13e03e6114b9658324d1620708a76248cf4a1cf9af5a41df31be19d38645"
 STATE_TAG = "GRADSNR_STATE"
 GATE_TAG = "GRADSNR_GATE"
 CU_PER_H = {"G4": 8.90}
+# --mode aot (the free CPU pre-flight of the G4 memory check): calibrated with
+# this jax (the VM's pin) and these XLA:CPU flags, which keep the remat
+# optimization barriers (XLA:CPU deletes them before scheduling, undoing every
+# jax.checkpoint) and schedule for memory; the G4's jax bytes_limit (job log
+# 2026-10-29)
+AOT_JAX = "0.11.0"
+CPU_AOT_FLAGS = ("--xla_disable_hlo_passes=cse_barrier_expander "
+                 "--xla_cpu_scheduler_type=CPU_SCHEDULER_TYPE_MEMORY_OPTIMIZED")
+G4_BYTES_LIMIT = 96875839488
 
 # two-sided 97.5% Student t quantiles (df -> t); df > 30 -> 1.96
 _T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
@@ -1039,6 +1067,161 @@ def make_sample_fn(cfg, hp, treedef, p_idx, n_leaves, img_tokens):
     return jax.jit(fn, donate_argnums=(2,))
 
 
+def model_cfg(args):
+    """KREA2_CONFIG with the --model-config overrides"""
+    import dataclasses
+
+    from krea2_jax.config import KREA2_CONFIG
+
+    if not args.model_config:
+        return KREA2_CONFIG
+    return dataclasses.replace(KREA2_CONFIG, **json.loads(args.model_config))
+
+
+def step_hp(args):
+    """make_sample_fn's hyper-parameters (remat_policy set per candidate)"""
+    return argparse.Namespace(
+        remat_policy=None, attn=args.attn, qchunk=args.qchunk,
+        attn_block=256, logit_mean=args.logit_mean, logit_std=args.logit_std,
+        timestep_mu=args.timestep_mu)
+
+
+def abstract_step(args, cfg):
+    """shapes only (no weights), shared by run_jax and --mode aot: the leaf
+    split of --params and the abstract arguments of the per-sample step"""
+    import jax
+    import jax.numpy as jnp
+
+    from krea2_jax.checkpoint import abstract_krea2_params
+
+    abs_p = abstract_krea2_params(cfg, dtype=jnp.bfloat16, unstack=("blocks",))
+    paths, treedef = dotted_paths(abs_p)
+    leaves = jax.tree.leaves(abs_p)
+    p_idx = select_leaves(paths, args.params)
+    pset = set(p_idx)
+    sizes = [int(np.prod(leaves[i].shape)) for i in p_idx]
+    feat = cfg.channels * cfg.patch ** 2
+    S = jax.ShapeDtypeStruct
+    a_args = ([S(leaves[i].shape, jnp.bfloat16) for i in p_idx],
+              [S(l.shape, jnp.bfloat16) for i, l in enumerate(leaves)
+               if i not in pset],
+              [S(leaves[i].shape, jnp.float32) for i in p_idx],
+              S((1, args.img_tokens, feat), jnp.bfloat16), S((1, 2), jnp.int32),
+              S((1, args.text_rows, cfg.txtlayers, cfg.txtdim), jnp.bfloat16),
+              S((1, args.text_rows), jnp.bool_),
+              jax.eval_shape(lambda: jax.random.PRNGKey(0)),
+              S((), jnp.float32), S((), jnp.float32))
+    return argparse.Namespace(paths=paths, treedef=treedef, leaves=leaves,
+                              p_idx=p_idx, sizes=sizes, p_size=sum(sizes),
+                              a_args=a_args)
+
+
+def outside_bytes(args, cfg, p_size, n_load):
+    """device bytes resident outside the step's executable: the other G - 1
+    group accumulators and the cached text states + latents of every loaded
+    image"""
+    feat = cfg.channels * cfg.patch ** 2
+    return ((args.groups - 1) * p_size * 4 + n_load * (
+        args.text_rows * cfg.txtlayers * cfg.txtdim * 2
+        + args.img_tokens * feat * 2))
+
+
+def compile_step(cfg, hp, st, img_tokens, remat, attn):
+    """AOT compile of the per-sample step on the abstract args of st for one
+    remat policy / attention -> (compiled, memory row)"""
+    hp2 = argparse.Namespace(**{**vars(hp), "remat_policy": remat, "attn": attn})
+    fn = make_sample_fn(cfg, hp2, st.treedef, st.p_idx, len(st.leaves),
+                        img_tokens)
+    t0 = time.time()
+    comp = fn.lower(*st.a_args).compile()
+    ma = comp.memory_analysis()
+    peak = None
+    if ma is not None:
+        peak = (ma.argument_size_in_bytes + ma.output_size_in_bytes
+                - ma.alias_size_in_bytes + ma.temp_size_in_bytes)
+    return comp, {"remat": remat, "attn": attn,
+                  "compile_s": round(time.time() - t0, 1), "peak_bytes": peak,
+                  "temp_bytes": getattr(ma, "temp_size_in_bytes", None),
+                  "argument_bytes": getattr(ma, "argument_size_in_bytes", None)}
+
+
+_DT_BYTES = {"pred": 1, "s8": 1, "u8": 1, "bf16": 2, "f16": 2, "s16": 2,
+             "u16": 2, "f32": 4, "s32": 4, "u32": 4, "f64": 8, "s64": 8,
+             "u64": 8}
+
+
+def rematted_while_bytes(hlo_text):
+    """(count, summed output bytes) of the entry computation's while loops
+    that run inside a rematerialized forward (op_name .../checkpoint/
+    rematted_computation/...: the q-chunk maps of the recomputed blocks)"""
+    entry = hlo_text[hlo_text.index("\nENTRY "):]
+    n = total = 0
+    for line in entry.splitlines():
+        m = re.match(r"\s*(?:ROOT )?%\S+ = \((.*?)\) while\(", line)
+        if m and "rematted_computation" in line:
+            n += 1
+            for dt, dims in re.findall(r"\b([a-z]+[0-9]*)\[([0-9,]*)\]",
+                                       m.group(1)):
+                total += _DT_BYTES[dt] * math.prod(
+                    int(d) for d in dims.split(",") if d)
+    return n, total
+
+
+def run_aot(args):
+    """--mode aot: the CPU pre-flight of auto's memory check (module
+    docstring); exit 0 iff a --remat-candidates entry is estimated to fit"""
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " "
+                               + CPU_AOT_FLAGS).strip()
+    sys.path[:0] = [str(REPO), str(REPO / "scripts")]
+    import jax
+
+    import train_full as tf
+
+    if jax.__version__ != AOT_JAX:
+        raise SystemExit(f"--mode aot is calibrated with jax {AOT_JAX} (the "
+                         f"VM's pin), this is jax {jax.__version__}")
+    if args.attn != "ref":
+        raise SystemExit("--mode aot models --attn ref only (XLA:CPU has no "
+                         "cuDNN attention)")
+    cfg = model_cfg(args)
+    n_load = len(json.loads(Path(args.samples).read_text())["entries"])
+    st = abstract_step(args, cfg)
+    outside = outside_bytes(args, cfg, st.p_size, n_load)
+    cap = args.mem_margin * args.device_limit
+    L = args.text_rows + args.img_tokens
+    L += (-L) % cfg.seq_pad_multiple
+    chunked = L > args.qchunk and L % args.qchunk == 0
+    hp, rows, fit = step_hp(args), [], None
+    for remat in args.remat_candidates.split(","):
+        comp, row = compile_step(cfg, hp, st, args.img_tokens, remat, "ref")
+        n_while, w_bytes = rematted_while_bytes(comp.as_text())
+        del comp
+        if chunked and tf.REMAT_MODES[remat] and n_while < cfg.layers:
+            raise SystemExit(f"aot: {n_while} rematerialized q-chunk loops < "
+                             f"{cfg.layers} layers: the HLO the estimate "
+                             "reads changed, re-calibrate before trusting it")
+        est = row["peak_bytes"] + w_bytes
+        row.update(rematted_while_bytes=w_bytes, outside_bytes=outside,
+                   gpu_peak_est=est, fits=est + outside <= cap)
+        rows.append(row)
+        print("aot: " + json.dumps(row), flush=True)
+        if row["fits"]:
+            fit = row
+            break
+    Path(args.out).mkdir(parents=True, exist_ok=True)
+    _write_json(Path(args.out) / "aot.json", {"device_limit": args.device_limit,
+                                               "mem_margin": args.mem_margin,
+                                               "n_load": n_load, "rows": rows})
+    if fit is None:
+        raise SystemExit(f"AOT_FAIL: no remat candidate fits {args.mem_margin}"
+                         f" x {args.device_limit} B by the GPU estimate (peak + "
+                         f"rematerialized while outputs + outside {outside} B)")
+    print(f"AOT_OK remat {fit['remat']}: GPU estimate {fit['gpu_peak_est'] / 1e9:.1f}"
+          f" + outside {outside / 1e9:.1f} = {(fit['gpu_peak_est'] + outside) / 1e9:.1f}"
+          f" GB <= {cap / 1e9:.1f} GB ({args.mem_margin} x {args.device_limit} B)")
+
+
 def _sha256_array(x):
     """sha256 of an array's C-order bytes (memmap slices included), read in
     64 MiB pieces"""
@@ -1167,14 +1350,10 @@ def download_failed(markers):
 def run_jax(args):
     sys.path[:0] = [str(REPO), str(REPO / "scripts")]
     os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-    import dataclasses
-
     import jax
     import jax.numpy as jnp
 
     import train_full  # noqa: F401  (imported here, before the compile thread)
-    from krea2_jax.checkpoint import abstract_krea2_params
-    from krea2_jax.config import KREA2_CONFIG
 
     t_start = time.time()
 
@@ -1229,9 +1408,7 @@ def run_jax(args):
     out.mkdir(parents=True, exist_ok=True)
     Path(args.scratch).mkdir(parents=True, exist_ok=True)
     env = env_report(args)
-    cfg = KREA2_CONFIG
-    if args.model_config:
-        cfg = dataclasses.replace(cfg, **json.loads(args.model_config))
+    cfg = model_cfg(args)
     K, G = args.bins, args.groups
     run_bins = ([int(x) for x in args.run_bins.split(",")] if args.run_bins
                 else [0, K - 1] if args.mode == "smoke"
@@ -1249,15 +1426,12 @@ def run_jax(args):
                     else 5.0 if auto else 25.0)
 
     # --- parameter subsets on the abstract tree (no weights yet) ---
-    abs_p = abstract_krea2_params(cfg, dtype=jnp.bfloat16, unstack=("blocks",))
-    paths, treedef = dotted_paths(abs_p)
-    abs_leaves = jax.tree.leaves(abs_p)
-    p_idx = select_leaves(paths, args.params)
+    st = abstract_step(args, cfg)
+    paths, abs_leaves, p_idx = st.paths, st.leaves, st.p_idx
     c_idx = set(select_leaves(paths, args.cross_params))
     if not c_idx <= set(p_idx):
         raise SystemExit("--cross-params must be a subset of --params")
-    sizes = [int(np.prod(abs_leaves[i].shape)) for i in p_idx]
-    p_size = sum(sizes)
+    sizes, p_size = st.sizes, st.p_size
     c_size = sum(s for i, s in zip(p_idx, sizes) if i in c_idx)
     acc_bytes = G * p_size * 4
     mm_bytes = K * G * c_size * 4
@@ -1270,10 +1444,7 @@ def run_jax(args):
         raise SystemExit("P' memmap does not fit the scratch disk: shrink "
                          "--cross-params")
 
-    hp = argparse.Namespace(
-        remat_policy=None, attn=args.attn, qchunk=args.qchunk,
-        attn_block=256, logit_mean=args.logit_mean, logit_std=args.logit_std,
-        timestep_mu=args.timestep_mu)
+    hp = step_hp(args)
     spec = json.loads(Path(args.samples).read_text())
     n_ship = len(spec["entries"])
     if N > n_ship:
@@ -1289,43 +1460,14 @@ def run_jax(args):
                          f"--img-tokens {args.img_tokens}")
     mu = (args.timestep_mu if args.timestep_mu is not None
           else float(cfg.mu_for_seq_len(n_img)))
-    feat = cfg.channels * cfg.patch ** 2
 
-    # --- abstract args + AOT compile (memory) ---
-    S = jax.ShapeDtypeStruct
-    a_p = [S(abs_leaves[i].shape, jnp.bfloat16) for i in p_idx]
-    a_rest = [S(l.shape, jnp.bfloat16) for i, l in enumerate(abs_leaves)
-              if i not in set(p_idx)]
-    a_acc = [S(abs_leaves[i].shape, jnp.float32) for i in p_idx]
-    a_args = (a_p, a_rest, a_acc, S((1, args.img_tokens, feat), jnp.bfloat16),
-              S((1, 2), jnp.int32),
-              S((1, args.text_rows, cfg.txtlayers, cfg.txtdim), jnp.bfloat16),
-              S((1, args.text_rows), jnp.bool_),
-              jax.eval_shape(lambda: jax.random.PRNGKey(0)),
-              S((), jnp.float32), S((), jnp.float32))
+    # --- AOT compile of the step on the abstract args (memory) ---
     limit = env.get("device_bytes_limit")
-    # resident outside the executable: the other G - 1 group accumulators and
-    # the cached text states + latents of every loaded image
-    outside = ((G - 1) * p_size * 4 + n_load * (args.text_rows * cfg.txtlayers
-               * cfg.txtdim * 2 + args.img_tokens * feat * 2))
+    outside = outside_bytes(args, cfg, p_size, n_load)
 
     def compile_for(remat, attn):
-        hp2 = argparse.Namespace(**{**vars(hp), "remat_policy": remat,
-                                    "attn": attn})
-        fn = make_sample_fn(cfg, hp2, treedef, p_idx, len(abs_leaves),
-                            args.img_tokens)
-        t0 = time.time()
-        comp = fn.lower(*a_args).compile()
-        ma = comp.memory_analysis()
-        peak = None
-        if ma is not None:
-            peak = (ma.argument_size_in_bytes + ma.output_size_in_bytes
-                    - ma.alias_size_in_bytes + ma.temp_size_in_bytes)
-        row = {"remat": remat, "attn": attn, "compile_s": round(time.time() - t0, 1),
-               "peak_bytes": peak,
-               "temp_bytes": getattr(ma, "temp_size_in_bytes", None),
-               "argument_bytes": getattr(ma, "argument_size_in_bytes", None),
-               "outside_bytes": outside}
+        comp, row = compile_step(cfg, hp, st, args.img_tokens, remat, attn)
+        row["outside_bytes"] = outside
         emit("aot: " + json.dumps(row))
         return comp, row
 
@@ -1772,7 +1914,8 @@ def run_jax(args):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--mode", required=True,
-                    choices=["select", "smoke", "measure", "auto", "report"])
+                    choices=["select", "smoke", "measure", "auto", "report",
+                             "aot"])
     ap.add_argument("--out", required=True,
                     help="select: the samples json; else the output dir")
     # select
@@ -1816,6 +1959,8 @@ def parse_args(argv=None):
                          "other G-1 accumulators + cached inputs fit "
                          "--mem-margin x the device limit is used")
     ap.add_argument("--mem-margin", type=float, default=0.92)
+    ap.add_argument("--device-limit", type=int, default=G4_BYTES_LIMIT,
+                    help="aot: the device's jax bytes_limit (default: G4)")
     ap.add_argument("--logit-mean", type=float, default=0.0)
     ap.add_argument("--logit-std", type=float, default=1.0)
     ap.add_argument("--timestep-mu", type=float, default=None)
@@ -1885,6 +2030,10 @@ def main(argv=None):
                 rep["go"] = go
         print(report_text(rep))
         return None
+    if args.mode == "aot":
+        if args.samples is None:
+            raise SystemExit("--samples is required")
+        return run_aot(args)
     for k in ("base_ckpt", "text_encoder", "data_dir", "samples"):
         if getattr(args, k) is None:
             raise SystemExit(f"--{k.replace('_', '-')} is required")
