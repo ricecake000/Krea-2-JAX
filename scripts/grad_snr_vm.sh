@@ -29,6 +29,10 @@ tar xf /root/gradsnr_in.tar -C "$IN" && rm -f /root/gradsnr_in.tar
 st extracted
 { nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv; nvidia-smi | sed -n 3p
   free -g; df -h /content; echo "nproc $(nproc)"; python3 --version; } 2>&1 | tee "$OUT/vm_env.txt"
+# before ~37 GB of downloads: Raw 26.3 + Qwen 8.9 + shards 1.9, then the P' memmap (~29 GB for the default
+# --cross-params, refused by grad_snr.py above 0.8 x the free disk) -> need ~80 GB free
+FREE_GB=$(( $(df --output=avail -B1 /content | tail -1) / 1000000000 ))
+[ "$FREE_GB" -ge "${GRADSNR_MIN_DISK_GB:-80}" ] || { echo "DISK_TOO_SMALL free ${FREE_GB} GB < ${GRADSNR_MIN_DISK_GB:-80}"; exit 5; }
 CUDA_MAJOR=$(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\)\..*/\1/p' | head -1)
 PLUG=cuda13; [ "${CUDA_MAJOR:-0}" -ge 13 ] || PLUG=cuda12
 echo "driver CUDA ${CUDA_MAJOR:-?} -> jax[$PLUG]==0.11.0"

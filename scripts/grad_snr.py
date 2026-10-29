@@ -57,7 +57,9 @@ subset of P):
     r / (1 + r), r = (N/2) S/N_b, and the null sd of the cos does not depend
     on N (~1/sqrt(d_eff)); a bin is detectable when the sign-flip p of both
     the split-half cos and U is <= 0.05; the N needed for detection at
-    z = 2 null sd is N* = 2c / ((1 - c) S/N_b) with c = 2 sd_null.
+    z = 2 null sd is N* = 2c / ((1 - c) S/N_b) with c = 2 sd_null (sd_null
+    from the sign-flip null; a present signal inflates it, so N* overstates
+    the N of an already detectable bin; exact in the noise-dominated case).
 
 Modes:
   select   (laptop, pyarrow only) metadata.parquet -> samples json: M ids of
@@ -347,7 +349,9 @@ def build_report(state, z=2.0, alpha=0.05):
     rep = {"config": cfg, "bins_done": bins, "bins": {},
            "rule": ("detectable: sign-flip p <= %.2f for split-half cos AND "
                     "U; n_needed = 2c/((1-c) snr), c = %.1f null sd of the "
-                    "split-half cos" % (alpha, z))}
+                    "split-half cos (the sign-flip sd is inflated by a "
+                    "present signal, so n_needed overstates N for a bin that "
+                    "is already detectable)" % (alpha, z))}
     for b in bins:
         H, Q = state_arrays(state, b)
         r = state["bins"][str(b)]
