@@ -90,17 +90,61 @@ Modes:
            extreme bins (--run-bins, default 0 and K-1) with N each; report
            incl. the projected N and GO / NO-GO
   measure  (phase 2) the same pipeline for --run-bins (default all K)
-  report   re-print the report of --out (state.json) or of a job.log
-           (--from-log: the last GRADSNR_STATE line)
-After every bin: state.json + report.json + report.txt in --out and one
-`GRADSNR_STATE <base64 gzip json>` line on stdout (the job log is fetched
-even when the runner hits its wall cap). --resume skips bins already in
-state.json (same config); --deadline-min stops before a bin that would not
-finish in time.
+  auto     smoke, gate and phase 2 in ONE process (one billed session): the
+           inputs of all shipped images are loaded up front (a fresh N_m up
+           to that needs no reload), bins run in the order 0, K-1, 1, ...,
+           K-2, all at --n-per-bin N; after 0 and K-1 the gate
+           (gate_decision) picks, pre-registered (N_RULE):
+             NO-GO -> stop (exit 0, the report says NO-GO);
+             GO because a gate bin is detectable -> N_m = N, the K-2 other
+               bins continue in the SAME state (0 and K-1 reused);
+             GO only by projection (N* <= n_fit, nothing detectable) ->
+               N_m = min(N* rounded up to G, n_fit rounded down to G, the
+               shipped images); N_m > N: a FRESH measurement of all K bins
+               at N_m (new noise and t draws: seed + 1, so the result does
+               not reuse the draws the gate was decided on; the images are
+               the first N_m, the gate's N among them); N_m <= N: as the
+               detectable case;
+           n_fit = min(shipped images, n of --budget-cu (the CU allowed
+           after the gate) minus --overhead-min, n of the time left before
+           --deadline-min minus --overhead-min), each for K fresh bins at
+           bin_est (conservative for the K-2 bins of the reuse case: one
+           number, no circularity). bin_est uses the measured s/sample of
+           the chosen attention (or the gate bins' own rate if slower), the
+           same estimate the per-bin deadline check uses, so a GO never
+           plans bins the deadline would cut: a GO whose bins (K-2 at N or
+           K at N_m) do not fit stops instead (verdict GO, action stop).
+           cuDNN attention (--try-cudnn) is compiled in a background thread
+           while the ref step compiles and the inputs download / load (after
+           the ref timing it is waited for at most --cudnn-wait-s, never into
+           the reserve of the first bins; still compiling -> ref); it
+           is used for ALL bins iff its gradient cos vs ref >= 0.999 AND its
+           median s/sample <= 0.90 x ref (decided before the first bin,
+           recorded in the config; any cuDNN failure -> ref). Output:
+           out/smoke/ = the gate snapshot (state / report of bins 0, K-1
+           + the decision, frozen at the gate); out/measure/ = the phase-2
+           result (reuse: the continuing state, bins 0 and K-1 included;
+           fresh: the new state); the final answer is always
+           out/measure/report.txt. One `GRADSNR_GATE {json}` line
+  report   re-print the report of --out (state.json; out/measure or
+           out/smoke of an auto run) or of a job.log (--from-log: the last
+           GRADSNR_STATE line, of --stage smoke|measure if given)
+After every bin: state.json + report.json + report.txt in --out (auto: the
+stage dir) and one `GRADSNR_STATE stage=<stage> <base64 gzip json>` line on
+stdout (the job log is fetched even when the runner hits its wall cap; lines
+without the stage token are from older runs and still decode). The host
+part of a bin (P' memmap write, cross-bin products, state, report) runs on a
+single worker thread while the GPU starts the next bin; a worker error
+fails the run. --resume (smoke / measure) skips bins already in state.json
+(same config); --deadline-min stops before a bin that would not finish in
+time (exit 6, PARTIAL). --wait-inputs / --wait-raw: ready markers of a
+background downloader (grad_snr_vm.sh) waited on before reading the inputs
+/ Raw (a `.failed` file next to a marker or a dead --downloader-pid fails at
+once), so the compiles overlap the downloads.
 
     python scripts/grad_snr.py --mode select --metadata metadata.parquet \\
         --manifest latents/manifest.json --out samples.json
-    python scripts/grad_snr.py --mode smoke --base-ckpt raw.safetensors \\
+    python scripts/grad_snr.py --mode auto --base-ckpt raw.safetensors \\
         --text-encoder <Qwen3-VL-4B dir> --data-dir <latents dir> \\
         --samples samples.json --out out/ --scratch /content/scratch
 """
@@ -115,7 +159,9 @@ import math
 import os
 import shutil
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -126,6 +172,7 @@ REPO = Path(__file__).resolve().parent.parent
 # run config "text_encoder_id")
 TRAIN_TE_ID = "ec5d13e03e6114b9658324d1620708a76248cf4a1cf9af5a41df31be19d38645"
 STATE_TAG = "GRADSNR_STATE"
+GATE_TAG = "GRADSNR_GATE"
 CU_PER_H = {"G4": 8.90}
 
 # two-sided 97.5% Student t quantiles (df -> t); df > 30 -> 1.96
@@ -460,7 +507,8 @@ def _ci(d, spec=".3e"):
 def report_text(rep):
     cfg = rep["config"]
     lines = [f"grad S/N: bucket {cfg['bucket']} mu {cfg['mu']:.4f}, K {cfg['bins']} "
-             f"bins, G {cfg['groups']} groups, attn {cfg['attn']}, remat "
+             f"bins, N {cfg['n_per_bin']}, G {cfg['groups']} groups, seed "
+             f"{cfg['seed']}, attn {cfg['attn']}, remat "
              f"{cfg['remat']}, |P| {cfg['p_size']:,} ({cfg['params']}), "
              f"|P'| {cfg['cross_size']:,} ({cfg['cross_params']})",
              f"rule: {rep['rule']}"]
@@ -519,11 +567,28 @@ def report_text(rep):
             lines.append(f"  {k:<22} {_g(gb['mix0'][k], '.4f')} / "
                          f"{_g(gb['mixmax'][k], '.4f')}")
     if "go" in rep:
-        lines.append(f"-- {rep['go']['verdict']}: {rep['go']['why']}")
-        if rep["go"]["verdict"] == "GO":
+        go = rep["go"]
+        lines.append(f"-- {go['verdict']}: {go['why']}")
+        if "action" in go:
+            p = go["n_fit_parts"]
+            lines.append(f"   gate -> {go['action']}, N_m {go['N_m']}; N* "
+                         f"{go['n_star'] if go['n_star'] is not None else 'inf'}, "
+                         f"n_fit {go['n_fit']} = min(images {p['images']}, "
+                         f"budget {p['budget']}, time "
+                         f"{p['time'] if p['time'] is not None else 'no limit'}) at "
+                         f"{go['s_per_sample']:.3f} s/sample")
+            lines.append(f"   phase-2 N rule: {go['n_rule']}")
+        if go["verdict"] == "GO":
             lines.append("   (conditional on the sign-symmetry / no-unobserved-"
                          "tail assumption of the rule above: a reason to run "
                          "phase 2, not 5% evidence of signal)")
+    if "budget" in rep:
+        bu = rep["budget"]
+        lines.append(f"-- post-gate budget {bu['budget_cu']:g} CU: bins admitted until "
+                     f"{bu['budget_end_after_gate_s']:.0f} s after the gate (reserve "
+                     f"{bu['reserve_s']:.0f} s); spent {bu['spent_after_gate_s']:.0f} s "
+                     f"= {bu['spent_after_gate_cu']:.2f} CU after the gate; "
+                     + (bu["stop"] or "no stop"))
     return "\n".join(lines)
 
 
@@ -555,18 +620,107 @@ def go_no_go(rep, s_per_sample, budget_cu, overhead_min, max_images,
             "images)", "n_star": n_star, "n_budget": n_fit}
 
 
+N_RULE = ("NO-GO -> stop. GO because a gate bin is detectable -> N_m = N, "
+          "the K-2 other bins continue in the same state. GO only by "
+          "projection (N* <= n_fit) -> N_m = min(N* rounded up to G, n_fit "
+          "rounded down to G, shipped images); N_m > N -> fresh measurement "
+          "of all K bins at N_m (seed + 1), else as detectable. n_fit = "
+          "min(shipped images, n of the CU budget after the gate, n of the "
+          "time left), both minus the overhead, for K fresh bins at bin_est; "
+          "a GO whose bins do not fit the budget and the time left stops")
+
+
+def bin_est(sps, n, K, bin_overhead_s):
+    """Conservative seconds of one bin of n samples (the per-bin deadline
+    check and the gate): 1.25 x the samples + Grams / P' transfer / host
+    cross products (~3 s per earlier bin) + bin_overhead_s; inf without a
+    valid timing (fail closed)."""
+    if not (np.isfinite(sps) and sps > 0):
+        return float("inf")
+    return 1.25 * n * sps + bin_overhead_s + 3 * K
+
+
+def n_within(seconds, n_bins, sps, K, bin_overhead_s):
+    """Largest n with n_bins x bin_est(sps, n) <= seconds (None: no limit)."""
+    if not np.isfinite(seconds):
+        return None
+    if not (np.isfinite(sps) and sps > 0):
+        return 0
+    return max(int(math.floor((seconds / n_bins - bin_overhead_s - 3 * K)
+                              / (1.25 * sps))), 0)
+
+
+def gate_decision(det, n_star, N, K, G, sps, n_ship, budget_cu, overhead_min,
+                  left_s, bin_overhead_s, rate=CU_PER_H["G4"]):
+    """--mode auto: the pre-registered phase-2 rule (N_RULE) from the gate
+    bins (det: the detectable ones, n_star: the smallest N*) at N, the
+    planning s/sample, the shipped images, the CU budget after the gate and
+    the seconds left before the deadline -> {verdict GO / NO-GO, action
+    reuse / fresh / stop, N_m (None when stopping), why, n_star, n_fit and
+    its parts}."""
+    over = overhead_min * 60
+    budget_s = budget_cu / rate * 3600 - over
+    time_s = left_s - over
+    parts = {"images": n_ship,
+             "budget": n_within(budget_s, K, sps, K, bin_overhead_s),
+             "time": n_within(time_s, K, sps, K, bin_overhead_s)}
+    n_fit = min(v for v in parts.values() if v is not None)
+    d = {"verdict": "NO-GO", "action": "stop", "N_m": None, "n_star": n_star,
+         "n_fit": n_fit, "n_fit_parts": parts, "s_per_sample": sps,
+         "budget_cu": budget_cu, "overhead_min": overhead_min,
+         "left_s": left_s if np.isfinite(left_s) else None, "n_rule": N_RULE}
+    if det:
+        d.update(verdict="GO", N_m=N, why=f"bins {det} detectable at N {N}")
+    elif n_star is not None and n_star <= n_fit:
+        n_m = min(-(-n_star // G) * G, n_fit // G * G, n_ship)
+        d.update(verdict="GO", N_m=max(n_m, N),
+                 why=f"projected N* {n_star} <= n_fit {n_fit}")
+    else:
+        d["why"] = (f"no bin detectable; projected N* "
+                    f"{n_star if n_star is not None else 'inf'} > n_fit {n_fit}")
+        return d
+    m = K - 2 if d["N_m"] == N else K
+    need = m * bin_est(sps, d["N_m"], K, bin_overhead_s)
+    if need <= budget_s * (1 + 1e-9) and need <= time_s * (1 + 1e-9):
+        d["action"] = "reuse" if m == K - 2 else "fresh"
+    else:
+        d["why"] += (f"; but {m} bins at N {d['N_m']} need {need:.0f} s > "
+                     f"budget {budget_s:.0f} s / time left {time_s:.0f} s "
+                     "(after the overhead): stop")
+        d["N_m"] = None
+    return d
+
+
+_OUT = threading.Lock()
+
+
+def emit(line):
+    """One locked write per line: the worker thread prints the (long)
+    GRADSNR_STATE lines while the main thread logs."""
+    with _OUT:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
 def encode_state(state):
     return base64.b64encode(gzip.compress(json.dumps(state).encode())).decode()
 
 
-def decode_state_from_log(path):
+def decode_state_from_log(path, stage=None):
+    """The last GRADSNR_STATE line (of `stage` if given) of a log; lines
+    without the stage token (older runs) match only stage=None."""
     last = None
     with open(path, errors="replace") as f:
         for line in f:
-            if line.startswith(STATE_TAG + " "):
-                last = line.split(" ", 1)[1].strip()
+            if not line.startswith(STATE_TAG + " "):
+                continue
+            parts = line.split()
+            st = parts[1][6:] if parts[1].startswith("stage=") else None
+            if stage is None or st == stage:
+                last = parts[-1]
     if last is None:
-        raise SystemExit(f"{path}: no {STATE_TAG} line")
+        raise SystemExit(f"{path}: no {STATE_TAG} line"
+                         + (f" of stage {stage}" if stage else ""))
     return json.loads(gzip.decompress(base64.b64decode(last)))
 
 
@@ -576,12 +730,14 @@ def _write_json(path, obj):
     os.replace(tmp, path)
 
 
-def write_outputs(out, state, extra=None):
+def write_outputs(out, state, extra=None, stage=None):
     """Persist the raw state FIRST (state.json + the GRADSNR_STATE log
     line), then the derived report; a failing report never loses a bin."""
     out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     _write_json(out / "state.json", state)
-    print(f"{STATE_TAG} {encode_state(state)}", flush=True)
+    emit(f"{STATE_TAG} " + (f"stage={stage} " if stage else "")
+         + encode_state(state))
     try:
         rep = build_report(state)
         if extra:
@@ -775,7 +931,7 @@ def verify_shards(args, spec_path):
         if not (got == dig == man["digests"].get(s)):
             raise SystemExit(f"shard {s}: sha256 {got} vs samples {dig} vs "
                              f"manifest {man['digests'].get(s)}")
-    print(f"latent shards verified: {sorted(spec['shards'])}", flush=True)
+    emit(f"latent shards verified: {sorted(spec['shards'])}")
 
 
 def text_contexts(args, cfg, captions):
@@ -795,7 +951,7 @@ def text_contexts(args, cfg, captions):
     txt_cfg = from_hf_config(te_dir, **over)
     t0 = time.time()
     te_id = text_encoder_identity(te_dir, txt_cfg)
-    print(f"text encoder identity {te_id} ({time.time() - t0:.0f} s)", flush=True)
+    emit(f"text encoder identity {te_id} ({time.time() - t0:.0f} s)")
     if args.expect_te_id != "any" and te_id != args.expect_te_id:
         raise SystemExit(f"text encoder identity {te_id} != expected "
                          f"{args.expect_te_id} (train_full's run config)")
@@ -820,9 +976,9 @@ def text_contexts(args, cfg, captions):
         a.delete()
     del tp
     lens = [int(m.sum()) for _, m in out]
-    print(f"text states of {len(out)} captions in {time.time() - t0:.0f} s "
+    emit(f"text states of {len(out)} captions in {time.time() - t0:.0f} s "
           f"(valid rows {min(lens)}..{max(lens)} of {args.text_rows}); tower "
-          "freed", flush=True)
+          "freed")
     return out, te_id
 
 
@@ -950,7 +1106,7 @@ def env_report(args):
     info["host_mem_available"] = mem.get("MemAvailable")
     du = shutil.disk_usage(args.scratch)
     info["scratch_free"] = du.free
-    print("env: " + json.dumps(info), flush=True)
+    emit("env: " + json.dumps(info))
     if dev.platform == "cpu" and not args.allow_cpu:
         raise SystemExit("CPU backend: the measurement needs the GPU "
                          "(--allow-cpu for the tiny end-to-end check)")
@@ -962,6 +1118,52 @@ def env_report(args):
     return info
 
 
+_COMPILE_THREADS = []  # background cuDNN compiles (daemon threads)
+
+
+def exit_past_compiles(code):
+    """os._exit(code) while an abandoned cuDNN compile is still inside XLA:
+    interpreter finalization under a running compile could crash or hang and
+    turn the exit code; a no-op otherwise"""
+    if any(th.is_alive() for th in _COMPILE_THREADS):
+        emit(f"abandoned cuDNN compile still running: hard exit {code}")
+        sys.stderr.flush()
+        os._exit(code)
+
+
+def _ready(path):
+    try:
+        return Path(path).read_text().strip() == "ok"
+    except OSError:
+        return False
+
+
+def _alive(pid):
+    """the process exists and is not a zombie"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def download_failed(markers):
+    """the reason in a `.failed` file next to one of the ready markers"""
+    for m in markers:
+        f = Path(m).parent / ".failed"
+        if f.exists():
+            return f"{f}: {f.read_text(errors='replace').strip()[:500]}"
+    return None
+
+
 def run_jax(args):
     sys.path[:0] = [str(REPO), str(REPO / "scripts")]
     os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
@@ -970,6 +1172,7 @@ def run_jax(args):
     import jax
     import jax.numpy as jnp
 
+    import train_full  # noqa: F401  (imported here, before the compile thread)
     from krea2_jax.checkpoint import abstract_krea2_params
     from krea2_jax.config import KREA2_CONFIG
 
@@ -985,10 +1188,43 @@ def run_jax(args):
         """exit 6 (PARTIAL, like a per-bin stop) when less than need_s is
         left before `where`"""
         if not left_s() > need_s:
-            print(f"DEADLINE_STOP before {where} ({left_s():.0f} s left, "
-                  f"need {need_s:.0f} s)", flush=True)
+            emit(f"DEADLINE_STOP before {where} ({left_s():.0f} s left, "
+                 f"need {need_s:.0f} s)")
             sys.exit(6)
 
+    def wait_ready(markers, what):
+        """poll (~2 s) until every ready marker says ok; a .failed file next
+        to one or a dead --downloader-pid fails at once"""
+        t0 = last = time.time()
+        while markers:
+            bad = download_failed(markers)
+            if bad:
+                raise SystemExit(f"DOWNLOAD_FAILED ({what}) {bad}")
+            if all(_ready(m) for m in markers):
+                emit(f"{what} ready (waited {time.time() - t0:.0f} s)")
+                return
+            if args.downloader_pid and not _alive(args.downloader_pid):
+                if all(_ready(m) for m in markers):
+                    continue
+                raise SystemExit(
+                    f"DOWNLOAD_FAILED ({what}) downloader pid "
+                    f"{args.downloader_pid} exited without "
+                    f"{[m for m in markers if not _ready(m)]}"
+                    + (f": {download_failed(markers)}" if download_failed(markers) else ""))
+            deadline_check(f"waiting for {what}", 300)
+            if time.time() - last >= 60:
+                emit(f"waiting for {what}: {[m for m in markers if not _ready(m)]} "
+                     f"({time.time() - t0:.0f} s)")
+                last = time.time()
+            time.sleep(2)
+
+    auto = args.mode == "auto"
+    if auto and (args.resume or args.run_bins):
+        raise SystemExit("--mode auto: --resume / --run-bins do not apply (the "
+                         "gate and phase 2 run in one process, bins in a fixed order)")
+    bad = download_failed(args.wait_inputs + ([args.wait_raw] if args.wait_raw else []))
+    if bad:
+        raise SystemExit(f"DOWNLOAD_FAILED {bad}")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     Path(args.scratch).mkdir(parents=True, exist_ok=True)
@@ -998,15 +1234,19 @@ def run_jax(args):
         cfg = dataclasses.replace(cfg, **json.loads(args.model_config))
     K, G = args.bins, args.groups
     run_bins = ([int(x) for x in args.run_bins.split(",")] if args.run_bins
-                else ([0, K - 1] if args.mode == "smoke" else list(range(K))))
-    if any(not 0 <= b < K for b in run_bins) or G < 3 or G % 2:
-        raise SystemExit("--run-bins must lie in [0, K); --groups even >= 4")
+                else [0, K - 1] if args.mode == "smoke"
+                else [0, K - 1, *range(1, K - 1)] if auto else list(range(K)))
+    if any(not 0 <= b < K for b in run_bins) or G < 3 or G % 2 or K < 2:
+        raise SystemExit("--run-bins must lie in [0, K); --groups even >= 4; "
+                         "--bins >= 2")
     N = args.n_per_bin
     if N < 2 * G:
         raise SystemExit(f"--n-per-bin {N} < 2 * groups {G}")
     if args.timing_samples < 1:
         raise SystemExit("--timing-samples must be >= 1 (the deadline "
                          "estimate needs a measured s/sample)")
+    overhead_min = (args.overhead_min if args.overhead_min is not None
+                    else 5.0 if auto else 25.0)
 
     # --- parameter subsets on the abstract tree (no weights yet) ---
     abs_p = abstract_krea2_params(cfg, dtype=jnp.bfloat16, unstack=("blocks",))
@@ -1021,11 +1261,11 @@ def run_jax(args):
     c_size = sum(s for i, s in zip(p_idx, sizes) if i in c_idx)
     acc_bytes = G * p_size * 4
     mm_bytes = K * G * c_size * 4
-    print(f"P: {len(p_idx)} tensors, {p_size:,} params ({args.params}); P': "
-          f"{len(c_idx)} tensors, {c_size:,} ({args.cross_params}); group "
-          f"accumulators {acc_bytes / 2**30:.2f} GiB on device, P' memmap "
-          f"{mm_bytes / 2**30:.2f} GiB in {args.scratch} (free "
-          f"{env['scratch_free'] / 2**30:.0f} GiB)", flush=True)
+    emit(f"P: {len(p_idx)} tensors, {p_size:,} params ({args.params}); P': "
+         f"{len(c_idx)} tensors, {c_size:,} ({args.cross_params}); group "
+         f"accumulators {acc_bytes / 2**30:.2f} GiB on device, P' memmap "
+         f"{mm_bytes / 2**30:.2f} GiB in {args.scratch} (free "
+         f"{env['scratch_free'] / 2**30:.0f} GiB)")
     if mm_bytes > 0.8 * env["scratch_free"]:
         raise SystemExit("P' memmap does not fit the scratch disk: shrink "
                          "--cross-params")
@@ -1035,6 +1275,11 @@ def run_jax(args):
         attn_block=256, logit_mean=args.logit_mean, logit_std=args.logit_std,
         timestep_mu=args.timestep_mu)
     spec = json.loads(Path(args.samples).read_text())
+    n_ship = len(spec["entries"])
+    if N > n_ship:
+        raise SystemExit(f"--n-per-bin {N} > the {n_ship} shipped images")
+    # auto: inputs of every shipped image up front (a fresh N_m needs no reload)
+    n_load = n_ship if auto else N
     w_px, h_px = (int(x) for x in spec["bucket"].split("x"))
     unit = cfg.vae_compression * cfg.patch
     hw = (h_px // unit, w_px // unit)
@@ -1059,6 +1304,10 @@ def run_jax(args):
               jax.eval_shape(lambda: jax.random.PRNGKey(0)),
               S((), jnp.float32), S((), jnp.float32))
     limit = env.get("device_bytes_limit")
+    # resident outside the executable: the other G - 1 group accumulators and
+    # the cached text states + latents of every loaded image
+    outside = ((G - 1) * p_size * 4 + n_load * (args.text_rows * cfg.txtlayers
+               * cfg.txtdim * 2 + args.img_tokens * feat * 2))
 
     def compile_for(remat, attn):
         hp2 = argparse.Namespace(**{**vars(hp), "remat_policy": remat,
@@ -1075,48 +1324,81 @@ def run_jax(args):
         row = {"remat": remat, "attn": attn, "compile_s": round(time.time() - t0, 1),
                "peak_bytes": peak,
                "temp_bytes": getattr(ma, "temp_size_in_bytes", None),
-               "argument_bytes": getattr(ma, "argument_size_in_bytes", None)}
-        print("aot: " + json.dumps(row), flush=True)
+               "argument_bytes": getattr(ma, "argument_size_in_bytes", None),
+               "outside_bytes": outside}
+        emit("aot: " + json.dumps(row))
         return comp, row
 
+    def fits(row):
+        return (limit is None or row["peak_bytes"] is None
+                or row["peak_bytes"] + outside <= args.mem_margin * limit)
+
+    def cud_compile(remat):
+        try:
+            c, row = compile_for(remat, "cudnn")
+        except Exception as e:  # optional speed-up only
+            return None, {"remat": remat, "attn": "cudnn", "error": repr(e)[:500]}
+        if not fits(row):
+            return None, {**row, "error": f"does not fit {args.mem_margin} x "
+                          f"the device limit {limit}"}
+        return c, row
+
+    def cud_bg(remat, after=None):
+        """cud_compile on a daemon thread (a failing run exits without
+        waiting for an optional compile) -> (thread, result box)"""
+        box = {}
+
+        def run():
+            if after is not None:
+                after[0].join()  # one cuDNN compile at a time
+            box["r"] = cud_compile(remat)
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        _COMPILE_THREADS.append(th)
+        return th, box
+
+    # the cuDNN candidate compiles on a background thread (shapes only)
+    # while the ref step compiles and the inputs download / load; joined
+    # before any timing so it never overlaps a measured sample
+    remats = args.remat_candidates.split(",")
+    try_cud = (args.try_cudnn and args.attn != "cudnn"
+               and args.mode in ("smoke", "auto"))
+    cud_futs = {remats[0]: cud_bg(remats[0])} if try_cud else {}
     aot = []
     comp = None
-    for remat in args.remat_candidates.split(","):
+    for remat in remats:
         c, row = compile_for(remat, args.attn)
         aot.append(row)
-        # resident outside the executable: the other G - 1 group
-        # accumulators and the N cached text states + latents
-        outside = ((G - 1) * p_size * 4 + N * (args.text_rows * cfg.txtlayers
-                   * cfg.txtdim * 2 + args.img_tokens * feat * 2))
-        row["outside_bytes"] = outside
-        fits = (limit is None or row["peak_bytes"] is None
-                or row["peak_bytes"] + outside <= args.mem_margin * limit)
-        if fits:
+        if fits(row):
             comp, hp.remat_policy = c, remat
             break
         del c
     if comp is None:
         raise SystemExit(f"no remat candidate fits {args.mem_margin} x the "
                          f"device limit {limit}: {aot}")
-    print(f"using remat {hp.remat_policy}, attn {hp.attn}", flush=True)
+    if try_cud and hp.remat_policy not in cud_futs:
+        cud_futs[hp.remat_policy] = cud_bg(hp.remat_policy, cud_futs[remats[0]])
+    emit(f"using remat {hp.remat_policy}, attn {hp.attn}")
 
     # --- inputs ---
     deadline_check("loading the inputs", 300)
+    wait_ready(args.wait_inputs, "latents + text encoder")
     if args.verify_shards:
         verify_shards(args, args.samples)
-    ids, caps, x0_np, hw_s, bucket = load_samples(args, cfg, N)
+    ids, caps, x0_np, hw_s, bucket = load_samples(args, cfg, n_load)
     ctxs, te_id = text_contexts(args, cfg, caps)
     deadline_check("loading Raw")
+    wait_ready([args.wait_raw] if args.wait_raw else [], "Raw")
     t0 = time.time()
     params = load_dit_bf16(args.base_ckpt, cfg)
     leaves = jax.tree.leaves(params)
     p_leaves = [leaves[i] for i in p_idx]
     rest = [l for i, l in enumerate(leaves) if i not in set(p_idx)]
     del params, leaves
-    print(f"Raw loaded as bf16 in {time.time() - t0:.0f} s", flush=True)
-    x0_dev = [jax.device_put(x0_np[j:j + 1]) for j in range(N)]
+    emit(f"Raw loaded as bf16 in {time.time() - t0:.0f} s")
+    x0_dev = [jax.device_put(x0_np[j:j + 1]) for j in range(n_load)]
     hw_dev = jax.device_put(np.array([hw_s], np.int32))
-    base_key = jax.random.PRNGKey(args.seed)
     grams = Grams()
     c_pos = [k for k, i in enumerate(p_idx) if i in c_idx]
 
@@ -1134,196 +1416,363 @@ def run_jax(args):
         s = 1.0 / (1.0 + m.exp(-u))
         return m.exp(mu) / (m.exp(mu) + (1.0 / s - 1.0))
 
-    def one(f, acc, b, j):
+    def one(f, acc, b, j, key0):
         lo, hi = edges(b)
-        key = jax.random.fold_in(jax.random.fold_in(base_key, b), j)
+        key = jax.random.fold_in(jax.random.fold_in(key0, b), j)
         ctx, tm = ctxs[j]
         return f(p_leaves, rest, acc, x0_dev[j], hw_dev, ctx, tm, key,
                  np.float32(lo), np.float32(hi))
 
-    # --- timing (both modes: the per-bin time estimate of the deadline) ---
+    # --- timing (every mode: the per-bin time estimate of the deadline) ---
     timing = {}
     extra = {"env": env, "aot": aot, "te_id": te_id}
-    n_left = len(run_bins)
+    base_key = jax.random.PRNGKey(args.seed)
 
-    def bin_est(sps):
-        # conservative: 1.25 x the samples + Grams / P' transfer / host
-        # cross products (~3 s per earlier bin) + --bin-overhead-s
-        if not (np.isfinite(sps) and sps > 0):
-            return float("inf")  # fail closed: no bin without a valid timing
-        return 1.25 * N * sps + args.bin_overhead_s + 3 * K
+    def median_s(f, warm):
+        """median s/sample of --timing-samples samples after `warm` warm-up
+        samples (bin K//2)"""
+        a, ts = zeros_acc(), []
+        for j in range(warm + args.timing_samples):
+            t0 = time.time()
+            a, _, loss, _ = one(f, a, K // 2, j % n_load, base_key)
+            jax.block_until_ready(loss)
+            ts.append(time.time() - t0)
+        del a
+        return float(np.median(ts[warm:]))
 
     deadline_check("timing")
-
-    acc = zeros_acc()
-    acc, sq, loss, t = one(comp, acc, K // 2, 0)
-    jax.block_until_ready(loss)
-    ts = []
-    for j in range(1, 1 + args.timing_samples):
-        t0 = time.time()
-        acc, sq, loss, t = one(comp, acc, K // 2, j % N)
-        jax.block_until_ready(loss)
-        ts.append(time.time() - t0)
-    timing["ref_s_per_sample"] = float(np.median(ts))
-    if not (np.isfinite(timing["ref_s_per_sample"]) and timing["ref_s_per_sample"] > 0):
-        raise SystemExit(f"invalid timing {timing['ref_s_per_sample']} s/sample")
+    busy = any(th.is_alive() for th, _ in cud_futs.values())
+    ref_sps = timing["ref_s_per_sample"] = median_s(comp, 1)
+    if not (np.isfinite(ref_sps) and ref_sps > 0):
+        raise SystemExit(f"invalid timing {ref_sps} s/sample")
     deadline_check("the bins")
-    print(f"timing ({hp.attn}, remat {hp.remat_policy}): "
-          f"{timing['ref_s_per_sample']:.3f} s/sample (median of {len(ts)})",
-          flush=True)
-    cud_est = aot[-1]["compile_s"] * 1.5 + 8 * timing["ref_s_per_sample"] + 60
-    if (args.mode == "smoke" and args.try_cudnn and hp.attn != "cudnn"
-            and left_s() - cud_est < n_left * bin_est(timing["ref_s_per_sample"])):
+    emit(f"timing ({hp.attn}, remat {hp.remat_policy}): {ref_sps:.3f} "
+         f"s/sample (median of {args.timing_samples})")
+    n_first = 2 if auto else len(run_bins)
+    cud_est = 8 * ref_sps + 60
+    c2 = None
+    if try_cud:
+        # bounded: --cudnn-wait-s, and never into the reserve of the trial +
+        # the first bins; a compile still running is abandoned (daemon
+        # thread, its result never read; main() exits past it)
+        wait = max(0.0, min(args.cudnn_wait_s, left_s() - cud_est - n_first
+                            * bin_est(ref_sps, N, K, args.bin_overhead_s)))
+        t0 = time.time()
+        for th, _ in cud_futs.values():
+            th.join(max(0.0, t0 + wait - time.time()))
+        if any(th.is_alive() for th, _ in cud_futs.values()):
+            timing["cudnn_skipped"] = (f"compile not done after "
+                                       f"{time.time() - t0:.0f} s (wait cap "
+                                       f"{wait:.0f} s): ref")
+            emit("cudnn: " + timing["cudnn_skipped"])
+        else:
+            res = {r: box.get("r", (None, {"remat": r, "attn": "cudnn",
+                                            "error": "compile thread died"}))
+                   for r, (_, box) in cud_futs.items()}
+            aot.extend(row for _, row in res.values())
+            c2, row = res[hp.remat_policy]
+            del res
+            if c2 is None:
+                timing["cudnn_error"] = row["error"]
+            emit(f"cudnn compile joined (waited {time.time() - t0:.0f} s): "
+                 + ("ok" if c2 is not None else row["error"]))
+            if c2 is not None and busy:
+                # the compile ran during the ref timing: time ref again so the
+                # switch rule compares undisturbed numbers
+                ref_sps = timing["ref_s_per_sample"] = median_s(comp, 0)
+                emit(f"timing ({hp.attn}, re-timed): {ref_sps:.3f} s/sample")
+    if c2 is not None and (left_s() - cud_est
+                           < n_first * bin_est(ref_sps, N, K, args.bin_overhead_s)):
         timing["cudnn_skipped"] = (f"deadline: {left_s():.0f} s left, the "
-                                   f"trial ~{cud_est:.0f} s + {n_left} bins")
-        print("cudnn trial skipped: " + timing["cudnn_skipped"], flush=True)
-    elif args.mode == "smoke" and args.try_cudnn and hp.attn != "cudnn":
+                                   f"trial ~{cud_est:.0f} s + {n_first} bins")
+        c2 = None
+    elif c2 is not None:
         try:
-            c2, row = compile_for(hp.remat_policy, "cudnn")
-            aot.append(row)
-            g_ref, _, _, _ = one(comp, zeros_acc(), K // 2, 0)
-            g_cud, _, _, _ = one(c2, zeros_acc(), K // 2, 0)
+            g_ref, _, _, _ = one(comp, zeros_acc(), K // 2, 0, base_key)
+            g_cud, _, _, _ = one(c2, zeros_acc(), K // 2, 0, base_key)
             cosv = (sum(grams.dot(a, b) for a, b in zip(g_ref, g_cud))
                     / math.sqrt(sum(grams.dot(a, a) for a in g_ref)
                                 * sum(grams.dot(b, b) for b in g_cud)))
             del g_ref, g_cud
-            a2 = zeros_acc()
-            ts2 = []
-            for j in range(1 + args.timing_samples):
-                t0 = time.time()
-                a2, sq, loss, t = one(c2, a2, K // 2, j % N)
-                jax.block_until_ready(loss)
-                ts2.append(time.time() - t0)
-            timing["cudnn_s_per_sample"] = float(np.median(ts2[1:]))
+            timing["cudnn_s_per_sample"] = median_s(c2, 1)
             timing["cudnn_grad_cos_vs_ref"] = float(cosv)
-            del a2, c2
         except Exception as e:  # optional speed-up only
             timing["cudnn_error"] = repr(e)[:500]
-        print("cudnn: " + json.dumps(timing), flush=True)
-    del acc
+            c2 = None
+    sps = ref_sps
+    if auto:
+        # pre-registered: cuDNN for ALL bins iff cos >= 0.999 AND <= 0.90 x ref
+        use = (c2 is not None
+               and timing["cudnn_grad_cos_vs_ref"] >= 0.999
+               and timing["cudnn_s_per_sample"] <= 0.90 * ref_sps)
+        timing["attn_rule"] = ("cudnn for all bins iff grad cos vs ref >= 0.999 "
+                               "AND median s/sample <= 0.90 x ref, else ref "
+                               "(any cuDNN failure -> ref)")
+        timing["attn_choice"] = "cudnn" if use else "ref"
+        if use:
+            comp, hp.attn, sps = c2, "cudnn", timing["cudnn_s_per_sample"]
+    c2 = None
+    if try_cud:
+        emit("cudnn: " + json.dumps(timing))
     extra["timing"] = timing
 
-    # --- state (resume) ---
-    config = {"bins": K, "groups": G, "n_per_bin": N, "seed": args.seed,
-              "bucket": bucket, "mu": mu, "hw": list(hw_s),
-              "img_tokens": args.img_tokens, "text_rows": args.text_rows,
-              "logit_mean": args.logit_mean, "logit_std": args.logit_std,
-              "attn": hp.attn, "remat": hp.remat_policy, "qchunk": args.qchunk,
-              "params": args.params, "cross_params": args.cross_params,
-              "p_size": p_size, "cross_size": c_size, "ids": ids,
-              "base_ckpt": Path(args.base_ckpt).name, "te_id": te_id,
-              "model_config": args.model_config}
-    state_path = out / "state.json"
-    state = None
-    if args.resume and state_path.exists():
-        old = json.loads(state_path.read_text())
-        if old["config"] != config:
-            raise SystemExit("--resume: state.json has a different config")
-        state = old
-        print(f"resumed: bins done {sorted(state['bins'])}", flush=True)
-    if state is None:
-        state = {"config": config, "groups": G,
-                 "n_per_group": [len(range(g, N, G)) for g in range(G)],
-                 "leaves": [{"path": paths[i], "size": s, "cross": i in c_idx}
-                            for i, s in zip(p_idx, sizes)],
-                 "bins": {}, "cross": {}}
-    mm_path = Path(args.scratch) / "cross_sums.npy"
-    if state["bins"]:
-        # resumed bins: their P' group sums must be in this scratch memmap,
-        # else every later cross-bin product with them would be silently 0
-        if not mm_path.exists():
-            raise SystemExit(f"--resume: {mm_path} is missing (the P' sums of "
-                             f"bins {sorted(state['bins'])} live only there); "
-                             "start a fresh --out instead")
-        mm = np.load(str(mm_path), mmap_mode="r+")
-        if mm.shape != (K, G, c_size) or mm.dtype != np.float32:
-            raise SystemExit(f"--resume: {mm_path} has shape {mm.shape} "
-                             f"{mm.dtype}, expected {(K, G, c_size)} float32")
-        for b in sorted(state["bins"]):
-            want = state["bins"][b].get("cross_sha256")
-            got = _sha256_array(mm[int(b)])
-            if got != want:
-                raise SystemExit(f"--resume: {mm_path} bin {b} sha256 {got} != "
-                                 f"state.json {want} (wrong or stale scratch)")
-        print(f"resume: {mm_path} matches bins {sorted(state['bins'])}", flush=True)
-    else:
-        mm = np.lib.format.open_memmap(str(mm_path), mode="w+",
-                                       dtype=np.float32, shape=(K, G, c_size))
+    # --- state ---
+    def new_state(n, seed):
+        config = {"bins": K, "groups": G, "n_per_bin": n, "seed": seed,
+                  "bucket": bucket, "mu": mu, "hw": list(hw_s),
+                  "img_tokens": args.img_tokens, "text_rows": args.text_rows,
+                  "logit_mean": args.logit_mean, "logit_std": args.logit_std,
+                  "attn": hp.attn, "remat": hp.remat_policy, "qchunk": args.qchunk,
+                  "params": args.params, "cross_params": args.cross_params,
+                  "p_size": p_size, "cross_size": c_size, "ids": ids[:n],
+                  "base_ckpt": Path(args.base_ckpt).name, "te_id": te_id,
+                  "model_config": args.model_config}
+        return {"config": config, "groups": G,
+                "n_per_group": [len(range(g, n, G)) for g in range(G)],
+                "leaves": [{"path": paths[i], "size": s, "cross": i in c_idx}
+                           for i, s in zip(p_idx, sizes)],
+                "bins": {}, "cross": {}}
 
-    # --- bins ---
-    rep = None
-    bin_s = None
-    stopped = False
-    for b in run_bins:
-        if str(b) in state["bins"]:
-            continue
-        need = max(bin_est(timing["ref_s_per_sample"]), 1.1 * (bin_s or 0))
-        if not left_s() > need:
-            print(f"DEADLINE_STOP before bin {b}: {left_s():.0f} s left < "
-                  f"{need:.0f} s per bin", flush=True)
-            stopped = True
-            break
-        t0 = time.time()
-        accs = [zeros_acc() for _ in range(G)]
+    mm_path = Path(args.scratch) / "cross_sums.npy"
+
+    def new_mm():
+        # one P' memmap on the disk at a time (a fresh measurement replaces it)
+        mm_path.unlink(missing_ok=True)
+        return np.lib.format.open_memmap(str(mm_path), mode="w+",
+                                         dtype=np.float32, shape=(K, G, c_size))
+
+    def run_stage(stage, out_dir, state, mm, bins, n, key0, sps, extra_s,
+                  budget_end=None):
+        """The bins (in order; those already in state skipped) at n samples
+        into state / out_dir; a bin starts only if its estimate fits before
+        the deadline and before budget_end (epoch s; auto: the post-gate CU
+        budget). GPU part here; the host part of a bin (memmap
+        row, cross products with every earlier bin, state, outputs) on ONE
+        serial worker thread while the next bin runs, <= 2 host copies of
+        the P' sums in flight. A worker error is re-raised here (before the
+        next bin, at the latest at the end). -> (the stop line or None,
+        (rep, txt) of the last bin or None)."""
         L = len(p_idx)
-        Q = np.zeros((L, G))
-        losses, tvals, sq_tot = [], [], []
-        for j in range(N):
-            g = j % G
-            accs[g], sq, loss, t = one(comp, accs[g], b, j)
-            sq = np.asarray(sq, np.float64)
-            Q[:, g] += sq
-            sq_tot.append(float(sq.sum()))
-            losses.append(float(loss))
-            tvals.append(float(t))
-            if not np.isfinite(losses[-1]) or not np.all(np.isfinite(Q[:, g])):
-                raise SystemExit(f"bin {b} sample {j}: non-finite loss/grad")
-        H = np.stack([grams.gram(accs, k) for k in range(L)])
-        X = np.stack([np.concatenate([np.asarray(accs[g][k]).ravel()
-                                      for k in c_pos]) for g in range(G)])
-        mm[b] = X
+        ex = ThreadPoolExecutor(max_workers=1)
+        slots = threading.Semaphore(2)
+        futs = []
+        done = {int(x) for x in state["bins"]}  # main-thread view
+        bin_s = None
+        stopped = None
+
+        def host_part(b, X, H, Q, losses, tvals, sq_tot, secs):
+            try:
+                t0 = time.time()
+                mm[b] = X
+                mm.flush()
+                # serial worker: every bin already in state has its mm row
+                for a in sorted(int(x) for x in state["bins"]):
+                    Xa = np.asarray(mm[a])
+                    Cab = np.zeros((G, G))
+                    step = 1 << 22
+                    for s in range(0, c_size, step):
+                        Cab += (Xa[:, s:s + step].astype(np.float64)
+                                @ X[:, s:s + step].astype(np.float64).T)
+                    lo_b, hi_b = sorted((a, b))
+                    state["cross"][f"{lo_b},{hi_b}"] = (Cab if a < b else Cab.T).tolist()
+                lo, hi = edges(b)
+                entry = {"H": H.tolist(), "Q": Q.tolist(), "loss": losses,
+                         "t": tvals, "t_range": [t_of(lo), t_of(hi)],
+                         "seconds": secs, "sq_total": sq_tot,
+                         "cross_sha256": _sha256_array(X)}
+                entry["host_s"] = round(time.time() - t0, 1)
+                state["bins"][str(b)] = entry
+                return write_outputs(out_dir, state, extra_s, stage)
+            finally:
+                slots.release()
+
+        try:
+            for b in bins:
+                if b in done:
+                    continue
+                for f in futs:
+                    if f.done():
+                        f.result()  # a failed host part stops the run here
+                need = max(bin_est(sps, n, K, args.bin_overhead_s),
+                           1.1 * (bin_s or 0))
+                if not left_s() > need:
+                    stopped = (f"DEADLINE_STOP before bin {b}: {left_s():.0f} s "
+                               f"left < {need:.0f} s per bin")
+                elif budget_end is not None and not budget_end - time.time() > need:
+                    stopped = (f"BUDGET_STOP before bin {b}: "
+                               f"{budget_end - time.time():.0f} s of the post-gate "
+                               f"CU budget left < {need:.0f} s per bin")
+                if stopped:
+                    emit(stopped)
+                    break
+                t0 = time.time()
+                accs = [zeros_acc() for _ in range(G)]
+                Q = np.zeros((L, G))
+                losses, tvals, sq_tot = [], [], []
+
+                def take(j, g, sq, loss, t):
+                    sq = np.asarray(sq, np.float64)
+                    Q[:, g] += sq
+                    sq_tot.append(float(sq.sum()))
+                    losses.append(float(loss))
+                    tvals.append(float(t))
+                    if not np.isfinite(losses[-1]) or not np.all(np.isfinite(Q[:, g])):
+                        raise SystemExit(f"bin {b} sample {j}: non-finite loss/grad")
+
+                prev = None
+                for j in range(n):
+                    g = j % G
+                    accs[g], sq, loss, t = one(comp, accs[g], b, j, key0)
+                    if prev is not None:
+                        take(*prev)  # sample j-1, read while sample j runs
+                    prev = (j, g, sq, loss, t)
+                take(*prev)
+                H = np.stack([grams.gram(accs, k) for k in range(L)])
+                slots.acquire()  # waits while 2 P' copies are in flight
+                try:
+                    X = np.empty((G, c_size), np.float32)  # filled in place
+                    for g in range(G):
+                        o = 0
+                        for k in c_pos:
+                            a = np.asarray(accs[g][k]).ravel()
+                            X[g, o:o + a.size] = a
+                            o += a.size
+                except BaseException:
+                    slots.release()
+                    raise
+                del accs
+                bin_s = time.time() - t0  # GPU part incl. Grams + P' transfer
+                futs.append(ex.submit(host_part, b, X, H, Q, losses, tvals,
+                                      sq_tot, bin_s))
+                done.add(b)
+                del X
+                emit(f"bin {b} done in {bin_s:.0f} s ({bin_s / n:.2f} s/sample); "
+                     f"t {min(tvals):.4f}..{max(tvals):.4f}, loss "
+                     f"{np.mean(losses):.4f}")
+            last = None
+            for f in futs:
+                last = f.result()
+        finally:
+            ex.shutdown(wait=True)
+        return stopped, last
+
+    def finish(stage, out_dir, state, last, extra_s, bins):
+        rep, txt = last if last is not None else write_outputs(
+            out_dir, state, extra_s, stage)
+        emit(txt)
+        emit(f"total {time.time() - t_start:.0f} s")
+        return rep, [b for b in bins if str(b) not in state["bins"]]
+
+    if not auto:
+        state = new_state(N, args.seed)
+        state_path = out / "state.json"
+        if args.resume and state_path.exists():
+            old = json.loads(state_path.read_text())
+            if old["config"] != state["config"]:
+                raise SystemExit("--resume: state.json has a different config")
+            state = old
+            emit(f"resumed: bins done {sorted(state['bins'])}")
+        if state["bins"]:
+            # resumed bins: their P' group sums must be in this scratch
+            # memmap, else every later cross-bin product with them would be
+            # silently 0
+            if not mm_path.exists():
+                raise SystemExit(f"--resume: {mm_path} is missing (the P' sums of "
+                                 f"bins {sorted(state['bins'])} live only there); "
+                                 "start a fresh --out instead")
+            mm = np.load(str(mm_path), mmap_mode="r+")
+            if mm.shape != (K, G, c_size) or mm.dtype != np.float32:
+                raise SystemExit(f"--resume: {mm_path} has shape {mm.shape} "
+                                 f"{mm.dtype}, expected {(K, G, c_size)} float32")
+            for b in sorted(state["bins"]):
+                want = state["bins"][b].get("cross_sha256")
+                got = _sha256_array(mm[int(b)])
+                if got != want:
+                    raise SystemExit(f"--resume: {mm_path} bin {b} sha256 {got} != "
+                                     f"state.json {want} (wrong or stale scratch)")
+            emit(f"resume: {mm_path} matches bins {sorted(state['bins'])}")
+        else:
+            mm = new_mm()
+        stopped, last = run_stage(args.mode, out, state, mm, run_bins, N,
+                                  base_key, sps, extra)
+        if args.mode == "smoke":
+            rep = last[0] if last is not None else build_report(state)
+            go = go_no_go(rep, sps, args.budget_cu, overhead_min, n_ship)
+            last = write_outputs(out, state, {**extra, "go": go}, "smoke")
+        rep, missing = finish(args.mode, out, state, last, extra, run_bins)
+        if stopped or missing:
+            emit(f"PARTIAL: bins {missing} not measured ({stopped or 'deadline'})")
+            sys.exit(6)
+        return
+
+    # --- auto: gate bins, gate, phase 2 ---
+    sm_dir, me_dir = out / "smoke", out / "measure"
+    state = new_state(N, args.seed)
+    mm = new_mm()
+    stopped, last = run_stage("smoke", sm_dir, state, mm, run_bins[:2], N,
+                              base_key, sps, extra)
+    if stopped:
+        finish("smoke", sm_dir, state, last, extra, run_bins[:2])
+        emit(f"PARTIAL: the gate bins did not finish ({stopped})")
+        sys.exit(6)
+    rep = build_report(state)
+    det = [b for b, r in rep["bins"].items() if r["P"]["detectable"]]
+    ns = [r["P"]["n_needed"] for r in rep["bins"].values()
+          if r["P"]["n_needed"] is not None]
+    # planning s/sample: the timing of the chosen attention, or the gate
+    # bins' own rate if that is slower (the per-bin deadline uses the same)
+    sps_plan = max([sps] + [state["bins"][str(b)]["seconds"] / N
+                            for b in run_bins[:2]])
+    t_gate = time.time()
+    gate = gate_decision(det, min(ns) if ns else None, N, K, G, sps_plan,
+                         n_ship, args.budget_cu, overhead_min, left_s(),
+                         args.bin_overhead_s)
+    emit(f"{GATE_TAG} {json.dumps(gate)}")
+    gx = {**extra, "go": gate}
+    _, txt = write_outputs(sm_dir, state, gx, "smoke")
+    emit(txt)
+    if gate["action"] == "stop":
+        emit(f"GATE_STOP {gate['verdict']}: no phase 2 (total "
+             f"{time.time() - t_start:.0f} s)")
+        return
+    if gate["action"] == "reuse":
+        n_m, key_m = N, base_key
+        # the continuing state lives in out/measure from here on
+        write_outputs(me_dir, state, gx, "measure")
+    else:
+        n_m, key_m = gate["N_m"], jax.random.PRNGKey(args.seed + 1)
         mm.flush()
-        for a in sorted(int(x) for x in state["bins"]):
-            Xa = np.asarray(mm[a])
-            Cab = np.zeros((G, G))
-            step = 1 << 22
-            for s in range(0, c_size, step):
-                Cab += (Xa[:, s:s + step].astype(np.float64)
-                        @ X[:, s:s + step].astype(np.float64).T)
-            lo_b, hi_b = sorted((a, b))
-            state["cross"][f"{lo_b},{hi_b}"] = (Cab if a < b else Cab.T).tolist()
-        del accs
-        lo, hi = edges(b)
-        bin_s = time.time() - t0
-        state["bins"][str(b)] = {
-            "H": H.tolist(), "Q": Q.tolist(), "loss": losses, "t": tvals,
-            "t_range": [t_of(lo), t_of(hi)], "seconds": bin_s,
-            "sq_total": sq_tot,
-            "cross_sha256": _sha256_array(X)}
-        del X
-        rep, txt = write_outputs(out, state, extra)
-        print(f"bin {b} done in {bin_s:.0f} s ({bin_s / N:.2f} s/sample); "
-              f"t {min(tvals):.4f}..{max(tvals):.4f}, loss "
-              f"{np.mean(losses):.4f}", flush=True)
-    if rep is None:
-        rep, txt = write_outputs(out, state, extra)
-    if args.mode == "smoke":
-        sps = timing.get("ref_s_per_sample", 1.0)
-        n_ship = len(spec["entries"])
-        rep["go"] = go_no_go(rep, sps, args.budget_cu, args.overhead_min, n_ship)
-        rep, txt = write_outputs(out, state, {**extra, "go": rep["go"]})
-    print(txt, flush=True)
-    print(f"total {time.time() - t_start:.0f} s", flush=True)
-    missing = [b for b in run_bins if str(b) not in state["bins"]]
+        del mm
+        mm = new_mm()
+        state = new_state(n_m, args.seed + 1)
+    emit(f"phase 2: {gate['action']} at N {n_m} (bins "
+         f"{[b for b in range(K) if str(b) not in state['bins']]})")
+    # the post-gate CU budget is enforced, not only planned: no bin starts
+    # unless it fits before gate time + budget - the overhead reserve (the
+    # same reserve gate_decision sized the plan with: worker drain, reports)
+    budget_end = t_gate + args.budget_cu / CU_PER_H["G4"] * 3600 - overhead_min * 60
+    stopped, last = run_stage("measure", me_dir, state, mm, list(range(K)), n_m,
+                              key_m, sps_plan, gx, budget_end)
+    spent = time.time() - t_gate
+    budget = {"budget_cu": args.budget_cu, "reserve_s": overhead_min * 60,
+              "budget_end_epoch": budget_end,
+              "budget_end_after_gate_s": budget_end - t_gate,
+              "spent_after_gate_s": spent,
+              "spent_after_gate_cu": spent / 3600 * CU_PER_H["G4"],
+              "stop": stopped}
+    _, txt = write_outputs(me_dir, state, {**gx, "budget": budget}, "measure")
+    emit(txt)
+    emit(f"total {time.time() - t_start:.0f} s")
+    missing = [b for b in range(K) if str(b) not in state["bins"]]
     if stopped or missing:
-        print(f"PARTIAL: bins {missing} not measured (deadline)", flush=True)
+        emit(f"PARTIAL: bins {missing} not measured ({stopped or 'deadline'})")
         sys.exit(6)
 
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--mode", required=True,
-                    choices=["select", "smoke", "measure", "report"])
+                    choices=["select", "smoke", "measure", "auto", "report"])
     ap.add_argument("--out", required=True,
                     help="select: the samples json; else the output dir")
     # select
@@ -1351,7 +1800,8 @@ def parse_args(argv=None):
                     default=True)
     ap.add_argument("--bins", type=int, default=8)
     ap.add_argument("--run-bins", default=None,
-                    help="comma list (default: smoke 0,K-1; measure all)")
+                    help="comma list (default: smoke 0,K-1; measure all; "
+                         "auto: fixed)")
     ap.add_argument("--n-per-bin", type=int, default=64)
     ap.add_argument("--groups", type=int, default=8)
     ap.add_argument("--params", default="blocks.4,blocks.18,tmlp,last,first")
@@ -1371,13 +1821,20 @@ def parse_args(argv=None):
     ap.add_argument("--timestep-mu", type=float, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--try-cudnn", action=argparse.BooleanOptionalAction,
-                    default=True, help="smoke: also time --attn cudnn")
+                    default=True, help="smoke: also time --attn cudnn; auto: "
+                    "and use it iff cos >= 0.999 and <= 0.90 x ref s/sample")
     ap.add_argument("--timing-samples", type=int, default=3)
+    ap.add_argument("--cudnn-wait-s", type=float, default=300.0,
+                    help="max seconds to wait (after the ref timing) for the "
+                         "background cuDNN compile; still running -> ref")
     ap.add_argument("--budget-cu", type=float, default=15.0,
-                    help="smoke: phase-2 CU budget of the go/no-go rule")
-    ap.add_argument("--overhead-min", type=float, default=25.0,
-                    help="smoke: phase-2 fixed minutes (setup, downloads, "
-                         "compile, load) in the go/no-go budget")
+                    help="smoke: phase-2 CU budget of the go/no-go rule; "
+                         "auto: the CU allowed after the gate")
+    ap.add_argument("--overhead-min", type=float, default=None,
+                    help="phase-2 fixed minutes in the go/no-go budget "
+                         "(default: smoke 25 = a new session's setup, "
+                         "downloads, compile, load; auto 5 = continuing: "
+                         "memmap re-create, worker drain, reports)")
     ap.add_argument("--deadline-min", type=float, default=0,
                     help="minutes of the script: refuse to load inputs with "
                          "< 5 min left, skip the cuDNN trial and stop before "
@@ -1390,6 +1847,18 @@ def parse_args(argv=None):
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--allow-any-gpu", action="store_true")
     ap.add_argument("--from-log", default=None, help="report: a job.log")
+    ap.add_argument("--stage", choices=["smoke", "measure"], default=None,
+                    help="report: the stage of an auto run (default: the last "
+                         "GRADSNR_STATE line / out/measure, else out/smoke)")
+    ap.add_argument("--wait-inputs", nargs="*", default=[],
+                    help="ready markers (content 'ok') to wait for before "
+                         "reading the latents and the text encoder")
+    ap.add_argument("--wait-raw", default=None,
+                    help="ready marker of Raw (downloaded AND sha256 "
+                         "verified) to wait for before loading it")
+    ap.add_argument("--downloader-pid", type=int, default=None,
+                    help="pid of the background downloader: exiting without "
+                         "the markers fails the wait at once")
     return ap.parse_args(argv)
 
 
@@ -1398,14 +1867,42 @@ def main(argv=None):
     if args.mode == "select":
         return select_samples(args)
     if args.mode == "report":
-        state = (decode_state_from_log(args.from_log) if args.from_log
-                 else json.loads((Path(args.out) / "state.json").read_text()))
-        print(report_text(build_report(state)))
+        if args.from_log:
+            print(report_text(build_report(decode_state_from_log(
+                args.from_log, args.stage))))
+            return None
+        d = Path(args.out)
+        cands = [d / args.stage] if args.stage else [d, d / "measure", d / "smoke"]
+        sp = next((c / "state.json" for c in cands
+                   if (c / "state.json").exists()), None)
+        if sp is None:
+            raise SystemExit(f"no state.json in {[str(c) for c in cands]}")
+        rep = build_report(json.loads(sp.read_text()))
+        rj = sp.with_name("report.json")
+        if rj.exists():  # the gate decision lives only in the report
+            go = json.loads(rj.read_text()).get("go")
+            if go:
+                rep["go"] = go
+        print(report_text(rep))
         return None
     for k in ("base_ckpt", "text_encoder", "data_dir", "samples"):
         if getattr(args, k) is None:
             raise SystemExit(f"--{k.replace('_', '-')} is required")
-    return run_jax(args)
+    try:
+        run_jax(args)
+    except SystemExit as e:
+        if any(th.is_alive() for th in _COMPILE_THREADS):
+            if e.code is not None and not isinstance(e.code, int):
+                print(e.code, file=sys.stderr)
+            exit_past_compiles(e.code if isinstance(e.code, int) else 1)
+        raise
+    except BaseException:
+        if any(th.is_alive() for th in _COMPILE_THREADS):
+            import traceback
+            traceback.print_exc()
+            exit_past_compiles(1)
+        raise
+    exit_past_compiles(0)
 
 
 if __name__ == "__main__":
