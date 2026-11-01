@@ -70,8 +70,9 @@ is never built into /vol/krea2 nor uploaded to the HF latents repo:
                     (krea2-fullft), e.g. latents_v3/
 --build: `stage` (CPU, secret rclone-gdrive only) rclone-copies the package
 into /vol/src/NAME (--checksum: resumable, unchanged files skipped), commits,
-and checks every tar the parquet names is there; a failure stops before any
-GPU starts. Then the cost estimate (build_estimate at the measured v2 rate,
+and checks every tar the parquet names is there; then finalize_r2's R2
+pre-check (credentials + the prefix, see below); a failure of either stops
+before any GPU starts. Then the cost estimate (build_estimate at the measured v2 rate,
 the staged row count), prep (VAE only; no HF write check), the workers
 (cache_latents.py --tar-dir /vol/src/NAME --out /vol/krea2-NAME), and
 `finalize_r2` (CPU, secret krea2-r2 only, never HF): --write-manifest
@@ -1621,7 +1622,7 @@ class R2ConflictError(Exception):
 
 def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
                      python=sys.executable, cwd=REMOTE_REPO, env=None,
-                     rclone=RCLONE_BIN):
+                     rclone=RCLONE_BIN, precheck=False):
     """A named cache's finalize: --write-manifest against the staged
     package's parquet, then metadata.parquet + the manifest's shards to
     r2:<bucket>/<prefix>/ (rclone copy --checksum; rclone's own transfer
@@ -1629,8 +1630,9 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
     manifest on R2 means a complete cache. Refuses (before the copy) a prefix
     whose existing manifest marks another cache (r2_conflicts); a cheap
     pre-check refuses it already before hashing when there is no local
-    manifest. Never touches HF. Never raises: -> {ok, repo, error, problems,
-    n_files, bytes, log}."""
+    manifest. precheck: only that pre-check (R2 credentials + the prefix),
+    run by --build before any GPU starts. Never touches HF. Never raises:
+    -> {ok, repo, error, problems, n_files, bytes, log}."""
     env = os.environ if env is None else env
     log = []
 
@@ -1671,6 +1673,10 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
         res["problems"] = conflicts()
         if res["problems"]:
             raise R2ConflictError(url)
+        if precheck:
+            say(f"R2 pre-check ok: {url} is new, unfinished or this cache")
+            res["ok"] = True
+            return to_plain(res)
         # 2. verify all shards + digests against the staged parquet
         cmd = finalize_cmd(python=python, out=out, tar_dir=job["src"])
         say("$ " + " ".join(cmd))
@@ -1778,8 +1784,9 @@ if modal is not None:
 
     @app.function(timeout=FINALIZE_R2_TIMEOUT_H * 3600, volumes={VOL: vol},
                   secrets=[r2_secret])
-    def finalize_r2(cache_name: str, dest_r2: str) -> dict:
-        return finalize_r2_impl(vol, cache_name, dest_r2)
+    def finalize_r2(cache_name: str, dest_r2: str,
+                    precheck: bool = False) -> dict:
+        return finalize_r2_impl(vol, cache_name, dest_r2, precheck=precheck)
 
     def _print_prep(p):
         print(f"prep: HF user {p.get('whoami')!r} (token from "
@@ -1885,6 +1892,10 @@ if modal is not None:
                           src=job["src"], src_drive=job["src_remote"],
                           dest_r2=job["dest"])
             n_images = _stage_local(job)["n_rows"]
+            pc = finalize_r2.remote(job["name"], job["dest"], True)
+            if not pc.get("ok"):
+                raise SystemExit("R2 pre-check FAILED (no GPU started): "
+                                 + _err_line(pc.get("error")))
         print(render_estimate(n_images, gpu, cpu, containers, vae_impl,
                               batch))
         p = prep.remote(False)   # VAE once, before N workers would race on it
