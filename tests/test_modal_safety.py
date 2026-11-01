@@ -194,7 +194,7 @@ def test_finalize_r2_never_hf_publishes_once_and_prechecks(tmp_path, monkeypatch
     assert case != "published" or (len(up) == 1 and "--ignore-existing" in up[0])   # immutable: add only, never replace
 
 
-@pytest.mark.parametrize("case", ["ok", "cache from another input", "tar not in the package"])
+@pytest.mark.parametrize("case", ["ok", "cache from another input", "tar not in the package", "unmarked shards"])
 def test_stage_pins_input_generation_and_needs_every_tar_in_package(tmp_path, monkeypatch, case):
     pa, pq = pytest.importorskip("pyarrow"), pytest.importorskip("pyarrow.parquet")
     monkeypatch.setattr(mcl, "VOL_OUT", str(tmp_path / "krea2"))
@@ -207,11 +207,15 @@ def test_stage_pins_input_generation_and_needs_every_tar_in_package(tmp_path, mo
         (src / t).write_bytes(b"t")
     if case == "cache from another input":
         (out / mcl.GEN_JSON).write_text('{"generation": "old"}')
+    (src / mcl.STAGE_JSON).write_text('{"generation": "A"}')   # an earlier staging: gone unless re-validated
+    if case == "unmarked shards":
+        (out / "latents/train-0000.safetensors").write_bytes(b"s")
     r = mcl.stage_impl(SimpleNamespace(reload=lambda: None, commit=lambda: None), "v3", "selection_v3/package",
                        runner=fake_rclone(calls, {"metadata.parquet": 9, "data/train-0000.tar": 1}),
                        env={"RCLONE_CONF_B64": "eA=="}, conf_path=str(tmp_path / "c.conf"))
     synced = [c for c in calls if "sync" in c]
-    assert r["ok"] is (case == "ok") and bool(synced) is (case != "cache from another input")
+    assert r["ok"] is (case == "ok") and bool(synced) is (case in ("ok", "tar not in the package"))
+    assert r["ok"] or (src / mcl.STAGE_JSON).exists() is (not synced)   # a failed restage leaves no stale stage.json
     assert not r["ok"] or json.loads((out / mcl.GEN_JSON).read_text())["generation"] == r["generation"] == json.loads(
         (src / mcl.STAGE_JSON).read_text())["generation"]
 

@@ -1659,7 +1659,10 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
          names is in the listing and on disk);
       5. stage.json = {src_remote, generation, files}, and the cache dir's
          GEN_JSON = the generation if it has none yet (it is then bound to
-         this input).
+         this input; a cache dir with shard output but no GEN_JSON is never
+         adopted). stage.json is deleted (and committed) before the sync and
+         only written back after 3-4 pass, so a failed restage leaves no
+         stage.json and the workers / finalize_r2 refuse.
     Never raises: -> {ok, error, src, src_remote, generation, n_rows, n_tars,
     bytes, missing, log}."""
     env = os.environ if env is None else env
@@ -1690,6 +1693,17 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
         mk = _read_json(out / GEN_JSON)
         if mk and mk.get("generation") != gen:
             raise SystemExit(generation_refusal(out, gen, mk.get("generation")))
+        lat = out / "latents"
+        if mk is None and lat.is_dir() and any(lat.iterdir()):
+            raise SystemExit(
+                f"{out} already holds shard output but no {GEN_JSON}: its "
+                "input is unknown, it is never adopted. Pick a new "
+                f"--cache-name, or delete the cache explicitly: modal volume "
+                f"rm -r {VOLUME_NAME} {str(out)[len(VOL) + 1:]}")
+        # the sync may mutate the inputs: no stage.json (workers / finalize
+        # refuse) until the new state is validated below
+        (src / STAGE_JSON).unlink(missing_ok=True)
+        commit_volume(vol, say)
         src.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
         args = ["--config", conf, "sync", job["src_remote"], str(src)]
