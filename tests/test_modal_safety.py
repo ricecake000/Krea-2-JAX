@@ -2,6 +2,8 @@
 plain modules (no Modal SDK, no network)."""
 
 import hashlib
+import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -142,6 +144,38 @@ def test_finalize_refuses_before_publishing(tmp_path, role, private, auth_ok, er
     assert not r["ok"] and err in r["error"] and api.calls[-1] == last and not ran
     assert "upload_large_folder" not in api.calls and ("create_repo" in api.calls) == (last == "repo_info")
 
+
+
+@pytest.mark.parametrize("name,src,dest,mode", [
+    ("", "selection_v3/package", "", "build"), ("", "", "latents_v3", "finalize"), ("v3", "", "latents_v3", "build"),
+    ("v3", "selection_v3/package", "", "build"), ("v3", "a/../b", "latents_v3", "build"), ("../x", "p", "y", "stage")])
+def test_named_cache_never_uses_v2_dirs_or_repo(name, src, dest, mode):
+    with pytest.raises(SystemExit):
+        mcl.resolve_job(name, src, dest, mode)
+    job = mcl.resolve_job("v3", "selection_v3/package", "latents_v3/", "build")
+    assert (job["out"], job["src"], job["src_remote"], job["dest"]) == (
+        "/vol/krea2-v3", "/vol/src/v3", "gdrive:danbooru_pipeline/selection_v3/package", "latents_v3")
+    assert mcl.worker_cmd(0, 2, 4, 8, out=job["out"], tar_dir=job["src"])[-2:] == ["--tar-dir", "/vol/src/v3"]
+
+
+@pytest.mark.parametrize("remote", [{}, {mcl.MANIFEST: 30, "latents/s.safetensors": 3}])
+def test_finalize_r2_never_touches_hf_and_refuses_finished_prefix(tmp_path, monkeypatch, remote):
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)   # any HF use fails the finalize
+    monkeypatch.setattr(mcl, "VOL_OUT", str(tmp_path / "krea2"))
+    out, calls = tmp_path / "krea2-v3", []
+    (out / "latents").mkdir(parents=True)
+    (out / "metadata.parquet").write_bytes(b"pq")
+    (out / "latents/s.safetensors").write_bytes(b"abc")
+    (out / mcl.MANIFEST).write_text(json.dumps({"shards": ["s.safetensors"]}))
+    run = lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0, stderr=b"", stdout=json.dumps(
+        [{"Path": p, "Size": n} for p, n in remote.items()]).encode() if "lsjson" in cmd else b"another build")
+    r = mcl.finalize_r2_impl(SimpleNamespace(reload=lambda: None, commit=lambda: None), "v3", "latents_v3/",
+                             runner=run, python="py", env={k: "x" for k in mcl.R2_ENV})
+    up = [c for c in calls if c[1] in ("copy", "copyto")]
+    fresh = not remote
+    assert r["ok"] is fresh and bool(up) is fresh and ("--write-manifest" in sum(calls, [])) is fresh
+    assert not fresh or (up[0][-len(mcl.RCLONE_COMMON) - len(mcl.R2_UPLOAD_FLAGS):][0] == "--checksum"
+                      and up[-1][1:4] == ["copyto", str(out / mcl.MANIFEST), f"r2:x/latents_v3/{mcl.MANIFEST}"])
 
 TE = {"repo": mef.TEXT_REPO, "revision": "te-rev-1"}
 HF_ID = {"repo": mef.BASE_REPO, "revision": "c0ffee", "file": mef.BASE_FILE, "size": 25_000}

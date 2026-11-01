@@ -1,6 +1,8 @@
 """Modal app: benchmark Modal GPU types for the VAE latent cache, then build
 the `krea2-latents-v1` cache (scripts/cache_latents.py) on the chosen type and
-upload it to a private HF dataset repo the training node can `hf download`.
+upload it to a private HF dataset repo the training node can `hf download`
+(v2), or, for a named cache (v3 on), build it from an image package on Google
+Drive and upload it to Cloudflare R2 (the node kit's DATA_SOURCE=r2).
 
     modal run scripts/modal_cache_latents.py --bench                  # all GPU types x impls
     modal run scripts/modal_cache_latents.py --bench --gpus B200 --impls ref,2d,2d-compile
@@ -56,18 +58,71 @@ done shards). Never start a second --build while one is still running (two
 workers would write the same shards). Output:
 /home/mj/krea2-ops/mi350x/results/modal/cache_build_<ts>.md.
 
+Mode 3, named caches (--cache-name NAME: Drive in, R2 out; v3 on). The HF
+image repo above is v2's and the HF private quota is full, so a new dataset
+is never built into /vol/krea2 nor uploaded to the HF latents repo:
+    --src-drive P   image package on Drive (metadata.parquet + data/train-
+                    XXXX.tar, the v2 HF image repo's layout): a path under
+                    gdrive:danbooru_pipeline (remote `gdrive` of the Modal
+                    secret `rclone-gdrive`, RCLONE_CONF_B64; recreate it as in
+                    danbooru-aesthetic-pred/modal_embed.py) or remote:path
+    --dest-r2 X     bucket-relative prefix in the `krea2-r2` bucket
+                    (krea2-fullft), e.g. latents_v3/
+--build: `stage` (CPU, secret rclone-gdrive only) rclone-copies the package
+into /vol/src/NAME (--checksum: resumable, unchanged files skipped), commits,
+and checks every tar the parquet names is there; a failure stops before any
+GPU starts. Then the cost estimate (build_estimate at the measured v2 rate,
+the staged row count), prep (VAE only; no HF write check), the workers
+(cache_latents.py --tar-dir /vol/src/NAME --out /vol/krea2-NAME), and
+`finalize_r2` (CPU, secret krea2-r2 only, never HF): --write-manifest
+against the staged parquet, then rclone copy --checksum of metadata.parquet +
+the manifest's shards to r2:krea2-fullft/X/ and latents/manifest.json LAST
+(a manifest on R2 = a complete cache; rclone's own transfer check is the
+upload check). A prefix that already has a manifest is refused unless it is
+this very upload (same manifest bytes, every object ours with the same
+size), so a finished cache is never replaced; a prefix without one is
+resumed. --finalize-only --cache-name NAME --dest-r2 X redoes finalize_r2;
+--stage-only --cache-name NAME --src-drive P only stages (CPU, cents).
+--src-drive / --dest-r2 without --cache-name, and --reset-upload-cache with
+it, are refused.
+
+v3 recipe (package gdrive:danbooru_pipeline/selection_v3/package, 196,099
+images / 200 tars; no bench needed again: the v2 build's B200 setup):
+    modal run scripts/modal_cache_latents.py --stage-only --cache-name v3 \
+        --src-drive selection_v3/package           # optional: CPU only, early
+    modal run --detach scripts/modal_cache_latents.py --build --cache-name v3 \
+        --src-drive selection_v3/package --dest-r2 latents_v3/ --gpu B200 \
+        --containers 2 --batch 4 --cpu 8 --worker-timeout-h 4 \
+        --vae-impl 2d-compile
+    modal run scripts/modal_cache_latents.py --finalize-only --cache-name v3 \
+        --dest-r2 latents_v3/                      # after a laptop disconnect
+Estimate (build_estimate, prices of PRICES_DATE, v2 rate 41.0 img/s per
+B200 container): 2 x B200 = $9.84 for the GPU containers (1.33 GPU-h + 2 x 3
+min startup at $6.88/h), ~43 min wall; plus the CPU stage + finalize_r2
+containers (cents to well under $1) and R2 storage (~100 GB, ~$1.5/month).
+--worker-timeout-h 4 is ~2x v2's 2 h for ~2x the images (the cost model
+itself says 2). The training node downloads the cache with DATA_SOURCE=r2
+DATA_R2_PREFIX=latents_v3 (krea2-ops/node).
+
 Volume `krea2-latents` (Volumes v2, created on first use):
     /vol/hf       HF_HOME (VAE weights downloaded once)
     /vol/bench    metadata.parquet, data/train-0000.tar (bench input)
     /vol/krea2    latents/train-XXXX.safetensors, then metadata.parquet +
-                  latents/manifest.json (the cache; uploaded as the repo root)
-Modal secret `huggingface`: the HF token under HF_TOKEN,
-HUGGING_FACE_HUB_TOKEN or HUGGINGFACE_TOKEN (exported as HF_TOKEN).
+                  latents/manifest.json (the v2 cache; uploaded as the repo
+                  root)
+    /vol/src/NAME       staged image package of a named cache
+    /vol/krea2-NAME     a named cache (same layout as /vol/krea2)
+Modal secrets: `huggingface` (the HF token under HF_TOKEN,
+HUGGING_FACE_HUB_TOKEN or HUGGINGFACE_TOKEN, exported as HF_TOKEN; bench,
+prep, workers, v2 finalize), `rclone-gdrive` (stage), `krea2-r2`
+(finalize_r2: R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID,
+R2_SECRET_ACCESS_KEY, passed to rclone only through its env). The image
+carries rclone RCLONE_VER (zip sha256 pinned, as the node kit).
 
 Importable without the Modal SDK (the app is only defined when `modal`
 imports); pricing, cost model, selection, report rendering, worker command,
-streaming/commit loop and upload checks are plain functions
-(tests/test_scripts_smoke.py::modal_cache_latents_flow).
+streaming/commit loop, upload checks, staging and R2 finalize are plain
+functions (tests/test_modal_safety.py).
 """
 
 import fnmatch
@@ -79,6 +134,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from collections import deque
@@ -196,6 +252,50 @@ WRITE_HELP = (
     f"{OUT_REPO} ({{reason}}). Put a WRITE token for user {OUT_OWNER} in it: "
     "`modal secret create huggingface HF_TOKEN=hf_... --force`, then re-run "
     "with --finalize-only (finished shards are kept on the volume).")
+# --- named caches (--cache-name NAME, v3 on): Drive image package in, R2 out.
+# Each name has its own dirs, so the v2 cache (/vol/krea2, HF) is never read
+# or written by a named build.
+VOL_SRC = f"{VOL}/src"    # staged image packages: /vol/src/<name>
+SHARED_DIRS = (VOL_HF, VOL_BENCH, VOL_OUT, VOL_INDUCTOR)
+CACHE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+# remote `gdrive` = the rclone config in the Modal secret `rclone-gdrive`
+# (RCLONE_CONF_B64, the same secret danbooru-aesthetic-pred/modal_embed.py uses)
+DRIVE_ROOT = "gdrive:danbooru_pipeline"
+STAGE_INCLUDE = ["/metadata.parquet", "/data/train-*.tar"]
+R2_SEG = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+R2_PREFIX_RE = re.compile(rf"^{R2_SEG}(/{R2_SEG})*$")
+R2_ENV = ("R2_ACCOUNT_ID", "R2_BUCKET", "R2_ACCESS_KEY_ID",
+          "R2_SECRET_ACCESS_KEY")   # Modal secret `krea2-r2` (krea2_jax/r2.py)
+MANIFEST = "latents/manifest.json"
+# pinned rclone (the zip + sha256 the node kit's dl.sh pins)
+RCLONE_VER = "v1.75.1"
+RCLONE_ZIP_URL = (f"https://downloads.rclone.org/{RCLONE_VER}/rclone-"
+                  f"{RCLONE_VER}-linux-amd64.zip")
+RCLONE_ZIP_SHA256 = ("982b5aa772841168f8e380f139e9e787"
+                     "b2a105403e32b94da8676a0e1c0a13ab")
+RCLONE_BIN = "/usr/local/bin/rclone"
+RCLONE_CONF = "/tmp/rclone.conf"    # Drive config, 0600, deleted after use
+RCLONE_COMMON = ["--retries", "10", "--low-level-retries", "20",
+                 "--stats", "60s", "--stats-one-line", "-v"]
+R2_UPLOAD_FLAGS = ["--checksum", "--transfers", "16", "--checkers", "16",
+                   "--s3-chunk-size", "64M", "--s3-upload-concurrency", "4"]
+STAGE_TIMEOUT_H = 4
+FINALIZE_R2_TIMEOUT_H = 8   # ~2x v2: hash ~100 GB + upload ~100 GB
+# measured v2 build (2026-10-13, cache_build_b200_r2.log): 2 x B200,
+# 2d-compile, batch 4, --cpu 8: 96,848 images in 17.8 + 21.6 container-min
+# (after VAE load / compile) -> img/s per container
+V2_BUILD = {"gpu": "B200", "impl": "2d-compile", "batch": 4, "cores": 8,
+            "img_s": 96_848 / ((17.8 + 21.6) * 60)}
+RCLONE_INSTALL = (
+    "python -c \"import sys, urllib.request as u; open('/tmp/rclone.zip', "
+    "'wb').write(u.urlopen(u.Request(sys.argv[1], headers={'User-Agent': "
+    "'krea2-modal/1.0'})).read())\" " + RCLONE_ZIP_URL
+    + f" && echo '{RCLONE_ZIP_SHA256}  /tmp/rclone.zip' | sha256sum -c -"
+    " && python -m zipfile -e /tmp/rclone.zip /tmp/rclone_x"
+    f" && install -m 755 /tmp/rclone_x/rclone-{RCLONE_VER}-linux-amd64/rclone"
+    f" {RCLONE_BIN} && rm -rf /tmp/rclone.zip /tmp/rclone_x"
+    f" && {RCLONE_BIN} version")
+
 # cache_latents.py's per-shard progress line, e.g.
 # "[w0/4] 3/25 train-0008: 968 imgs in 101.2s (9.57 img/s), ..."
 SHARD_LINE_RE = re.compile(r"^\[w\d+/\d+\] \d+/\d+ \S+: \d+ imgs in ")
@@ -528,12 +628,15 @@ def token_can_write(whoami, owner=OUT_OWNER):
 
 # ------------------------------------------------------------- build helpers
 def worker_cmd(i, n, batch, decode_threads, python="python", out=VOL_OUT,
-               dl_root=REMOTE_DL, vae_impl="ref"):
-    """cache_latents.py command of build worker i of n (run from the repo)."""
+               dl_root=REMOTE_DL, vae_impl="ref", tar_dir=None):
+    """cache_latents.py command of build worker i of n (run from the repo).
+    tar_dir: a staged package (metadata.parquet + data/*.tar) instead of
+    the HF dataset repo."""
     return [python, "scripts/cache_latents.py", "--out", out,
             "--num-workers", str(n), "--worker-index", str(i),
             "--batch", str(batch), "--decode-threads", str(decode_threads),
-            "--download-dir", f"{dl_root}/w{i}", "--vae-impl", vae_impl]
+            "--download-dir", f"{dl_root}/w{i}", "--vae-impl", vae_impl,
+            ] + (["--tar-dir", str(tar_dir)] if tar_dir else [])
 
 
 def worker_env(base):
@@ -546,9 +649,13 @@ def worker_env(base):
             "MKL_NUM_THREADS": "1"}
 
 
-def finalize_cmd(python="python", out=VOL_OUT, dl_root=REMOTE_DL):
-    return [python, "scripts/cache_latents.py", "--out", out,
-            "--write-manifest", "--download-dir", f"{dl_root}/manifest"]
+def finalize_cmd(python="python", out=VOL_OUT, dl_root=REMOTE_DL,
+                 tar_dir=None):
+    """--write-manifest; tar_dir: verify against that package's parquet (a
+    named cache), else the HF dataset repo's."""
+    return [python, "scripts/cache_latents.py", "--out", str(out),
+            "--write-manifest", "--download-dir", f"{dl_root}/manifest",
+            ] + (["--tar-dir", str(tar_dir)] if tar_dir else [])
 
 
 def is_shard_line(line):
@@ -1081,15 +1188,19 @@ def gpu_name_smi():
         return f"n/a ({e})"
 
 
-def build_worker_impl(i, n, batch, decode_threads, vol, vae_impl="ref"):
+def build_worker_impl(i, n, batch, decode_threads, vol, vae_impl="ref",
+                      cache_name=""):
     """One cache_latents.py worker; the volume is committed after every
     finished shard (explicitly, on top of Modal's background commits, so a
-    killed container loses at most its in-flight shard) and at the end."""
+    killed container loses at most its in-flight shard) and at the end.
+    cache_name: a named cache (/vol/krea2-NAME from the staged /vol/src/NAME)
+    instead of the v2 one."""
     setup_hf_token()
     env = worker_env(os.environ)
     res = {"worker": i, "device_name": gpu_name_smi()}
+    job = resolve_job(cache_name, mode="worker")
     cmd = worker_cmd(i, n, batch, decode_threads, python=sys.executable,
-                     vae_impl=vae_impl)
+                     out=job["out"], vae_impl=vae_impl, tar_dir=job["src"])
     print(f"w{i}/{n} on {res['device_name']}: $ {' '.join(cmd)}", flush=True)
     t0 = time.time()
     try:
@@ -1239,6 +1350,374 @@ def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
     return to_plain(res)
 
 
+# ------------------------------------------- named caches: Drive in, R2 out
+def resolve_job(cache_name="", src_drive="", dest_r2="", mode="build"):
+    """CLI flags -> {name, out, src, src_remote, dest} (validated; SystemExit
+    on misuse). mode: bench | build | finalize | stage | worker (paths only).
+
+    name "" = the v2 cache: /vol/krea2 from the HF image repo, uploaded to the
+    HF latents repo; --src-drive / --dest-r2 are refused there (they would
+    mix another dataset into v2's dir or repo). NAME = /vol/krea2-NAME, input
+    staged into /vol/src/NAME: needs --dest-r2 (the HF target repo is v2's)
+    for build / finalize, and --src-drive for build / stage."""
+    name = (cache_name or "").strip()
+    src_drive, dest_r2 = (src_drive or "").strip(), (dest_r2 or "").strip()
+    if mode == "bench":
+        if name or src_drive or dest_r2:
+            raise SystemExit("--bench takes no --cache-name / --src-drive / "
+                             "--dest-r2")
+        return {"name": "", "out": VOL_OUT, "src": None, "src_remote": None,
+                "dest": None}
+    if not name:
+        if src_drive or dest_r2:
+            raise SystemExit(
+                "--src-drive / --dest-r2 need --cache-name NAME: the default "
+                f"cache {VOL_OUT} holds the v2 cache (HF in, HF out) and must "
+                "never be mixed with another dataset")
+        if mode == "stage":
+            raise SystemExit("--stage-only needs --cache-name and --src-drive")
+        return {"name": "", "out": VOL_OUT, "src": None, "src_remote": None,
+                "dest": None}
+    if not CACHE_NAME_RE.match(name):
+        raise SystemExit(f"--cache-name {name!r}: want {CACHE_NAME_RE.pattern}")
+    out, src = f"{VOL_OUT}-{name}", f"{VOL_SRC}/{name}"
+    for p in (out, src):
+        if any(p == d or p.startswith(d + "/") for d in SHARED_DIRS):
+            raise SystemExit(f"--cache-name {name!r} maps to {p}, inside a "
+                             "shared / v2 dir")
+    if mode in ("build", "stage") and not src_drive:
+        raise SystemExit(f"--cache-name {name} --{mode} needs --src-drive "
+                         "(the image package to stage into " + src + ")")
+    if mode in ("build", "finalize") and not dest_r2:
+        raise SystemExit(f"--cache-name {name} needs --dest-r2 PREFIX: the HF "
+                         f"upload target {OUT_REPO} is the v2 cache's")
+    return {"name": name, "out": out, "src": src,
+            "src_remote": resolve_drive_src(src_drive) if src_drive else None,
+            "dest": parse_r2_prefix(dest_r2) if dest_r2 else None}
+
+
+def resolve_drive_src(spec):
+    """'selection_v3/package' -> 'gdrive:danbooru_pipeline/selection_v3/
+    package'; a 'remote:path' is kept. No '..' / empty segments."""
+    s = str(spec).strip().rstrip("/")
+    if ":" not in s:
+        s = f"{DRIVE_ROOT}/{s.lstrip('/')}"
+    remote, _, path = s.partition(":")
+    segs = path.split("/")
+    if (not remote or not path or ".." in segs or "" in segs
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", remote)):
+        raise SystemExit(f"--src-drive {spec!r}: want a path under "
+                         f"{DRIVE_ROOT} or remote:path")
+    return s
+
+
+def parse_r2_prefix(p):
+    """'latents_v3/' -> 'latents_v3' (bucket-relative, no '..')."""
+    s = str(p).strip().strip("/")
+    if not R2_PREFIX_RE.match(s):
+        raise SystemExit(f"--dest-r2 {p!r}: want a bucket-relative prefix "
+                         "like latents_v3/")
+    return s
+
+
+def build_estimate(n_images, containers, gpu=V2_BUILD["gpu"],
+                   cores=V2_BUILD["cores"], img_s=V2_BUILD["img_s"],
+                   overhead_min=DEFAULT_OVERHEAD_MIN):
+    """cost_row's projection (hourly_usd, every container pays the startup
+    overhead) at a measured per-container rate (default: the v2 build) ->
+    {usd, wall_h, gpu_h, usd_h, worker_timeout_h}."""
+    hourly = hourly_usd(gpu, cores)
+    hours = n_images / img_s / 3600
+    over = overhead_min / 60
+    return {"usd": hourly * (hours + containers * over),
+            "wall_h": hours / containers + over, "gpu_h": hours,
+            "usd_h": hourly,
+            "worker_timeout_h": worker_timeout_h(
+                {"hours_1": hours, "overhead_h": over}, containers)}
+
+
+def render_estimate(n_images, gpu, cpu, containers, vae_impl, batch):
+    """One line: build_estimate at the measured v2 rate when the build
+    matches its config (gpu, impl, batch), else a note."""
+    v = V2_BUILD
+    if (gpu_key(gpu), vae_impl, batch) != (v["gpu"], v["impl"], v["batch"]):
+        return (f"estimate: no measured rate for {gpu}/{vae_impl}/batch "
+                f"{batch} (measured: {v['gpu']}/{v['impl']}/batch "
+                f"{v['batch']} at {v['img_s']:.1f} img/s per container)")
+    e = build_estimate(n_images, containers, gpu=gpu, cores=cpu)
+    return (f"estimate: {n_images} images on {containers} x {gpu} at "
+            f"{v['img_s']:.1f} img/s each (v2 build): ${e['usd']:.2f} GPU "
+            f"containers (${e['usd_h']:.2f}/h each, {e['gpu_h']:.2f} h + "
+            f"{containers} x {DEFAULT_OVERHEAD_MIN:g} min startup), wall "
+            f"{e['wall_h'] * 60:.0f} min; cost model's worker timeout "
+            f"{e['worker_timeout_h']} h")
+
+
+def run_rclone(args, env, runner=subprocess.run, rclone=RCLONE_BIN,
+               capture=False):
+    """rclone ARGS with env (credentials only there, never in argv / logs).
+    capture: stdout/stderr as bytes in the result, else streamed."""
+    print("$ rclone " + " ".join(map(str, args)), flush=True)
+    return runner([rclone, *map(str, args)], env=env, capture_output=capture)
+
+
+def _tail(b, n=600):
+    return (b or b"").decode("utf-8", "replace")[-n:].strip()
+
+
+def r2_rclone_env(env):
+    """-> (subprocess env with the env-only rclone remote `r2` (as the node
+    kit's dl.sh r2()), bucket). Other RCLONE_* / R2_* / HF token vars are
+    dropped."""
+    missing = [k for k in R2_ENV if not env.get(k)]
+    if missing:
+        raise RuntimeError(f"Modal secret krea2-r2 lacks {missing}")
+    base = {k: v for k, v in env.items()
+            if not k.startswith(("RCLONE_", "R2_")) and k not in TOKEN_ENV_NAMES}
+    return {**base, "RCLONE_CONFIG": "/dev/null",
+            "RCLONE_CONFIG_R2_TYPE": "s3",
+            "RCLONE_CONFIG_R2_PROVIDER": "Cloudflare",
+            "RCLONE_CONFIG_R2_ENDPOINT":
+                f"https://{env['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+            "RCLONE_CONFIG_R2_ACCESS_KEY_ID": env["R2_ACCESS_KEY_ID"],
+            "RCLONE_CONFIG_R2_SECRET_ACCESS_KEY": env["R2_SECRET_ACCESS_KEY"],
+            "RCLONE_CONFIG_R2_NO_CHECK_BUCKET": "true"}, env["R2_BUCKET"]
+
+
+def r2_list(url, env, runner=subprocess.run, rclone=RCLONE_BIN):
+    """{relpath: size} of every object under url ({} for an absent prefix)."""
+    p = run_rclone(["lsjson", "-R", "--files-only", "--fast-list", url], env,
+                   runner, rclone, capture=True)
+    if p.returncode != 0:
+        if "directory not found" in _tail(p.stderr, 4000).lower():
+            return {}
+        raise RuntimeError(f"rclone lsjson {url} rc={p.returncode}: "
+                           f"{_tail(p.stderr)}")
+    return {e["Path"]: int(e["Size"]) for e in json.loads(p.stdout or b"[]")}
+
+
+def upload_list(out_dir):
+    """{relpath: size} of the data files a named cache publishes:
+    metadata.parquet + every shard the manifest lists (the manifest itself
+    is uploaded last, separately)."""
+    out_dir = Path(out_dir)
+    manifest = json.loads((out_dir / MANIFEST).read_text())
+    files = {PARQUET: (out_dir / PARQUET).stat().st_size}
+    for s in manifest["shards"]:
+        files[f"latents/{s}"] = (out_dir / "latents" / s).stat().st_size
+    return files
+
+
+def r2_conflicts(remote, local, local_manifest, remote_manifest):
+    """Why uploading `local` ({relpath: size}, incl. MANIFEST) into a prefix
+    holding `remote` is unsafe -> problems ([] = go). A prefix without
+    latents/manifest.json is new or an unfinished upload (rclone copy
+    --checksum resumes it). One with a manifest is finished: only a re-run of
+    the same upload passes (manifest bytes equal, every remote object one of
+    ours with the same size), anything else would replace a published
+    cache."""
+    if MANIFEST not in remote:
+        return []
+    probs = []
+    if local_manifest is None or remote_manifest != local_manifest:
+        probs.append(f"{MANIFEST} on R2 differs from the local one (another "
+                     "build of this cache, or another dataset)")
+    for p, n in sorted(remote.items()):
+        if p not in local:
+            probs.append(f"remote object {p} is not part of this cache")
+        elif local[p] != n:
+            probs.append(f"size {p}: remote {n} != local {local[p]}")
+    return probs
+
+
+def check_staged(src_dir):
+    """Staged package -> {n_rows, n_tars, bytes, missing}: every tar the
+    parquet names must be a file under src_dir."""
+    import pyarrow.parquet as pq
+
+    src_dir = Path(src_dir)
+    t = pq.read_table(str(src_dir / PARQUET), columns=["id", "tar"])
+    tars = sorted(set(t.column("tar").to_pylist()))
+    missing = [x for x in tars if not (src_dir / x).is_file()]
+    return {"n_rows": t.num_rows, "n_tars": len(tars), "missing": missing,
+            "bytes": sum((src_dir / x).stat().st_size for x in tars
+                         if x not in missing)}
+
+
+def write_rclone_conf(env, path=RCLONE_CONF):
+    """RCLONE_CONF_B64 (secret `rclone-gdrive`) -> 0600 file (never printed)."""
+    import base64
+
+    b64 = env.get("RCLONE_CONF_B64")
+    if not b64:
+        raise RuntimeError("Modal secret rclone-gdrive lacks RCLONE_CONF_B64")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, base64.b64decode(b64))
+    finally:
+        os.close(fd)
+    return path
+
+
+def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
+               rclone=RCLONE_BIN, conf_path=RCLONE_CONF):
+    """Drive package -> /vol/src/<name> (`rclone copy --checksum`: resumable,
+    files already there with the same md5 are skipped), commit, then the
+    must-fail completeness check (check_staged). Never raises: -> {ok, error,
+    src, src_remote, n_rows, n_tars, bytes, missing, log}."""
+    env = os.environ if env is None else env
+    log = []
+
+    def say(msg):
+        print(msg, flush=True)
+        log.append(msg)
+
+    res = {"ok": False, "error": None, "log": log}
+    try:
+        job = resolve_job(cache_name, src_drive, "", "stage")
+        src = Path(job["src"])
+        res.update(src=str(src), src_remote=job["src_remote"])
+        try:
+            vol.reload()
+        except Exception as e:  # noqa: BLE001
+            say(f"WARNING: volume reload failed: {type(e).__name__}: {e}")
+        conf = write_rclone_conf(env, conf_path)
+        renv = {k: v for k, v in env.items() if not k.startswith("RCLONE_")}
+        src.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        args = ["--config", conf, "copy", job["src_remote"], str(src)]
+        for pat in STAGE_INCLUDE:
+            args += ["--include", pat]
+        rc = run_rclone(args + ["--checksum", "--transfers", "8",
+                                "--checkers", "16", *RCLONE_COMMON],
+                        renv, runner, rclone).returncode
+        say(f"rclone copy {job['src_remote']} -> {src}: rc {rc} in "
+            f"{(time.time() - t0) / 60:.1f} min")
+        commit_volume(vol, say)
+        if rc != 0:
+            raise RuntimeError(f"rclone copy exit {rc}")
+        st = check_staged(src)
+        res.update(st)
+        say(f"staged: {st['n_rows']} rows, {st['n_tars']} tars "
+            f"({st['bytes'] / 1e9:.1f} GB), {len(st['missing'])} missing")
+        if st["missing"]:
+            raise RuntimeError(f"{len(st['missing'])} tars named in the "
+                               f"parquet are not in the package, e.g. "
+                               f"{st['missing'][:5]}")
+        res["ok"] = True
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - reported, never raised
+        res["error"] = (str(e) if isinstance(e, (SystemExit, RuntimeError))
+                        else traceback.format_exc()[-4000:])
+        say("FATAL: " + res["error"])
+    finally:
+        Path(conf_path).unlink(missing_ok=True)
+    return to_plain(res)
+
+
+class R2ConflictError(Exception):
+    pass
+
+
+def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
+                     python=sys.executable, cwd=REMOTE_REPO, env=None,
+                     rclone=RCLONE_BIN):
+    """A named cache's finalize: --write-manifest against the staged
+    package's parquet, then metadata.parquet + the manifest's shards to
+    r2:<bucket>/<prefix>/ (rclone copy --checksum; rclone's own transfer
+    check is the only upload check) and latents/manifest.json last, so a
+    manifest on R2 means a complete cache. Refuses (before the copy) a prefix
+    whose existing manifest marks another cache (r2_conflicts); a cheap
+    pre-check refuses it already before hashing when there is no local
+    manifest. Never touches HF. Never raises: -> {ok, repo, error, problems,
+    n_files, bytes, log}."""
+    env = os.environ if env is None else env
+    log = []
+
+    def say(msg):
+        print(msg, flush=True)
+        log.append(msg)
+
+    res = {"ok": False, "repo": None, "error": None, "problems": [],
+           "log": log}
+    try:
+        job = resolve_job(cache_name, "", dest_r2, "finalize")
+        out = Path(job["out"])
+        mpath = out / MANIFEST
+        try:
+            vol.reload()
+        except Exception as e:  # noqa: BLE001
+            say(f"WARNING: volume reload failed: {type(e).__name__}: {e}")
+        renv, bucket = r2_rclone_env(env)
+        url = f"r2:{bucket}/{job['dest']}"
+        res["repo"] = url
+
+        def conflicts():
+            remote = r2_list(url, renv, runner, rclone)
+            rman = None
+            if MANIFEST in remote:
+                p = run_rclone(["cat", f"{url}/{MANIFEST}"], renv, runner,
+                               rclone, capture=True)
+                if p.returncode != 0:
+                    raise RuntimeError(f"rclone cat {MANIFEST} rc="
+                                       f"{p.returncode}: {_tail(p.stderr)}")
+                rman = p.stdout
+            if not mpath.exists():
+                return r2_conflicts(remote, {}, None, rman)
+            local = {**upload_list(out), MANIFEST: mpath.stat().st_size}
+            return r2_conflicts(remote, local, mpath.read_bytes(), rman)
+
+        # 1. cheap: refuse a finished foreign prefix before hashing ~100 GB
+        res["problems"] = conflicts()
+        if res["problems"]:
+            raise R2ConflictError(url)
+        # 2. verify all shards + digests against the staged parquet
+        cmd = finalize_cmd(python=python, out=out, tar_dir=job["src"])
+        say("$ " + " ".join(cmd))
+        rc = runner(cmd, cwd=cwd).returncode
+        if rc != 0:
+            raise RuntimeError(f"cache_latents.py --write-manifest exit {rc}")
+        if not commit_volume(vol, say):
+            say("continuing: the manifest is on the container's mount")
+        # 3. the final local state against the prefix
+        res["problems"] = conflicts()
+        if res["problems"]:
+            raise R2ConflictError(url)
+        files = upload_list(out)
+        fd, lst = tempfile.mkstemp(prefix="r2_upload_", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write("".join(f"{p}\n" for p in sorted(files)))
+        t0 = time.time()
+        rc = run_rclone(["copy", str(out), url, "--files-from-raw", lst,
+                         *R2_UPLOAD_FLAGS, *RCLONE_COMMON], renv, runner,
+                        rclone).returncode
+        if rc != 0:
+            raise RuntimeError(f"rclone copy -> {url} exit {rc} (re-run "
+                               "--finalize-only: done files are skipped)")
+        rc = run_rclone(["copyto", str(mpath), f"{url}/{MANIFEST}",
+                         "--checksum", *RCLONE_COMMON], renv, runner,
+                        rclone).returncode
+        if rc != 0:
+            raise RuntimeError(f"rclone copyto {MANIFEST} exit {rc}")
+        res["n_files"] = len(files) + 1
+        res["bytes"] = sum(files.values()) + mpath.stat().st_size
+        say(f"uploaded {res['n_files']} files, {res['bytes'] / 1e9:.2f} GB "
+            f"to {url} in {(time.time() - t0) / 60:.1f} min")
+        res["ok"] = True
+    except R2ConflictError as e:
+        res["error"] = (f"refusing to upload into {e}: it holds a finished "
+                        "cache that is not this one (see problems); pick "
+                        "another --dest-r2 or remove that prefix by hand")
+        say("FATAL: " + res["error"])
+        for p in res["problems"][:20]:
+            say("  " + p)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - reported, never raised
+        res["error"] = (str(e) if isinstance(e, (SystemExit, RuntimeError))
+                        else traceback.format_exc()[-4000:])
+        say("FATAL: " + res["error"])
+    return to_plain(res)
+
+
 # ------------------------------------------------------------------ Modal app
 if modal is not None:
     image = (
@@ -1248,6 +1727,8 @@ if modal is not None:
         .apt_install("build-essential")
         .pip_install(TORCH_PIN, extra_index_url=TORCH_INDEX)
         .pip_install(*PIP_PACKAGES)
+        # pinned rclone (Drive staging, R2 upload): zip sha256 checked
+        .run_commands(RCLONE_INSTALL)
         .env(CONTAINER_ENV)
         .add_local_dir(LOCAL_REPO / "krea2_jax", f"{REMOTE_REPO}/krea2_jax",
                        ignore=["**/__pycache__"])
@@ -1257,6 +1738,8 @@ if modal is not None:
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True,
                                  version=VOLUME_VERSION)
     hf_secret = modal.Secret.from_name("huggingface")
+    rclone_secret = modal.Secret.from_name("rclone-gdrive")
+    r2_secret = modal.Secret.from_name("krea2-r2")
     app = modal.App("krea2-cache-latents", image=image)
     mounts = {"volumes": {VOL: vol}, "secrets": [hf_secret]}
 
@@ -1278,12 +1761,25 @@ if modal is not None:
     @app.function(gpu="L4", cpu=8.0, memory=MEM_MB,
                   timeout=DEFAULT_WORKER_TIMEOUT_H * 3600, **mounts)
     def build_worker(i: int, n: int, batch: int, decode_threads: int,
-                     vae_impl: str = "ref") -> dict:
-        return build_worker_impl(i, n, batch, decode_threads, vol, vae_impl)
+                     vae_impl: str = "ref", cache_name: str = "") -> dict:
+        return build_worker_impl(i, n, batch, decode_threads, vol, vae_impl,
+                                 cache_name)
 
     @app.function(cpu=4.0, memory=16384, timeout=2 * 3600, **mounts)
     def finalize(reset_upload_cache: bool = False) -> dict:
         return finalize_impl(vol, reset_upload_cache=reset_upload_cache)
+
+    # named caches: only the secret each step needs (no HF token), no
+    # cpu/memory reservations (rclone + hashing; Modal bills max(req, use))
+    @app.function(timeout=STAGE_TIMEOUT_H * 3600, volumes={VOL: vol},
+                  secrets=[rclone_secret])
+    def stage(cache_name: str, src_drive: str) -> dict:
+        return stage_impl(vol, cache_name, src_drive)
+
+    @app.function(timeout=FINALIZE_R2_TIMEOUT_H * 3600, volumes={VOL: vol},
+                  secrets=[r2_secret])
+    def finalize_r2(cache_name: str, dest_r2: str) -> dict:
+        return finalize_r2_impl(vol, cache_name, dest_r2)
 
     def _print_prep(p):
         print(f"prep: HF user {p.get('whoami')!r} (token from "
@@ -1352,8 +1848,20 @@ if modal is not None:
                       else "; ".join(fin.get("problems") or [])[:500])
             raise SystemExit(f"finalize FAILED: {reason} (log: {path})")
 
+    def _stage_local(job):
+        """Drive -> /vol/src/NAME on a CPU container; must pass before any
+        GPU starts. -> stage result."""
+        print(f"staging {job['src_remote']} -> {job['src']} (CPU container)")
+        st = stage.remote(job["name"], job["src_remote"])
+        if not st.get("ok"):
+            raise SystemExit("staging FAILED (no GPU started): "
+                             + _err_line(st.get("error")))
+        print(f"staged {st['n_rows']} rows / {st['n_tars']} tars "
+              f"({st['bytes'] / 1e9:.1f} GB) in {st['src']}")
+        return st
+
     def build_local(gpu, containers, batch, cpu, decode_threads,
-                    worker_timeout_h, reset_upload_cache, vae_impl):
+                    worker_timeout_h, reset_upload_cache, vae_impl, job):
         gpu = gpu.strip().upper()
         if not gpu:
             raise SystemExit("--build needs --gpu (see the bench report)")
@@ -1365,20 +1873,30 @@ if modal is not None:
                              f"{MAX_WORKER_TIMEOUT_H}]")
         parse_impls(vae_impl)
         threads = decode_threads or cpu
+        named = bool(job["name"])
         params = {"gpu": gpu, "vae_impl": vae_impl, "containers": containers,
                   "batch": batch,
                   "cpu": cpu, "decode_threads": threads,
                   "worker_timeout_h": worker_timeout_h,
                   "reset_upload_cache": reset_upload_cache}
+        n_images = N_IMAGES
+        if named:
+            params.update(cache_name=job["name"], out=job["out"],
+                          src=job["src"], src_drive=job["src_remote"],
+                          dest_r2=job["dest"])
+            n_images = _stage_local(job)["n_rows"]
+        print(render_estimate(n_images, gpu, cpu, containers, vae_impl,
+                              batch))
         p = prep.remote(False)   # VAE once, before N workers would race on it
         _print_prep(p)
-        if p.get("can_write") is False:
+        if not named and p.get("can_write") is False:
             raise SystemExit("aborting before any GPU starts: "
                              + WRITE_HELP.format(reason=p["write_reason"]))
         fn = build_worker.with_options(
             gpu=gpu, cpu=float(cpu), memory=MEM_MB,
             timeout=int(worker_timeout_h * 3600))
-        calls = [fn.spawn(i, containers, batch, threads, vae_impl)
+        calls = [fn.spawn(i, containers, batch, threads, vae_impl,
+                          job["name"])
                  for i in range(containers)]
         print(f"spawned {containers} workers on {gpu}: {params}")
         workers = []
@@ -1391,8 +1909,10 @@ if modal is not None:
             print(summarize_workers([w])[1][0])
             workers.append(w)
         ok, _ = summarize_workers(workers)
-        fin = (finalize.remote(reset_upload_cache=reset_upload_cache)
-               if ok else None)
+        fin = None
+        if ok:
+            fin = (finalize_r2.remote(job["name"], job["dest"]) if named
+                   else finalize.remote(reset_upload_cache=reset_upload_cache))
         path = _write_build_log(params, p, workers, fin)
         if not ok:
             raise SystemExit(f"build FAILED: a worker failed, finalize not "
@@ -1405,24 +1925,42 @@ if modal is not None:
              n_decode: int = 128,
              overhead_min: float = DEFAULT_OVERHEAD_MIN,
              build: bool = False, finalize_only: bool = False,
+             stage_only: bool = False,
              gpu: str = "", containers: int = DEFAULT_CONTAINERS,
              batch: int = 8, cpu: int = 8, decode_threads: int = 0,
              worker_timeout_h: float = DEFAULT_WORKER_TIMEOUT_H,
              reset_upload_cache: bool = False,
-             impls: str = DEFAULT_IMPLS, vae_impl: str = "ref"):
+             impls: str = DEFAULT_IMPLS, vae_impl: str = "ref",
+             cache_name: str = "", src_drive: str = "", dest_r2: str = ""):
         modes = [m for m, on in (("--bench", bench), ("--build", build),
-                                 ("--finalize-only", finalize_only)) if on]
+                                 ("--finalize-only", finalize_only),
+                                 ("--stage-only", stage_only)) if on]
         if len(modes) != 1:
             raise SystemExit("choose exactly one of --bench, --build, "
-                             f"--finalize-only (got {modes or 'none'})")
-        if bench and reset_upload_cache:
+                             "--finalize-only, --stage-only (got "
+                             f"{modes or 'none'})")
+        if (bench or stage_only) and reset_upload_cache:
             raise SystemExit("--reset-upload-cache goes with --build or "
                              "--finalize-only")
+        mode = ("bench" if bench else "build" if build else
+                "stage" if stage_only else "finalize")
+        job = resolve_job(cache_name, src_drive, dest_r2, mode)
+        if job["name"] and reset_upload_cache:
+            raise SystemExit("--reset-upload-cache is for the HF upload of "
+                             "the v2 cache (a named cache goes to R2)")
         if bench:
             bench_local(gpus, n_decode, overhead_min, impls)
         elif build:
             build_local(gpu, containers, batch, cpu, decode_threads,
-                        worker_timeout_h, reset_upload_cache, vae_impl)
+                        worker_timeout_h, reset_upload_cache, vae_impl, job)
+        elif stage_only:
+            _stage_local(job)
+        elif job["name"]:
+            fin = finalize_r2.remote(job["name"], job["dest"])
+            path = _write_build_log(
+                {"finalize_only": True, "cache_name": job["name"],
+                 "dest_r2": job["dest"]}, {}, [], fin)
+            _check_finalize(fin, path)
         else:
             fin = finalize.remote(reset_upload_cache=reset_upload_cache)
             path = _write_build_log(
