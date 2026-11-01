@@ -2,6 +2,8 @@
 plain modules (no Modal SDK, no network)."""
 
 import hashlib
+import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -141,6 +143,81 @@ def test_finalize_refuses_before_publishing(tmp_path, role, private, auth_ok, er
                           runner=lambda *a, **kw: ran.append(a), python="py")
     assert not r["ok"] and err in r["error"] and api.calls[-1] == last and not ran
     assert "upload_large_folder" not in api.calls and ("create_repo" in api.calls) == (last == "repo_info")
+
+
+
+@pytest.mark.parametrize("name,src,dest,mode", [
+    ("", "selection_v3/package", "", "build"), ("", "", "latents_v3", "finalize"), ("v3", "", "latents_v3", "build"),
+    ("v3", "selection_v3/package", "", "build"), ("v3", "a/../b", "latents_v3", "build"), ("../x", "p", "y", "stage")])
+def test_named_cache_never_uses_v2_dirs_or_repo(name, src, dest, mode):
+    with pytest.raises(SystemExit):
+        mcl.resolve_job(name, src, dest, mode)
+    job = mcl.resolve_job("v3", "selection_v3/package", "latents_v3/", "build")
+    assert (job["out"], job["src"], job["src_remote"], job["dest"]) == (
+        "/vol/krea2-v3", "/vol/src/v3", "gdrive:danbooru_pipeline/selection_v3/package", "latents_v3")
+    assert mcl.worker_cmd(0, 2, 4, 8, out=job["out"], tar_dir=job["src"])[-2:] == ["--tar-dir", "/vol/src/v3"]
+
+
+def fake_rclone(calls, listing=(), cat=b"another build", probe_rc=0):
+    def run(cmd, **kw):
+        calls.append(cmd)
+        out = json.dumps([{"Path": p, "Size": n, "Hashes": {"md5": "m"}} for p, n in dict(listing).items()]).encode()
+        rc = probe_rc if mcl.PROBE_PREFIX in str(cmd) and "copyto" in cmd else 0
+        return SimpleNamespace(returncode=rc, stderr=b"", stdout=out if "lsjson" in cmd else cat)
+    return run
+
+
+MAN = json.dumps({"shards": ["s.safetensors"]})
+LOCAL = {"metadata.parquet": 2, "latents/s.safetensors": 3, mcl.MANIFEST: len(MAN)}
+
+
+@pytest.mark.parametrize("case,remote,cat,precheck,probe_rc,gen", [
+    ("fresh", {}, b"", False, 0, "g"), ("foreign", {mcl.MANIFEST: 30, "latents/s.safetensors": 3}, b"x", False, 0, "g"),
+    ("published", LOCAL, MAN.encode(), False, 0, "g"), ("read-only", {}, b"", True, 1, "g"), ("other input", {}, b"", False, 0, "h")])
+def test_finalize_r2_never_hf_publishes_once_and_prechecks(tmp_path, monkeypatch, case, remote, cat, precheck, probe_rc, gen):
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)   # any HF use fails the finalize
+    monkeypatch.setattr(mcl, "VOL_OUT", str(tmp_path / "krea2"))
+    monkeypatch.setattr(mcl, "VOL_SRC", str(tmp_path / "src"))
+    out, calls = tmp_path / "krea2-v3", []
+    (out / "latents").mkdir(parents=True), (tmp_path / "src/v3").mkdir(parents=True)
+    (out / "metadata.parquet").write_bytes(b"pq"), (out / "latents/s.safetensors").write_bytes(b"abc")
+    (out / mcl.MANIFEST).write_text(MAN), (out / mcl.GEN_JSON).write_text('{"generation": "g"}')
+    (tmp_path / "src/v3" / mcl.STAGE_JSON).write_text(json.dumps({"generation": gen}))
+    r = mcl.finalize_r2_impl(SimpleNamespace(reload=lambda: None, commit=lambda: None), "v3", "latents_v3/", python="py",
+                             runner=fake_rclone(calls, remote, cat, probe_rc), env={k: "x" for k in mcl.R2_ENV},
+                             precheck=precheck)
+    up, flat = [c for c in calls if c[1] in ("copy", "copyto") and mcl.PROBE_PREFIX not in str(c)], sum(calls, [])
+    assert r["ok"] is (case in ("fresh", "published")) and bool(up) is r["ok"] and ("--write-manifest" in flat) is r["ok"]
+    assert case != "other input" or (calls == [] and "input generation" in r["error"])
+    assert case != "fresh" or (up[0][-len(mcl.RCLONE_COMMON) - len(mcl.R2_UPLOAD_FLAGS):][0] == "--checksum"
+                               and up[-1][1:4] == ["copyto", str(out / mcl.MANIFEST), f"r2:x/latents_v3/{mcl.MANIFEST}"])
+    assert case != "published" or (len(up) == 1 and "--ignore-existing" in up[0])   # immutable: add only, never replace
+
+
+@pytest.mark.parametrize("case", ["ok", "cache from another input", "tar not in the package", "unmarked shards"])
+def test_stage_pins_input_generation_and_needs_every_tar_in_package(tmp_path, monkeypatch, case):
+    pa, pq = pytest.importorskip("pyarrow"), pytest.importorskip("pyarrow.parquet")
+    monkeypatch.setattr(mcl, "VOL_OUT", str(tmp_path / "krea2"))
+    monkeypatch.setattr(mcl, "VOL_SRC", str(tmp_path / "src"))
+    src, out, calls = tmp_path / "src/v3", tmp_path / "krea2-v3", []
+    (src / "data").mkdir(parents=True), (out / "latents").mkdir(parents=True)
+    tars = ["data/train-0000.tar"] + (["data/train-0001.tar"] if case == "tar not in the package" else [])
+    pq.write_table(pa.table({"id": list(range(len(tars))), "tar": tars}), src / "metadata.parquet")
+    for t in tars:   # on disk (a stale local tar too), but the package lists only train-0000
+        (src / t).write_bytes(b"t")
+    if case == "cache from another input":
+        (out / mcl.GEN_JSON).write_text('{"generation": "old"}')
+    (src / mcl.STAGE_JSON).write_text('{"generation": "A"}')   # an earlier staging: gone unless re-validated
+    if case == "unmarked shards":
+        (out / "latents/train-0000.safetensors").write_bytes(b"s")
+    r = mcl.stage_impl(SimpleNamespace(reload=lambda: None, commit=lambda: None), "v3", "selection_v3/package",
+                       runner=fake_rclone(calls, {"metadata.parquet": 9, "data/train-0000.tar": 1}),
+                       env={"RCLONE_CONF_B64": "eA=="}, conf_path=str(tmp_path / "c.conf"))
+    synced = [c for c in calls if "sync" in c]
+    assert r["ok"] is (case == "ok") and bool(synced) is (case in ("ok", "tar not in the package"))
+    assert r["ok"] or (src / mcl.STAGE_JSON).exists() is (not synced)   # a failed restage leaves no stale stage.json
+    assert not r["ok"] or json.loads((out / mcl.GEN_JSON).read_text())["generation"] == r["generation"] == json.loads(
+        (src / mcl.STAGE_JSON).read_text())["generation"]
 
 
 TE = {"repo": mef.TEXT_REPO, "revision": "te-rev-1"}
