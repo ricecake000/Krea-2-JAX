@@ -68,21 +68,30 @@ is never built into /vol/krea2 nor uploaded to the HF latents repo:
                     danbooru-aesthetic-pred/modal_embed.py) or remote:path
     --dest-r2 X     bucket-relative prefix in the `krea2-r2` bucket
                     (krea2-fullft), e.g. latents_v3/
---build: `stage` (CPU, secret rclone-gdrive only) rclone-copies the package
-into /vol/src/NAME (--checksum: resumable, unchanged files skipped), commits,
-and checks every tar the parquet names is there; then finalize_r2's R2
-pre-check (credentials + the prefix, see below); a failure of either stops
-before any GPU starts. Then the cost estimate (build_estimate at the measured v2 rate,
-the staged row count), prep (VAE only; no HF write check), the workers
+--build: `stage` (CPU, secret rclone-gdrive only) lists the package on
+Drive (path, size, Drive's own md5) = its input generation, refuses a cache
+dir already started from another generation (pick a new --cache-name or
+delete /vol/krea2-NAME explicitly), rclone-syncs it into /vol/src/NAME
+(--checksum: resumable; local tars the package no longer has are deleted),
+re-lists it (it must not have changed meanwhile), checks every tar the
+parquet names is in the listing and on disk, and records the generation in
+/vol/src/NAME/stage.json and (first use) /vol/krea2-NAME/
+.input_generation.json; workers and finalize_r2 refuse when the two differ.
+Then finalize_r2's pre-check (generation, the prefix, and a write probe
+object .write-probe-<random> written + deleted under it, so read-only
+credentials fail here); a failure of either stops before any GPU starts.
+Then the cost estimate (build_estimate at the measured v2 rate, the staged
+row count), prep (VAE only; no HF write check), the workers
 (cache_latents.py --tar-dir /vol/src/NAME --out /vol/krea2-NAME), and
 `finalize_r2` (CPU, secret krea2-r2 only, never HF): --write-manifest
 against the staged parquet, then rclone copy --checksum of metadata.parquet +
 the manifest's shards to r2:krea2-fullft/X/ and latents/manifest.json LAST
 (a manifest on R2 = a complete cache; rclone's own transfer check is the
-upload check). A prefix that already has a manifest is refused unless it is
-this very upload (same manifest bytes, every object ours with the same
-size), so a finished cache is never replaced; a prefix without one is
-resumed. --finalize-only --cache-name NAME --dest-r2 X redoes finalize_r2;
+upload check). A prefix with a manifest is published and immutable: one
+with another manifest (or foreign / different-size objects) is refused; the
+same manifest only gets its missing objects (--ignore-existing, nothing is
+replaced, metadata.parquet included). A prefix without one is resumed.
+--finalize-only --cache-name NAME --dest-r2 X redoes finalize_r2;
 --stage-only --cache-name NAME --src-drive P only stages (CPU, cents).
 --src-drive / --dest-r2 without --cache-name, and --reset-upload-cache with
 it, are refused.
@@ -111,8 +120,9 @@ Volume `krea2-latents` (Volumes v2, created on first use):
     /vol/krea2    latents/train-XXXX.safetensors, then metadata.parquet +
                   latents/manifest.json (the v2 cache; uploaded as the repo
                   root)
-    /vol/src/NAME       staged image package of a named cache
-    /vol/krea2-NAME     a named cache (same layout as /vol/krea2)
+    /vol/src/NAME       staged image package of a named cache + stage.json
+    /vol/krea2-NAME     a named cache (same layout as /vol/krea2) +
+                        .input_generation.json (never uploaded)
 Modal secrets: `huggingface` (the HF token under HF_TOKEN,
 HUGGING_FACE_HUB_TOKEN or HUGGINGFACE_TOKEN, exported as HF_TOKEN; bench,
 prep, workers, v2 finalize), `rclone-gdrive` (stage), `krea2-r2`
@@ -268,6 +278,9 @@ R2_PREFIX_RE = re.compile(rf"^{R2_SEG}(/{R2_SEG})*$")
 R2_ENV = ("R2_ACCOUNT_ID", "R2_BUCKET", "R2_ACCESS_KEY_ID",
           "R2_SECRET_ACCESS_KEY")   # Modal secret `krea2-r2` (krea2_jax/r2.py)
 MANIFEST = "latents/manifest.json"
+STAGE_JSON = "stage.json"   # /vol/src/NAME: the staged input generation
+GEN_JSON = ".input_generation.json"   # /vol/krea2-NAME: the input it is built from
+PROBE_PREFIX = ".write-probe-"   # R2 pre-check's write probe objects
 # pinned rclone (the zip + sha256 the node kit's dl.sh pins)
 RCLONE_VER = "v1.75.1"
 RCLONE_ZIP_URL = (f"https://downloads.rclone.org/{RCLONE_VER}/rclone-"
@@ -1200,6 +1213,12 @@ def build_worker_impl(i, n, batch, decode_threads, vol, vae_impl="ref",
     env = worker_env(os.environ)
     res = {"worker": i, "device_name": gpu_name_smi()}
     job = resolve_job(cache_name, mode="worker")
+    if job["name"]:
+        try:   # never add shards of another input to a started cache
+            staged_generation(job)
+        except SystemExit as e:
+            res.update(rc=None, error=str(e), seconds=0)
+            return to_plain(res)
     cmd = worker_cmd(i, n, batch, decode_threads, python=sys.executable,
                      out=job["out"], vae_impl=vae_impl, tar_dir=job["src"])
     print(f"w{i}/{n} on {res['device_name']}: $ {' '.join(cmd)}", flush=True)
@@ -1513,10 +1532,11 @@ def r2_conflicts(remote, local, local_manifest, remote_manifest):
     """Why uploading `local` ({relpath: size}, incl. MANIFEST) into a prefix
     holding `remote` is unsafe -> problems ([] = go). A prefix without
     latents/manifest.json is new or an unfinished upload (rclone copy
-    --checksum resumes it). One with a manifest is finished: only a re-run of
-    the same upload passes (manifest bytes equal, every remote object one of
-    ours with the same size), anything else would replace a published
-    cache."""
+    --checksum resumes it). One with a manifest is published and immutable:
+    only a re-run of the same upload passes (manifest bytes equal, every
+    remote object one of ours with the same size), and that re-run only adds
+    missing objects (finalize_r2_impl: --ignore-existing). Leftover write
+    probes (.write-probe-*) are ignored."""
     if MANIFEST not in remote:
         return []
     probs = []
@@ -1524,6 +1544,8 @@ def r2_conflicts(remote, local, local_manifest, remote_manifest):
         probs.append(f"{MANIFEST} on R2 differs from the local one (another "
                      "build of this cache, or another dataset)")
     for p, n in sorted(remote.items()):
+        if p.rsplit("/", 1)[-1].startswith(PROBE_PREFIX):
+            continue
         if p not in local:
             probs.append(f"remote object {p} is not part of this cache")
         elif local[p] != n:
@@ -1531,15 +1553,72 @@ def r2_conflicts(remote, local, local_manifest, remote_manifest):
     return probs
 
 
-def check_staged(src_dir):
+def input_generation(files):
+    """Identity of a package listing {path: {size, md5}} (Drive's own sizes
+    and md5s): sha256 of its canonical JSON."""
+    blob = json.dumps(sorted((p, f["size"], f["md5"]) for p, f in files.items()),
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return None
+
+
+def generation_refusal(out_dir, gen, have):
+    return (f"{out_dir} was built from input generation {have} but the "
+            f"package now is {gen}: its shards could mix two inputs. Pick a "
+            f"new --cache-name, or delete the cache explicitly: modal volume "
+            f"rm -r {VOLUME_NAME} {str(out_dir)[len(VOL) + 1:]}")
+
+
+def staged_generation(job):
+    """Input generation of a named cache: /vol/src/NAME/stage.json (written
+    by stage) must equal the one the cache dir was started with
+    (/vol/krea2-NAME/GEN_JSON) -> generation, else SystemExit."""
+    st = _read_json(Path(job["src"]) / STAGE_JSON)
+    mk = _read_json(Path(job["out"]) / GEN_JSON)
+    if not st or not mk:
+        raise SystemExit(f"{job['src']}/{STAGE_JSON} or {job['out']}/"
+                         f"{GEN_JSON} missing: stage the package first "
+                         "(--build or --stage-only)")
+    if st.get("generation") != mk.get("generation"):
+        raise SystemExit(generation_refusal(job["out"], st.get("generation"),
+                                            mk.get("generation")))
+    return st["generation"]
+
+
+def stage_listing(src_remote, conf, env, runner=subprocess.run,
+                  rclone=RCLONE_BIN):
+    """{path: {size, md5}} of the package files on Drive (STAGE_INCLUDE;
+    md5 = Drive's own hash, nothing is downloaded or hashed here)."""
+    args = ["--config", conf, "lsjson", "-R", "--files-only", "--hash",
+            "--hash-type", "md5"]
+    for pat in STAGE_INCLUDE:
+        args += ["--include", pat]
+    p = run_rclone(args + [src_remote], env, runner, rclone, capture=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"rclone lsjson {src_remote} rc={p.returncode}: "
+                           f"{_tail(p.stderr)}")
+    return {e["Path"]: {"size": int(e["Size"]),
+                        "md5": (e.get("Hashes") or {}).get("md5")}
+            for e in json.loads(p.stdout or b"[]")}
+
+
+def check_staged(src_dir, remote_files):
     """Staged package -> {n_rows, n_tars, bytes, missing}: every tar the
-    parquet names must be a file under src_dir."""
+    parquet names must be in the Drive listing `remote_files` and a file
+    under src_dir."""
     import pyarrow.parquet as pq
 
     src_dir = Path(src_dir)
     t = pq.read_table(str(src_dir / PARQUET), columns=["id", "tar"])
     tars = sorted(set(t.column("tar").to_pylist()))
-    missing = [x for x in tars if not (src_dir / x).is_file()]
+    missing = [x for x in tars
+               if x not in remote_files or not (src_dir / x).is_file()]
     return {"n_rows": t.num_rows, "n_tars": len(tars), "missing": missing,
             "bytes": sum((src_dir / x).stat().st_size for x in tars
                          if x not in missing)}
@@ -1561,12 +1640,28 @@ def write_rclone_conf(env, path=RCLONE_CONF):
     return path
 
 
+def _write_json(path, obj):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, path)
+
+
 def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
                rclone=RCLONE_BIN, conf_path=RCLONE_CONF):
-    """Drive package -> /vol/src/<name> (`rclone copy --checksum`: resumable,
-    files already there with the same md5 are skipped), commit, then the
-    must-fail completeness check (check_staged). Never raises: -> {ok, error,
-    src, src_remote, n_rows, n_tars, bytes, missing, log}."""
+    """Drive package -> /vol/src/<name>:
+      1. list it on Drive (path, size, Drive's md5) -> input generation; a
+         cache dir already started from another generation is refused here,
+         before anything changes;
+      2. `rclone sync --checksum` (resumable; local tars the package no
+         longer has are deleted; stage.json is outside the filter and kept);
+      3. list again: the package must not have changed meanwhile;
+      4. must-fail completeness check (check_staged: every tar the parquet
+         names is in the listing and on disk);
+      5. stage.json = {src_remote, generation, files}, and the cache dir's
+         GEN_JSON = the generation if it has none yet (it is then bound to
+         this input).
+    Never raises: -> {ok, error, src, src_remote, generation, n_rows, n_tars,
+    bytes, missing, log}."""
     env = os.environ if env is None else env
     log = []
 
@@ -1577,7 +1672,7 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
     res = {"ok": False, "error": None, "log": log}
     try:
         job = resolve_job(cache_name, src_drive, "", "stage")
-        src = Path(job["src"])
+        src, out = Path(job["src"]), Path(job["out"])
         res.update(src=str(src), src_remote=job["src_remote"])
         try:
             vol.reload()
@@ -1585,20 +1680,34 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
             say(f"WARNING: volume reload failed: {type(e).__name__}: {e}")
         conf = write_rclone_conf(env, conf_path)
         renv = {k: v for k, v in env.items() if not k.startswith("RCLONE_")}
+        files = stage_listing(job["src_remote"], conf, renv, runner, rclone)
+        if PARQUET not in files:
+            raise RuntimeError(f"no {PARQUET} in {job['src_remote']}")
+        gen = input_generation(files)
+        res["generation"] = gen
+        say(f"package {job['src_remote']}: {len(files)} files, input "
+            f"generation {gen[:16]}")
+        mk = _read_json(out / GEN_JSON)
+        if mk and mk.get("generation") != gen:
+            raise SystemExit(generation_refusal(out, gen, mk.get("generation")))
         src.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
-        args = ["--config", conf, "copy", job["src_remote"], str(src)]
+        args = ["--config", conf, "sync", job["src_remote"], str(src)]
         for pat in STAGE_INCLUDE:
             args += ["--include", pat]
         rc = run_rclone(args + ["--checksum", "--transfers", "8",
                                 "--checkers", "16", *RCLONE_COMMON],
                         renv, runner, rclone).returncode
-        say(f"rclone copy {job['src_remote']} -> {src}: rc {rc} in "
+        say(f"rclone sync {job['src_remote']} -> {src}: rc {rc} in "
             f"{(time.time() - t0) / 60:.1f} min")
         commit_volume(vol, say)
         if rc != 0:
-            raise RuntimeError(f"rclone copy exit {rc}")
-        st = check_staged(src)
+            raise RuntimeError(f"rclone sync exit {rc}")
+        if stage_listing(job["src_remote"], conf, renv, runner,
+                         rclone) != files:
+            raise RuntimeError(f"{job['src_remote']} changed while it was "
+                               "staged: re-run once it is final")
+        st = check_staged(src, files)
         res.update(st)
         say(f"staged: {st['n_rows']} rows, {st['n_tars']} tars "
             f"({st['bytes'] / 1e9:.1f} GB), {len(st['missing'])} missing")
@@ -1606,6 +1715,13 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
             raise RuntimeError(f"{len(st['missing'])} tars named in the "
                                f"parquet are not in the package, e.g. "
                                f"{st['missing'][:5]}")
+        _write_json(src / STAGE_JSON, {"src_remote": job["src_remote"],
+                                       "generation": gen, "files": files})
+        if mk is None:
+            out.mkdir(parents=True, exist_ok=True)
+            _write_json(out / GEN_JSON, {"src_remote": job["src_remote"],
+                                         "generation": gen})
+        commit_volume(vol, say)
         res["ok"] = True
     except (Exception, SystemExit) as e:  # noqa: BLE001 - reported, never raised
         res["error"] = (str(e) if isinstance(e, (SystemExit, RuntimeError))
@@ -1620,19 +1736,45 @@ class R2ConflictError(Exception):
     pass
 
 
+def r2_write_probe(url, env, runner=subprocess.run, rclone=RCLONE_BIN):
+    """Write + delete a tiny <url>/.write-probe-<random> object: the
+    credentials must be able to publish there. RuntimeError if not."""
+    import secrets
+
+    probe = f"{url}/{PROBE_PREFIX}{secrets.token_hex(8)}"
+    fd, tmp = tempfile.mkstemp(prefix="r2_probe_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"krea2 write probe\n")
+    try:
+        rc = run_rclone(["copyto", tmp, probe], env, runner, rclone).returncode
+        if rc != 0:
+            raise RuntimeError(f"R2 write probe failed (rclone copyto rc {rc}):"
+                               f" the krea2-r2 credentials cannot write {url} "
+                               "(read-only token?)")
+        rc = run_rclone(["deletefile", probe], env, runner, rclone).returncode
+        if rc != 0:
+            raise RuntimeError(f"R2 write probe {probe} written but not "
+                               f"deleted (rc {rc}): delete it by hand")
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
 def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
                      python=sys.executable, cwd=REMOTE_REPO, env=None,
                      rclone=RCLONE_BIN, precheck=False):
-    """A named cache's finalize: --write-manifest against the staged
-    package's parquet, then metadata.parquet + the manifest's shards to
-    r2:<bucket>/<prefix>/ (rclone copy --checksum; rclone's own transfer
-    check is the only upload check) and latents/manifest.json last, so a
-    manifest on R2 means a complete cache. Refuses (before the copy) a prefix
-    whose existing manifest marks another cache (r2_conflicts); a cheap
-    pre-check refuses it already before hashing when there is no local
-    manifest. precheck: only that pre-check (R2 credentials + the prefix),
-    run by --build before any GPU starts. Never touches HF. Never raises:
-    -> {ok, repo, error, problems, n_files, bytes, log}."""
+    """A named cache's finalize: input generation check (staged_generation),
+    --write-manifest against the staged package's parquet, then
+    metadata.parquet + the manifest's shards to r2:<bucket>/<prefix>/ (rclone
+    copy --checksum; rclone's own transfer check is the only upload check)
+    and latents/manifest.json last, so a manifest on R2 means a complete
+    cache. A prefix with a manifest is published and immutable: a foreign
+    one is refused before the copy (r2_conflicts; a cheap pre-check refuses
+    it already before hashing when there is no local manifest), the same one
+    only gets its missing objects (--ignore-existing: nothing, incl.
+    metadata.parquet, is ever replaced). precheck: only the generation
+    check, that pre-check and a write probe (r2_write_probe), run by --build
+    before any GPU starts. Never touches HF. Never raises: -> {ok, repo,
+    error, problems, n_files, bytes, log}."""
     env = os.environ if env is None else env
     log = []
 
@@ -1650,6 +1792,8 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
             vol.reload()
         except Exception as e:  # noqa: BLE001
             say(f"WARNING: volume reload failed: {type(e).__name__}: {e}")
+        gen = staged_generation(job)
+        say(f"input generation {gen[:16]} (stage.json == cache dir)")
         renv, bucket = r2_rclone_env(env)
         url = f"r2:{bucket}/{job['dest']}"
         res["repo"] = url
@@ -1665,16 +1809,19 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
                                        f"{p.returncode}: {_tail(p.stderr)}")
                 rman = p.stdout
             if not mpath.exists():
-                return r2_conflicts(remote, {}, None, rman)
+                return r2_conflicts(remote, {}, None, rman), remote
             local = {**upload_list(out), MANIFEST: mpath.stat().st_size}
-            return r2_conflicts(remote, local, mpath.read_bytes(), rman)
+            return (r2_conflicts(remote, local, mpath.read_bytes(), rman),
+                    remote)
 
         # 1. cheap: refuse a finished foreign prefix before hashing ~100 GB
-        res["problems"] = conflicts()
+        res["problems"], _ = conflicts()
         if res["problems"]:
             raise R2ConflictError(url)
         if precheck:
-            say(f"R2 pre-check ok: {url} is new, unfinished or this cache")
+            r2_write_probe(url, renv, runner, rclone)
+            say(f"R2 pre-check ok: {url} is new, unfinished or this cache; "
+                "write probe ok")
             res["ok"] = True
             return to_plain(res)
         # 2. verify all shards + digests against the staged parquet
@@ -1686,25 +1833,31 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
         if not commit_volume(vol, say):
             say("continuing: the manifest is on the container's mount")
         # 3. the final local state against the prefix
-        res["problems"] = conflicts()
+        res["problems"], remote = conflicts()
         if res["problems"]:
             raise R2ConflictError(url)
+        published = MANIFEST in remote
         files = upload_list(out)
         fd, lst = tempfile.mkstemp(prefix="r2_upload_", suffix=".txt")
         with os.fdopen(fd, "w") as f:
             f.write("".join(f"{p}\n" for p in sorted(files)))
         t0 = time.time()
         rc = run_rclone(["copy", str(out), url, "--files-from-raw", lst,
-                         *R2_UPLOAD_FLAGS, *RCLONE_COMMON], renv, runner,
-                        rclone).returncode
+                         *R2_UPLOAD_FLAGS,
+                         *(["--ignore-existing"] if published else []),
+                         *RCLONE_COMMON], renv, runner, rclone).returncode
         if rc != 0:
             raise RuntimeError(f"rclone copy -> {url} exit {rc} (re-run "
                                "--finalize-only: done files are skipped)")
-        rc = run_rclone(["copyto", str(mpath), f"{url}/{MANIFEST}",
-                         "--checksum", *RCLONE_COMMON], renv, runner,
-                        rclone).returncode
-        if rc != 0:
-            raise RuntimeError(f"rclone copyto {MANIFEST} exit {rc}")
+        if published:
+            say(f"{url} is published (same manifest): only missing objects "
+                "were added, nothing replaced")
+        else:
+            rc = run_rclone(["copyto", str(mpath), f"{url}/{MANIFEST}",
+                             "--checksum", *RCLONE_COMMON], renv, runner,
+                            rclone).returncode
+            if rc != 0:
+                raise RuntimeError(f"rclone copyto {MANIFEST} exit {rc}")
         res["n_files"] = len(files) + 1
         res["bytes"] = sum(files.values()) + mpath.stat().st_size
         say(f"uploaded {res['n_files']} files, {res['bytes'] / 1e9:.2f} GB "
