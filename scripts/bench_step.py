@@ -112,12 +112,15 @@ def parse_args(argv=None):
                     help="as train_full.py --layer-loop: 'unroll' keeps the "
                          "blocks as per-layer arrays (no per-layer slice/DUS "
                          "copies, longer compile)")
-    ap.add_argument("--fuse-proj", choices=["off", "concat", "prefused"],
+    ap.add_argument("--fuse-proj",
+                    choices=["off", "concat", "concat-attn", "prefused"],
                     default="off",
                     help="projection fusion: 'concat' concatenates each "
                          "attention's wq/wk/wv/gate (and each SwiGLU's "
                          "gate/up) weights inside the step and runs one GEMM "
-                         "(dit_forward fuse_proj='concat'); 'prefused' holds "
+                         "(dit_forward fuse_proj='concat'); 'concat-attn' "
+                         "does that for the attention projections only "
+                         "(SwiGLU gate/up stay two GEMMs); 'prefused' holds "
                          "the weights in the fused layout "
                          "(checkpoint.fuse_projection_params, applied to the "
                          "abstract tree before sharding/random init; "
@@ -286,7 +289,7 @@ def main(argv=None):
     remat = tf.REMAT_MODES[args.remat_policy]
     act = tf.act_sharding_for(hp, mesh)
     # prefused: the fused keys select the fused path; the flag stays "off"
-    model_fuse = "concat" if args.fuse_proj == "concat" else "off"
+    model_fuse = "off" if args.fuse_proj == "prefused" else args.fuse_proj
     fwd_kw = dict(lora=None, qchunk=args.qchunk, remat=remat,
                   attn_impl=args.attn, attn_mesh=mesh,
                   attn_block=args.attn_block, act_sharding=act,

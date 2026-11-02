@@ -104,7 +104,7 @@ def linear(x, p, lora=None, lora_scale=1.0, act_sharding=None):
     return _constrain(y, act_sharding)
 
 
-FUSE_PROJ_MODES = ("off", "concat")
+FUSE_PROJ_MODES = ("off", "concat", "concat-attn")
 
 
 def _fused_linear(x, p, fused_key, keys, sizes, lora, act_sharding):
@@ -113,9 +113,9 @@ def _fused_linear(x, p, fused_key, keys, sizes, lora, act_sharding):
 
     p[fused_key] (a prefused tree, `checkpoint.fuse_projection_params`) is
     used as is; otherwise the weights p[k] are concatenated along the out
-    axis (-2) inside the traced function (fuse_proj="concat"), biases along
-    -1 when every k has one. Refuses LoRA on any of `keys` (the fused GEMM
-    has no per-target delta).
+    axis (-2) inside the traced function (fuse_proj="concat"/"concat-attn"),
+    biases along -1 when every k has one. Refuses LoRA on any of `keys` (the
+    fused GEMM has no per-target delta).
     """
     bad = [k for k in keys if _lget(lora, k) is not None]
     if bad:
@@ -127,7 +127,7 @@ def _fused_linear(x, p, fused_key, keys, sizes, lora, act_sharding):
     else:
         nb = sum("bias" in p[k] for k in keys)
         if nb not in (0, len(keys)):
-            raise ValueError(f"fuse_proj='concat': bias on only {nb} of "
+            raise ValueError(f"fuse_proj concat: bias on only {nb} of "
                              f"{list(keys)}")
         fp = {"weight": jnp.concatenate([p[k]["weight"] for k in keys],
                                         axis=-2)}
@@ -596,13 +596,14 @@ def attention_forward(
 
     fuse_proj: see `_fused_linear`. A prefused tree (`p["wqkvg"]`, rows
     [wq; wk; wv; gate], from `checkpoint.fuse_projection_params`) always
-    takes the fused path; "concat" concatenates the four weights in the
-    traced function; "off" with unfused params runs four linears.
+    takes the fused path; "concat" and "concat-attn" concatenate the four
+    weights in the traced function; "off" with unfused params runs four
+    linears.
     """
     B, L, _ = x.shape
     sh = act_sharding
 
-    if "wqkvg" in p or fuse_proj == "concat":
+    if "wqkvg" in p or fuse_proj in ("concat", "concat-attn"):
         headdim = p["qknorm"]["qnorm"]["scale"].shape[-1]
         sizes = (heads * headdim, kvheads * headdim, kvheads * headdim,
                  x.shape[-1])
@@ -648,7 +649,8 @@ def attention_forward(
 def swiglu_forward(x, p, lora=None, lora_scale=1.0, act_sharding=None,
                    fuse_proj="off"):
     """down(silu(gate(x)) * up(x)); prefused `p["wgu"]` (rows [gate; up]) or
-    fuse_proj="concat" runs gate and up as one linear (`_fused_linear`)."""
+    fuse_proj="concat" runs gate and up as one linear (`_fused_linear`);
+    "concat-attn" and "off" keep two linears."""
     sh = act_sharding
     if "wgu" in p or fuse_proj == "concat":
         hidden = p["down"]["weight"].shape[-1]
@@ -799,7 +801,7 @@ def dit_forward(
     attn_kernel=None,    # aiter only: flash_attn_varlen-compatible callable
     txt_tokens=None,     # precomputed text_tokens_forward(...); skips context
     layer_loop="scan",   # "scan" (lax.scan over stacked blocks) or "unroll"
-    fuse_proj="off",     # "off" or "concat"; see below
+    fuse_proj="off",     # "off", "concat" or "concat-attn"; see below
 ):
     """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels).
 
@@ -840,7 +842,11 @@ def dit_forward(
     fewer and larger GEMMs). Attention/MLP dicts already holding the fused
     "wqkvg" / "wgu" weights (`checkpoint.fuse_projection_params`) take the
     fused path whatever this says. "off" with unfused params is the
-    original four + two linears. Fused paths refuse LoRA on the fused
+    original four + two linears. "concat-attn" concatenates only the
+    attention projections and keeps gate/up as two linears: wq/wk/wv/gate
+    are FSDP-sharded on the input axis, so their row concat needs no
+    collectives, while the gate/up concat (row-sharded) adds all-to-all +
+    collective-permute resharding. Fused paths refuse LoRA on the fused
     targets. Blocks and text-fusion blocks alike.
 
     attn_impl="aiter": tokens are reordered per sample (after the padding to

@@ -86,12 +86,15 @@ def parse_args(argv=None):
                     help="as train_full.py --layer-loop: 'unroll' keeps the "
                          "blocks as per-layer arrays (no per-layer slice/DUS "
                          "copies, longer compile)")
-    ap.add_argument("--fuse-proj", choices=["off", "concat", "prefused"],
+    ap.add_argument("--fuse-proj",
+                    choices=["off", "concat", "concat-attn", "prefused"],
                     default="off",
                     help="projection fusion: 'concat' concatenates each "
                          "attention's wq/wk/wv/gate (and each SwiGLU's "
                          "gate/up) weights inside the step and runs one GEMM "
-                         "(dit_forward fuse_proj='concat'); 'prefused' holds "
+                         "(dit_forward fuse_proj='concat'); 'concat-attn' "
+                         "does that for the attention projections only "
+                         "(SwiGLU gate/up stay two GEMMs); 'prefused' holds "
                          "the weights in the fused layout "
                          "(checkpoint.fuse_projection_params, applied to the "
                          "abstract tree before sharding/init); 'off' = "
@@ -374,7 +377,7 @@ def main(argv=None):
         cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
         args.img_tokens, mu_override=args.timestep_mu,
         # prefused: the fused keys select the fused path
-        fuse_proj="concat" if args.fuse_proj == "concat" else "off",
+        fuse_proj="off" if args.fuse_proj == "prefused" else args.fuse_proj,
     )
     t0 = time.time()
     lowered = train_step.lower(params, opt_state, ema, txt_params, b_img, b_hw,

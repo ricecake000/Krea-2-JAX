@@ -101,10 +101,11 @@ def test_unroll_list_blocks_matches_scan(tmp_path, mesh):
 
 
 @pytest.mark.parametrize("mode,loop", [
-    ("concat", "scan"), ("prefused", "scan"), ("prefused", "unroll")])
+    ("concat", "scan"), ("concat-attn", "scan"), ("prefused", "scan"),
+    ("prefused", "unroll")])
 def test_fused_projections_match_off(mode, loop):
-    """fuse_proj concat / prefused params == unfused: output, input grad, and param grads
-    (unfused grads fused with fuse_projection_params); fused paths refuse LoRA."""
+    """fuse_proj concat / concat-attn / prefused == unfused: output, input + param grads
+    (unfused grads fused); SwiGLU gate/up fused only by concat; fused paths refuse LoRA."""
     cfg, params, inp = setup(128)
     params = unstack_blocks(params) if loop == "unroll" else params
     def loss(p, img, fuse):
@@ -115,13 +116,17 @@ def test_fused_projections_match_off(mode, loop):
     f = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True), static_argnums=2)
     (_, out0), (g0, gi0) = f(params, inp[0], "off")
     fp = fuse_projection_params(params) if mode == "prefused" else params
-    (_, out), (g, gi) = f(fp, inp[0], "concat" if mode == "concat" else "off")
+    fuse = "off" if mode == "prefused" else mode
+    (_, out), (g, gi) = f(fp, inp[0], fuse)
     assert rel_err(out, out0) < 1e-5 and rel_err(gi, gi0) < 1e-5
-    assert tree_rel_err(fuse_projection_params(g) if mode == "concat" else g,
+    assert tree_rel_err(fuse_projection_params(g) if mode != "prefused" else g,
                         fuse_projection_params(g0)) < 1e-5
     names = str(jax.tree.structure(fp))
     assert ("'wqkvg'" in names and "'wgu'" in names and "'wk'" not in names) == (
         mode == "prefused")
+    m = jax.tree.map(lambda a: a[0], setup(128)[1]["blocks"]["mlp"])
+    jx = jax.make_jaxpr(lambda x: swiglu_forward(x, m, fuse_proj=fuse))(jnp.ones((2, 128)))
+    assert ("concatenate" in str(jx)) == (mode == "concat")
     with pytest.raises(ValueError, match="LoRA"):
         swiglu_forward(inp[0], setup(128)[1]["blocks"]["mlp"], lora={"up": {}},
                        fuse_proj="concat")
