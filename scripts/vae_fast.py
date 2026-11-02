@@ -191,15 +191,35 @@ class Encoder2d(nn.Module):
         self.conv_out = _conv2d_from_causal3d(enc.conv_out)
         self.quant_conv = _conv2d_from_causal3d(vae.quant_conv)
 
-    def forward(self, x):
-        x = self.conv_in(x)
+    def _head(self, x):
+        return self.quant_conv(self.conv_out(F.silu(self.norm_out(x))))
+
+    def stages(self):
+        """forward as named stages [(name, [callables])], applied in order:
+        conv_in, down0.. (a level's res blocks + its downsample), mid_res0,
+        mid_attn0, mid_res1, .., head (norm_out, silu, conv_out, quant_conv).
+        forward is exactly this loop; scripts/vae_profile.py times and
+        FLOP-counts each stage through the same list."""
+        out, level = [("conv_in", [self.conv_in])], []
         for layer in self.down:
-            x = layer(x)
-        x = self.mid_res0(x)
-        for layer in self.mid:
-            x = layer(x)
-        x = self.conv_out(F.silu(self.norm_out(x)))
-        return self.quant_conv(x)
+            level.append(layer)
+            if isinstance(layer, Downsample2d):
+                out.append((f"down{len(out) - 1}", level))
+                level = []
+        if level:
+            out.append((f"down{len(out) - 1}", level))
+        out.append(("mid_res0", [self.mid_res0]))
+        for i, layer in enumerate(self.mid):
+            out.append((f"mid_attn{i // 2}" if i % 2 == 0
+                        else f"mid_res{i // 2 + 1}", [layer]))
+        out.append(("head", [self._head]))
+        return out
+
+    def forward(self, x):
+        for _, fns in self.stages():
+            for f in fns:
+                x = f(x)
+        return x
 
 
 def posterior(moments):

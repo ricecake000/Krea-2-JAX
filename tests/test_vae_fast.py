@@ -37,3 +37,7 @@ def test_2d_posterior_matches_reference(h, w, b):
     assert m.shape == m_ref.shape == (b, 16, h // 8, w // 8)
     for a, r in ((m, m_ref), (s, s_ref)):
         assert ((a - r).abs().max() / r.abs().max()).item() < 1e-5
+    import vae_profile  # its stage-split forward (timing, FLOPs) == forward, bitwise
+    net = vae_fast.make_encoder(enc, "2d").net
+    with torch.no_grad():
+        assert torch.equal(vae_profile.run_stages(net, imgs), net(imgs))
