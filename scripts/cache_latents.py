@@ -16,10 +16,11 @@ shard metadata "vae_impl"
 (informational: shard_done ignores it, so shards of any impl stay valid).
 
 Output (<out>):
-    metadata.parquet                    verbatim copy (--write-manifest pass)
+    metadata.parquet                    verbatim copy (--write-manifest pass; bucket_w/h / F with --downscale F)
     latents/manifest.json               {"format", "vae", "n", "shards", "digests"} (--write-manifest pass)
     latents/train-XXXX.safetensors      one per source tar; "<id>" -> (16, bucket_h/8, bucket_w/8)
-                                        bf16; metadata {format, vae, source, count[, vae_impl]}
+                                        bf16; metadata {format, vae, source, count[, vae_impl]
+                                        [, downscale]}; with --downscale F: (16, bucket_h/8F, bucket_w/8F)
 
 Pipelined (main()): a prefetch thread fetches + reads the next tar, the
 decode pool decodes --decode-lookahead batches ahead (collated by a helper
@@ -31,6 +32,17 @@ per-shard progress line is printed only once that shard's save finished and
 reports where the main thread was blocked (tar / decode / gpu / save).
 Host memory: <= 2 tars of samples, lookahead + 1 collated batches, the shard
 being encoded + 1 pending save.
+
+Downscale (--downscale F, default 1): every sample is encoded at
+(bucket_w/F, bucket_h/F) by one PIL LANCZOS resize of its decoded bucket
+image (cache_dataset.load_image to the reduced size: exact, no crop); every
+bucket side must be a multiple of 16*F. The factor is recorded as shard and
+manifest metadata "downscale" (only when F != 1, so F = 1 output is
+unchanged); a shard of another factor is never "done", a run refuses an
+output dir holding another factor's shards or manifest, and --write-manifest
+(which needs the same --downscale) verifies the reduced shapes and writes
+metadata.parquet with bucket_w / bucket_h divided by F (the trainer's
+data.py derives the latent grid from them).
 
 Shard files are written atomically (tmp + os.replace); a shard whose output
 already opens with the right format/vae/source/count is skipped, so any run
@@ -157,8 +169,14 @@ def parse_shards(spec):
     return sorted(out)
 
 
-def shard_done(out_path, vae_id, source, expected_count):
-    """True when `out_path` is a complete shard for exactly this job."""
+def factor_str(meta):
+    """Downscale factor recorded in shard / manifest metadata ("1" if none)."""
+    return str(meta.get("downscale", "1"))
+
+
+def shard_done(out_path, vae_id, source, expected_count, downscale=1):
+    """True when `out_path` is a complete shard for exactly this job (a
+    shard of another downscale factor is not)."""
     try:
         with safe_open(str(out_path), framework="numpy") as f:
             meta = f.metadata() or {}
@@ -168,12 +186,15 @@ def shard_done(out_path, vae_id, source, expected_count):
     return (meta.get("format") == FORMAT and meta.get("vae") == vae_id
             and meta.get("source") == source
             and meta.get("count") == str(expected_count)
+            and factor_str(meta) == str(downscale)
             and n_keys == expected_count)
 
 
-def read_tar(tar_path):
+def read_tar(tar_path, downscale=1):
     """Sequentially read a dataset tar -> list of samples
-    {id, data (encoded image bytes), w, h} in tar order."""
+    {id, data (encoded image bytes), w, h (the full bucket)} in tar order.
+    Every bucket side must be a multiple of BUCKET_MULTIPLE * downscale."""
+    mult = BUCKET_MULTIPLE * downscale
     images, metas, order = {}, {}, []
     with tarfile.open(tar_path, "r|") as tf:
         for m in tf:
@@ -205,19 +226,23 @@ def read_tar(tar_path):
         sid, w, h = int(meta["id"]), int(meta["bucket_w"]), int(meta["bucket_h"])
         if str(sid) != stem:
             raise ValueError(f"{tar_path}: member {stem!r} has json id {sid}")
-        if w <= 0 or h <= 0 or w % BUCKET_MULTIPLE or h % BUCKET_MULTIPLE:
+        if w <= 0 or h <= 0 or w % mult or h % mult:
             raise ValueError(f"{tar_path}: id {sid} bucket {w}x{h} is not a "
-                             f"positive multiple of {BUCKET_MULTIPLE}")
+                             f"positive multiple of {mult}")
         samples.append({"id": sid, "data": images[stem], "w": w, "h": h})
     return samples
 
 
-def decode(sample):
-    """-> ((3, h, w) float32 in [-1, 1], resized?). An image whose size is not
-    its bucket is cover-resized + center-cropped (cache_dataset.load_image)."""
+def decode(sample, downscale=1):
+    """-> ((3, h/downscale, w/downscale) float32 in [-1, 1], resized?). An
+    image whose size is not its bucket is cover-resized + center-cropped
+    (cache_dataset.load_image). With downscale > 1 a bucket-sized image gets
+    exactly one LANCZOS resize to the reduced size (scale 1/downscale, the
+    crop is the identity) and is not counted as resized."""
     with Image.open(io.BytesIO(sample["data"])) as im:
         size = im.size  # header only
-    img = load_image(io.BytesIO(sample["data"]), sample["w"], sample["h"])
+    img = load_image(io.BytesIO(sample["data"]), sample["w"] // downscale,
+                     sample["h"] // downscale)
     return img[0], size != (sample["w"], sample["h"])
 
 
@@ -243,11 +268,11 @@ def _collate(futures, pin):
 
 
 def encode_samples(samples, encoder, batch, pool, lookahead=DECODE_LOOKAHEAD,
-                   log=print, tag="", timing=None):
+                   log=print, tag="", timing=None, downscale=1):
     """Encode samples grouped by bucket, `batch` at a time, decoding up to
     `lookahead` batches ahead on `pool` (collated into one tensor per batch
     by a helper thread). -> ({str(id): (16, h/8, w/8) bf16 CPU tensor},
-    number of resized images).
+    number of resized images); h, w = the bucket / downscale.
 
     On CUDA the main thread never waits for the GPU per batch: the batch is
     collated into pinned memory, copied H2D non_blocking, encoded, and its
@@ -295,7 +320,8 @@ def encode_samples(samples, encoder, batch, pool, lookahead=DECODE_LOOKAHEAD,
                             ) as collator:
         for j in range(len(chunks)):
             while nxt < len(chunks) and nxt <= j + lookahead:
-                futs = [pool.submit(decode, s) for s in chunks[nxt]]
+                futs = [pool.submit(decode, s, downscale)
+                        for s in chunks[nxt]]
                 pending.append(collator.submit(_collate, futs, cuda))
                 nxt += 1
             t = time.perf_counter()
@@ -310,7 +336,7 @@ def encode_samples(samples, encoder, batch, pool, lookahead=DECODE_LOOKAHEAD,
             if cuda:
                 imgs = imgs.to(device, non_blocking=True)
             lat = encoder(imgs)
-            w, h = chunk[0]["w"], chunk[0]["h"]
+            w, h = chunk[0]["w"] // downscale, chunk[0]["h"] // downscale
             want = (len(chunk), LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE)
             if tuple(lat.shape) != want:
                 raise ValueError(f"{tag}: encoder returned "
@@ -336,16 +362,17 @@ def encode_samples(samples, encoder, batch, pool, lookahead=DECODE_LOOKAHEAD,
     return out, resized
 
 
-def read_samples(tar_path, expected_count=None):
+def read_samples(tar_path, expected_count=None, downscale=1):
     """read_tar + the parquet's sample count for this tar (if given)."""
-    samples = read_tar(tar_path)
+    samples = read_tar(tar_path, downscale)
     if expected_count is not None and len(samples) != expected_count:
         raise ValueError(f"{tar_path}: {len(samples)} samples, metadata "
                          f"expects {expected_count}")
     return samples
 
 
-def write_shard(tensors, out_path, *, vae_id, source, vae_impl=None):
+def write_shard(tensors, out_path, *, vae_id, source, vae_impl=None,
+                downscale=1):
     """Atomic shard write (<out_path>.tmp, then os.replace) -> seconds."""
     t = time.perf_counter()
     out_path = Path(out_path)
@@ -355,6 +382,8 @@ def write_shard(tensors, out_path, *, vae_id, source, vae_impl=None):
             "count": str(len(tensors))}
     if vae_impl is not None:
         meta["vae_impl"] = vae_impl
+    if downscale != 1:
+        meta["downscale"] = str(downscale)
     save_file(tensors, str(tmp), metadata=meta)
     os.replace(tmp, out_path)
     return time.perf_counter() - t
@@ -362,7 +391,7 @@ def write_shard(tensors, out_path, *, vae_id, source, vae_impl=None):
 
 def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
                   expected_count=None, decode_threads=4, log=print, tag=None,
-                  vae_impl=None, lookahead=DECODE_LOOKAHEAD):
+                  vae_impl=None, lookahead=DECODE_LOOKAHEAD, downscale=1):
     """Encode one dataset tar into one `krea2-latents-v1` shard file
     (synchronously at the shard level: main() overlaps read / encode / save
     of consecutive shards with the same functions).
@@ -371,7 +400,7 @@ def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
     Skips the work when `out_path` is already complete for this job (with
     `expected_count` given this check needs no tar). Writes
     `<out_path>.tmp` then os.replace. `vae_impl` (if given) is stored as
-    extra metadata; it is not part of shard_done. Returns stats
+    extra metadata; it is not part of shard_done (downscale is). Returns stats
     {skipped, n, resized, seconds} (+ when encoded, the seconds blocked on
     TIMING_KEYS: tar_wait = read_tar, decode_wait / gpu_wait
     (encode_samples), save_wait = write_shard).
@@ -379,24 +408,26 @@ def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
     out_path = Path(out_path)
     tag = tag or out_path.stem
     if expected_count is not None and shard_done(out_path, vae_id, source,
-                                                 expected_count):
+                                                 expected_count, downscale):
         return {"skipped": True, "n": expected_count, "resized": 0,
                 "seconds": 0.0}
     t0 = time.time()
     t = time.perf_counter()
-    samples = read_samples(tar_path, expected_count)
+    samples = read_samples(tar_path, expected_count, downscale)
     timing = {"tar_wait": time.perf_counter() - t}
     if expected_count is None and shard_done(out_path, vae_id, source,
-                                             len(samples)):
+                                             len(samples), downscale):
         return {"skipped": True, "n": len(samples), "resized": 0,
                 "seconds": 0.0}
     with ThreadPoolExecutor(decode_threads,
                             thread_name_prefix="cache_latents_decode") as pool:
         tensors, resized = encode_samples(samples, encoder, batch, pool,
                                           lookahead=lookahead, log=log,
-                                          tag=tag, timing=timing)
+                                          tag=tag, timing=timing,
+                                          downscale=downscale)
     timing["save_wait"] = write_shard(tensors, out_path, vae_id=vae_id,
-                                      source=source, vae_impl=vae_impl)
+                                      source=source, vae_impl=vae_impl,
+                                      downscale=downscale)
     return {"skipped": False, "n": len(tensors), "resized": resized,
             "seconds": time.time() - t0, **timing}
 
@@ -447,17 +478,23 @@ def scan_shards(lat_dir, names):
     return out
 
 
-def verify_latents(cols, scan):
-    """Check a scan against the metadata columns. Every parquet id must have
-    exactly one latent, of shape (16, bucket_h/8, bucket_w/8), bf16, in the
-    shard named after its tar; shard metadata must be consistent. Raises
-    SystemExit listing every problem class with counts; returns (n, vae)."""
+def verify_latents(cols, scan, downscale=1):
+    """Check a scan against the metadata columns (the source buckets).
+    Every parquet id must have exactly one latent, of shape (16,
+    bucket_h/(8*downscale), bucket_w/(8*downscale)), bf16, in the shard named
+    after its tar; shard metadata must be consistent (incl. the downscale
+    factor). Raises SystemExit listing every problem class with counts;
+    returns (n, vae)."""
     problems = defaultdict(list)
     expect = {}
+    mult, f = BUCKET_MULTIPLE * downscale, downscale
     for sid, w, h, tar in zip(cols["id"], cols["bucket_w"], cols["bucket_h"],
                               cols["tar"]):
-        expect[sid] = ((LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE),
-                       shard_name(tar), tar)
+        if w % mult or h % mult:
+            problems[f"bucket not a multiple of {mult}"].append(
+                f"{sid}: {w}x{h}")
+        expect[sid] = ((LAT_CHANNELS, h // f // VAE_SCALE,
+                        w // f // VAE_SCALE), shard_name(tar), tar)
     sources = {shard_name(t): t for t in cols["tar"]}
     seen = {}
     vaes = set()
@@ -472,6 +509,9 @@ def verify_latents(cols, scan):
         if meta.get("source") != sources.get(name):
             problems["wrong source"].append(
                 f"{name}: {meta.get('source')!r} != {sources.get(name)!r}")
+        if factor_str(meta) != str(downscale):
+            problems["wrong downscale"].append(
+                f"{name}: {factor_str(meta)} != --downscale {downscale}")
         if meta.get("count") != str(len(keys)):
             problems["count mismatch"].append(
                 f"{name}: count {meta.get('count')!r}, {len(keys)} tensors")
@@ -572,10 +612,36 @@ def refuse_patched(mpath):
             "versions are built by scripts/modal_patch_latents.py build.")
 
 
-def write_manifest(out_dir, parquet_src, log=print, verify_digests=None):
+def write_scaled_parquet(src, dst, downscale):
+    """`src` with bucket_w / bucket_h divided by `downscale` (column types,
+    every other column and the schema metadata kept) -> `dst` (atomic)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(str(src))
+    for name in ("bucket_w", "bucket_h"):
+        col = t.column(name)
+        v = col.to_numpy()
+        if (v % downscale).any():
+            raise SystemExit(f"{src}: {name} not divisible by {downscale}")
+        t = t.set_column(t.column_names.index(name), t.field(name),
+                         pa.array(v // downscale, type=col.type))
+    if t.schema != pq.read_schema(str(src)):
+        raise SystemExit(f"{src}: scaled parquet schema changed")
+    tmp = Path(dst).with_name(Path(dst).name + ".tmp")
+    pq.write_table(t, str(tmp))
+    os.replace(tmp, dst)
+
+
+def write_manifest(out_dir, parquet_src, log=print, verify_digests=None,
+                   downscale=1):
     """Verify every shard against `parquet_src`, hash every shard file
     (sha256), then copy the parquet to out/metadata.parquet and write
-    out/latents/manifest.json (atomic) with the digests.
+    out/latents/manifest.json (atomic) with the digests. downscale != 1:
+    shapes are checked against the reduced buckets, metadata.parquet gets
+    bucket_w / bucket_h divided by it (refused when it is `parquet_src`
+    itself: the source would be scaled again on every pass) and the
+    manifest records "downscale".
 
     verify_digests: None (default) = verify when the existing manifest has
     digests; True = verify (an existing manifest without digests is only
@@ -586,11 +652,17 @@ def write_manifest(out_dir, parquet_src, log=print, verify_digests=None):
     lat_dir = out_dir / "latents"
     mpath = lat_dir / "manifest.json"
     refuse_patched(mpath)
+    dst = out_dir / "metadata.parquet"
+    if (downscale != 1 and dst.exists()
+            and os.path.samefile(parquet_src, dst)):
+        raise SystemExit(f"--downscale {downscale}: the source parquet "
+                         f"{parquet_src} is the output's {dst}; use an --out "
+                         "separate from --tar-dir")
     cols = read_metadata(parquet_src)
     names = sorted({shard_name(t) for t in cols["tar"]})
     t0 = time.time()
     scan = scan_shards(lat_dir, names)
-    n, vae = verify_latents(cols, scan)
+    n, vae = verify_latents(cols, scan, downscale)
     old_digests = None
     if mpath.exists():
         try:
@@ -618,19 +690,49 @@ def write_manifest(out_dir, parquet_src, log=print, verify_digests=None):
     if stray:
         log(f"WARNING: {len(stray)} shard files not referenced by the "
             f"parquet are left out of the manifest: {stray[:5]}")
-    dst = out_dir / "metadata.parquet"
-    if not (dst.exists() and os.path.samefile(parquet_src, dst)):
+    if downscale != 1:
+        write_scaled_parquet(parquet_src, dst, downscale)
+    elif not (dst.exists() and os.path.samefile(parquet_src, dst)):
         tmp = dst.with_name(dst.name + ".tmp")
         shutil.copyfile(parquet_src, tmp)
         os.replace(tmp, dst)
     manifest = {"format": FORMAT, "vae": vae, "n": n, "shards": names,
                 "digests": digests}
+    if downscale != 1:
+        manifest["downscale"] = downscale
     tmp = mpath.with_name(mpath.name + ".tmp")
     tmp.write_text(json.dumps(manifest, indent=2))
     os.replace(tmp, mpath)
-    log(f"verified {n} latents in {len(names)} shards (vae {vae}) in "
+    log(f"verified {n} latents in {len(names)} shards (vae {vae}"
+        + (f", downscale {downscale}" if downscale != 1 else "") + ") in "
         f"{time.time() - t0:.1f}s -> {mpath}")
     return manifest
+
+
+def refuse_mixed_factor(lat_dir, downscale):
+    """SystemExit if `lat_dir` holds a manifest or a readable shard of
+    another downscale factor: one cache dir never mixes factors (shard_done
+    alone would silently overwrite them shard by shard). Headers only."""
+    lat_dir = Path(lat_dir)
+    found = {}
+    man = lat_dir / "manifest.json"
+    if man.exists():
+        try:
+            found["manifest.json"] = factor_str(json.loads(man.read_text()))
+        except (OSError, ValueError, AttributeError):
+            pass
+    for path in sorted(lat_dir.glob("*.safetensors")):
+        try:
+            with safe_open(str(path), framework="numpy") as f:
+                found[path.name] = factor_str(f.metadata() or {})
+        except Exception:  # noqa: BLE001 - unreadable: rewritten anyway
+            continue
+    other = {k: v for k, v in found.items() if v != str(downscale)}
+    if other:
+        raise SystemExit(
+            f"{lat_dir} holds {len(other)} files of another downscale factor "
+            f"than --downscale {downscale}, e.g. {sorted(other.items())[:5]}: "
+            "one cache dir never mixes factors; use another --out")
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +816,12 @@ def build_parser():
                     help="with --write-manifest: re-hash and fail if a shard "
                          "differs from the digest in the existing manifest; "
                          "default: on when the existing manifest has digests")
+    ap.add_argument("--downscale", type=int, default=1,
+                    help="encode every sample at (bucket_w/F, bucket_h/F) "
+                         "(one LANCZOS resize; bucket sides must be multiples "
+                         "of 16*F); recorded as shard / manifest metadata; "
+                         "--write-manifest needs the same F and writes "
+                         "metadata.parquet with the reduced buckets")
     ap.add_argument("--vae-stub", action="store_true",
                     help=argparse.SUPPRESS)  # tests: StubEncoder, vae "stub"
     return ap
@@ -725,8 +833,9 @@ def main(argv=None):
     lat_dir = out_dir / "latents"
     if not 0 <= args.worker_index < args.num_workers:
         raise SystemExit("--worker-index must be in [0, --num-workers)")
-    if args.batch < 1 or args.decode_lookahead < 0:
-        raise SystemExit("--batch must be >= 1, --decode-lookahead >= 0")
+    if args.batch < 1 or args.decode_lookahead < 0 or args.downscale < 1:
+        raise SystemExit("--batch and --downscale must be >= 1, "
+                         "--decode-lookahead >= 0")
     remote = args.tar_dir is None
     tag = f"[w{args.worker_index}/{args.num_workers}]"
     if args.download_dir is not None:
@@ -743,7 +852,8 @@ def main(argv=None):
             raise SystemExit(f"{parquet} not found")
 
     if args.write_manifest:
-        write_manifest(out_dir, parquet, verify_digests=args.verify_digests)
+        write_manifest(out_dir, parquet, verify_digests=args.verify_digests,
+                       downscale=args.downscale)
         if remote and args.download_dir is None and not args.keep_tars:
             shutil.rmtree(dl_dir, ignore_errors=True)
         return
@@ -760,8 +870,10 @@ def main(argv=None):
         tars = [by_num[k] for k in want]
     mine = tars[args.worker_index::args.num_workers]
     vae_id = STUB_VAE_ID if args.vae_stub else args.vae
+    refuse_mixed_factor(lat_dir, args.downscale)
     todo = [t for t in mine
-            if not shard_done(lat_dir / shard_name(t), vae_id, t, counts[t])]
+            if not shard_done(lat_dir / shard_name(t), vae_id, t, counts[t],
+                              args.downscale)]
     n_todo = sum(counts[t] for t in todo)
     print(f"{tag} {len(mine)} shards assigned, {len(mine) - len(todo)} "
           f"already done, {len(todo)} to encode ({n_todo} images)",
@@ -795,7 +907,7 @@ def main(argv=None):
         path = (fetch_file(args.repo, t, dl_dir) if remote
                 else local_tar(args.tar_dir, t))
         t_fetch = time.time() - t0
-        samples = read_samples(path, counts[t])
+        samples = read_samples(path, counts[t], args.downscale)
         if remote and not args.keep_tars:
             path.unlink(missing_ok=True)
         return samples, t_fetch, time.time() - t0 - t_fetch
@@ -840,7 +952,8 @@ def main(argv=None):
                 tensors, resized = encode_samples(
                     samples, encoder, args.batch, pool,
                     lookahead=args.decode_lookahead,
-                    tag=f"{tag} {Path(t).stem}", timing=timing)
+                    tag=f"{tag} {Path(t).stem}", timing=timing,
+                    downscale=args.downscale)
                 del samples
                 t1 = time.perf_counter()
                 if saving is not None:
@@ -855,7 +968,8 @@ def main(argv=None):
                          "seconds": time.perf_counter() - t0}
                 saving = (saver.submit(write_shard, tensors,
                                        lat_dir / shard_name(t), vae_id=vae_id,
-                                       source=t, vae_impl=vae_impl),
+                                       source=t, vae_impl=vae_impl,
+                                       downscale=args.downscale),
                           k, t, stats)
                 del tensors
             if saving is not None:

@@ -102,6 +102,24 @@ replaced, metadata.parquet included). A prefix without one is resumed.
 --stage-only --cache-name NAME --src-drive P only stages (CPU, cents).
 --src-drive / --dest-r2 without --cache-name, and --reset-upload-cache with
 it, are refused.
+    --src-name S    build NAME from the package already staged for cache S
+                    (/vol/src/S) instead of staging into /vol/src/NAME: the
+                    `stage` step lists the package on Drive and requires S's
+                    stage.json to record exactly that listing (same input
+                    generation), its --src-drive, and every file on disk at
+                    its Drive size (verify_reused_stage), else it refuses
+                    (restage S first); nothing is synced, deleted or written
+                    under /vol/src/S. Workers and finalize_r2 pin the
+                    generation through S's stage.json as usual.
+    --downscale F   cache_latents.py --downscale F: every image encoded at
+                    (bucket_w/F, bucket_h/F) after one LANCZOS resize,
+                    metadata.parquet with the reduced buckets, "downscale"
+                    in the shards and the manifest.
+The cache dir's .input_generation.json also binds it to its source name
+and factor (first stage); a stage / worker / finalize_r2 with another
+--src-name or --downscale is refused (a GEN_JSON without them = its own
+source at factor 1, i.e. v3), so pass both on every call, --finalize-only
+included. Both are refused without --cache-name and with --bench / --profile.
 
 v3 recipe (package gdrive:danbooru_pipeline/selection_v3/package, 196,099
 images / 200 tars; no bench needed again: the v2 build's B200 setup with
@@ -128,6 +146,27 @@ containers (cents to well under $1) and R2 storage (~100 GB, ~$1.5/month).
 wall (the cost model says 3 h at the v2 rate, 2 h at the profile rate).
 The training node downloads the cache with DATA_SOURCE=r2
 DATA_R2_PREFIX=latents_v3 (krea2-ops/node).
+
+v3-512 recipe (run3 phase 1: the v3 package, every image 2x downscaled,
+e.g. 832x1216 -> 416x608, 1024x1024 -> 512x512; all 19 v3 buckets are
+multiples of 32 px; must come out with n = 196,099). Reuses /vol/src/v3
+(staged 11/02, 41.4 GB) instead of re-downloading; latents_v3/ is never
+written (its own manifest makes finalize_r2 refuse it anyway):
+    modal run scripts/modal_cache_latents.py --stage-only --cache-name v3-512 \
+        --src-name v3 --src-drive selection_v3/package \
+        --downscale 2                              # optional: CPU only, early
+    modal run --detach scripts/modal_cache_latents.py --build \
+        --cache-name v3-512 --src-name v3 --src-drive selection_v3/package \
+        --dest-r2 latents_v3_512/ --downscale 2 --gpu B200 --containers 1 \
+        --batch 4 --cpu 8 --worker-timeout-h 4 --vae-impl 2d-compile-cl
+    modal run scripts/modal_cache_latents.py --finalize-only \
+        --cache-name v3-512 --src-name v3 --dest-r2 latents_v3_512/ \
+        --downscale 2                              # after a laptop disconnect
+The printed estimate uses the ~1 MP rates, so it is an upper bound (the
+encoder sees 1/4 of the pixels; webp decode stays full size, so 8 decode
+threads are the likely limit). torch.compile recompiles for the 19 new
+bucket shapes. Shards are ~1/4 of v3's (~25 GB on R2). The node downloads
+it with DATA_R2_PREFIX=latents_v3_512.
 
 Mode 4 (--profile): where the encoder's GPU time goes (scripts/vae_profile.py)
 on one --gpu container (default B200, 8 cores, no memory reservation; hard
@@ -158,7 +197,8 @@ Volume `krea2-latents` (Volumes v2, created on first use):
     /vol/profile/TS     --profile results
     /vol/src/NAME       staged image package of a named cache + stage.json
     /vol/krea2-NAME     a named cache (same layout as /vol/krea2) +
-                        .input_generation.json (never uploaded)
+                        .input_generation.json (never uploaded: generation,
+                        src_remote, src_name, downscale)
 Modal secrets: `huggingface` (the HF token under HF_TOKEN,
 HUGGING_FACE_HUB_TOKEN or HUGGINGFACE_TOKEN, exported as HF_TOKEN; bench,
 prep, workers, v2 finalize), `rclone-gdrive` (stage), `krea2-r2`
@@ -704,8 +744,14 @@ def token_can_write(whoami, owner=OUT_OWNER):
 
 
 # ------------------------------------------------------------- build helpers
+def downscale_args(downscale):
+    """cache_latents.py --downscale (only when != 1: the default command is
+    unchanged)."""
+    return ["--downscale", str(downscale)] if downscale != 1 else []
+
+
 def worker_cmd(i, n, batch, decode_threads, python="python", out=VOL_OUT,
-               dl_root=REMOTE_DL, vae_impl="ref", tar_dir=None):
+               dl_root=REMOTE_DL, vae_impl="ref", tar_dir=None, downscale=1):
     """cache_latents.py command of build worker i of n (run from the repo).
     tar_dir: a staged package (metadata.parquet + data/*.tar) instead of
     the HF dataset repo."""
@@ -713,6 +759,7 @@ def worker_cmd(i, n, batch, decode_threads, python="python", out=VOL_OUT,
             "--num-workers", str(n), "--worker-index", str(i),
             "--batch", str(batch), "--decode-threads", str(decode_threads),
             "--download-dir", f"{dl_root}/w{i}", "--vae-impl", vae_impl,
+            *downscale_args(downscale),
             ] + (["--tar-dir", str(tar_dir)] if tar_dir else [])
 
 
@@ -727,11 +774,12 @@ def worker_env(base):
 
 
 def finalize_cmd(python="python", out=VOL_OUT, dl_root=REMOTE_DL,
-                 tar_dir=None):
+                 tar_dir=None, downscale=1):
     """--write-manifest; tar_dir: verify against that package's parquet (a
     named cache), else the HF dataset repo's."""
     return [python, "scripts/cache_latents.py", "--out", str(out),
             "--write-manifest", "--download-dir", f"{dl_root}/manifest",
+            *downscale_args(downscale),
             ] + (["--tar-dir", str(tar_dir)] if tar_dir else [])
 
 
@@ -1277,24 +1325,27 @@ def gpu_name_smi():
 
 
 def build_worker_impl(i, n, batch, decode_threads, vol, vae_impl="ref",
-                      cache_name=""):
+                      cache_name="", src_name="", downscale=1):
     """One cache_latents.py worker; the volume is committed after every
     finished shard (explicitly, on top of Modal's background commits, so a
     killed container loses at most its in-flight shard) and at the end.
-    cache_name: a named cache (/vol/krea2-NAME from the staged /vol/src/NAME)
-    instead of the v2 one."""
+    cache_name: a named cache (/vol/krea2-NAME from the staged /vol/src/
+    SRC_NAME, SRC_NAME defaulting to NAME) instead of the v2 one; downscale:
+    cache_latents.py --downscale (must be the cache dir's bound factor)."""
     setup_hf_token()
     env = worker_env(os.environ)
     res = {"worker": i, "device_name": gpu_name_smi()}
-    job = resolve_job(cache_name, mode="worker")
-    if job["name"]:
-        try:   # never add shards of another input to a started cache
+    try:   # never add shards of another input / factor to a started cache
+        job = resolve_job(cache_name, mode="worker", src_name=src_name,
+                          downscale=downscale)
+        if job["name"]:
             staged_generation(job)
-        except SystemExit as e:
-            res.update(rc=None, error=str(e), seconds=0)
-            return to_plain(res)
+    except SystemExit as e:
+        res.update(rc=None, error=str(e), seconds=0)
+        return to_plain(res)
     cmd = worker_cmd(i, n, batch, decode_threads, python=sys.executable,
-                     out=job["out"], vae_impl=vae_impl, tar_dir=job["src"])
+                     out=job["out"], vae_impl=vae_impl, tar_dir=job["src"],
+                     downscale=job["downscale"])
     print(f"w{i}/{n} on {res['device_name']}: $ {' '.join(cmd)}", flush=True)
     t0 = time.time()
     try:
@@ -1447,7 +1498,8 @@ def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
 # ------------------------------------------- named caches: Drive in, R2 out
 def resolve_mode(bench=False, build=False, finalize_only=False,
                  stage_only=False, profile=False, reset_upload_cache=False,
-                 cache_name="", src_drive="", dest_r2=""):
+                 cache_name="", src_drive="", dest_r2="", src_name="",
+                 downscale=1):
     """CLI mode flags -> bench | build | finalize | stage | profile
     (SystemExit on misuse, before any Modal call). --profile takes only
     --gpu: no cache, Drive, R2 or upload flags."""
@@ -1463,6 +1515,8 @@ def resolve_mode(bench=False, build=False, finalize_only=False,
         extra = [f for f, v in (("--cache-name", cache_name),
                                 ("--src-drive", src_drive),
                                 ("--dest-r2", dest_r2),
+                                ("--src-name", src_name),
+                                ("--downscale", downscale != 1),
                                 ("--reset-upload-cache", reset_upload_cache))
                  if v]
         if extra:
@@ -1563,36 +1617,47 @@ def profile_gpu_impl(gpu_requested, ts, out_root=VOL_PROFILE,
     return out
 
 
-def resolve_job(cache_name="", src_drive="", dest_r2="", mode="build"):
-    """CLI flags -> {name, out, src, src_remote, dest} (validated; SystemExit
-    on misuse). mode: bench | build | finalize | stage | worker (paths only).
+def resolve_job(cache_name="", src_drive="", dest_r2="", mode="build",
+                src_name="", downscale=1):
+    """CLI flags -> {name, out, src, src_name, src_remote, dest, downscale}
+    (validated; SystemExit on misuse). mode: bench | build | finalize |
+    stage | worker (paths only).
 
     name "" = the v2 cache: /vol/krea2 from the HF image repo, uploaded to the
-    HF latents repo; --src-drive / --dest-r2 are refused there (they would
-    mix another dataset into v2's dir or repo). NAME = /vol/krea2-NAME, input
-    staged into /vol/src/NAME: needs --dest-r2 (the HF target repo is v2's)
-    for build / finalize, and --src-drive for build / stage."""
+    HF latents repo; --src-drive / --dest-r2 / --src-name / --downscale are
+    refused there (they would mix another dataset or factor into v2's dir or
+    repo). NAME = /vol/krea2-NAME, input staged into /vol/src/SRC_NAME
+    (--src-name, default NAME; another name's staged package is reused, never
+    re-synced or modified): needs --dest-r2 (the HF target repo is v2's) for
+    build / finalize, and --src-drive for build / stage."""
     name = (cache_name or "").strip()
     src_drive, dest_r2 = (src_drive or "").strip(), (dest_r2 or "").strip()
+    src_name = (src_name or "").strip()
+    if isinstance(downscale, bool) or not isinstance(downscale, int) \
+            or downscale < 1:
+        raise SystemExit(f"--downscale {downscale!r}: want an int >= 1")
     if mode == "bench":
-        if name or src_drive or dest_r2:
+        if name or src_drive or dest_r2 or src_name or downscale != 1:
             raise SystemExit("--bench takes no --cache-name / --src-drive / "
-                             "--dest-r2")
-        return {"name": "", "out": VOL_OUT, "src": None, "src_remote": None,
-                "dest": None}
+                             "--dest-r2 / --src-name / --downscale")
+        return {"name": "", "out": VOL_OUT, "src": None, "src_name": None,
+                "src_remote": None, "dest": None, "downscale": 1}
     if not name:
-        if src_drive or dest_r2:
+        if src_drive or dest_r2 or src_name or downscale != 1:
             raise SystemExit(
-                "--src-drive / --dest-r2 need --cache-name NAME: the default "
-                f"cache {VOL_OUT} holds the v2 cache (HF in, HF out) and must "
-                "never be mixed with another dataset")
+                "--src-drive / --dest-r2 / --src-name / --downscale need "
+                f"--cache-name NAME: the default cache {VOL_OUT} holds the v2 "
+                "cache (HF in, HF out) and must never be mixed with another "
+                "dataset")
         if mode == "stage":
             raise SystemExit("--stage-only needs --cache-name and --src-drive")
-        return {"name": "", "out": VOL_OUT, "src": None, "src_remote": None,
-                "dest": None}
-    if not CACHE_NAME_RE.match(name):
-        raise SystemExit(f"--cache-name {name!r}: want {CACHE_NAME_RE.pattern}")
-    out, src = f"{VOL_OUT}-{name}", f"{VOL_SRC}/{name}"
+        return {"name": "", "out": VOL_OUT, "src": None, "src_name": None,
+                "src_remote": None, "dest": None, "downscale": 1}
+    src_name = src_name or name
+    for flag, v in (("--cache-name", name), ("--src-name", src_name)):
+        if not CACHE_NAME_RE.match(v):
+            raise SystemExit(f"{flag} {v!r}: want {CACHE_NAME_RE.pattern}")
+    out, src = f"{VOL_OUT}-{name}", f"{VOL_SRC}/{src_name}"
     for p in (out, src):
         if any(p == d or p.startswith(d + "/") for d in SHARED_DIRS):
             raise SystemExit(f"--cache-name {name!r} maps to {p}, inside a "
@@ -1603,9 +1668,10 @@ def resolve_job(cache_name="", src_drive="", dest_r2="", mode="build"):
     if mode in ("build", "finalize") and not dest_r2:
         raise SystemExit(f"--cache-name {name} needs --dest-r2 PREFIX: the HF "
                          f"upload target {OUT_REPO} is the v2 cache's")
-    return {"name": name, "out": out, "src": src,
+    return {"name": name, "out": out, "src": src, "src_name": src_name,
             "src_remote": resolve_drive_src(src_drive) if src_drive else None,
-            "dest": parse_r2_prefix(dest_r2) if dest_r2 else None}
+            "dest": parse_r2_prefix(dest_r2) if dest_r2 else None,
+            "downscale": downscale}
 
 
 def resolve_drive_src(spec):
@@ -1773,12 +1839,29 @@ def generation_refusal(out_dir, gen, have):
             f"rm -r {VOLUME_NAME} {str(out_dir)[len(VOL) + 1:]}")
 
 
+def binding_refusal(out_dir, mk, job):
+    """Why the cache dir's GEN_JSON `mk` does not fit `job`'s source name and
+    downscale factor, or None. A GEN_JSON without them (v3, written before
+    --src-name / --downscale) means its own source at factor 1."""
+    have = (mk.get("src_name", job["name"]), mk.get("downscale", 1))
+    want = (job["src_name"], job["downscale"])
+    if have == want:
+        return None
+    return (f"{out_dir} is bound to --src-name {have[0]} --downscale "
+            f"{have[1]}, this run asks for --src-name {want[0]} --downscale "
+            f"{want[1]}: a cache dir never mixes inputs or factors. Pass the "
+            "bound values, or pick a new --cache-name")
+
+
 def staged_generation(job):
-    """Input generation of a named cache: /vol/src/NAME/stage.json (written
-    by stage) must equal the one the cache dir was started with
-    (/vol/krea2-NAME/GEN_JSON) -> generation, else SystemExit."""
+    """Input generation of a named cache: /vol/src/SRC_NAME/stage.json
+    (written by stage) must equal the one the cache dir was started with
+    (/vol/krea2-NAME/GEN_JSON), whose source name and downscale factor must
+    be the job's (binding_refusal) -> generation, else SystemExit."""
     st = _read_json(Path(job["src"]) / STAGE_JSON)
     mk = _read_json(Path(job["out"]) / GEN_JSON)
+    if mk and binding_refusal(job["out"], mk, job):
+        raise SystemExit(binding_refusal(job["out"], mk, job))
     if not st or not mk:
         raise SystemExit(f"{job['src']}/{STAGE_JSON} or {job['out']}/"
                          f"{GEN_JSON} missing: stage the package first "
@@ -1822,6 +1905,37 @@ def check_staged(src_dir, remote_files):
                          if x not in missing)}
 
 
+def verify_reused_stage(src_dir, job, files, gen):
+    """--src-name OTHER: OTHER's staged package is reused as is (never
+    synced or modified). Its stage.json must record this --src-drive and
+    exactly the Drive listing `files` (so generation `gen`), every listed
+    file must be on disk at its listed size, and every tar the parquet names
+    in the listing -> check_staged's dict, else SystemExit (restage OTHER)."""
+    src_dir = Path(src_dir)
+    again = (f"restage it first: --stage-only --cache-name {job['src_name']} "
+             f"--src-drive {job['src_remote']}")
+    st = _read_json(src_dir / STAGE_JSON)
+    if not st:
+        raise SystemExit(f"{src_dir}/{STAGE_JSON} missing: {again}")
+    if st.get("src_remote") != job["src_remote"]:
+        raise SystemExit(f"{src_dir} was staged from {st.get('src_remote')}, "
+                         f"not --src-drive {job['src_remote']}")
+    if st.get("generation") != gen or st.get("files") != files:
+        raise SystemExit(f"{src_dir} holds input generation "
+                         f"{st.get('generation')} but the package on Drive "
+                         f"now is {gen}: {again}")
+    bad = sorted(p for p, f in files.items()
+                 if not (src_dir / p).is_file()
+                 or (src_dir / p).stat().st_size != f["size"])
+    chk = check_staged(src_dir, files)
+    if bad or chk["missing"]:
+        raise SystemExit(f"{src_dir}: {len(bad)} files missing or of another "
+                         f"size than on Drive ({bad[:5]}), "
+                         f"{len(chk['missing'])} parquet tars not in the "
+                         f"package ({chk['missing'][:5]}): {again}")
+    return chk
+
+
 def write_rclone_conf(env, path=RCLONE_CONF):
     """RCLONE_CONF_B64 (secret `rclone-gdrive`) -> 0600 file (never printed)."""
     import base64
@@ -1845,7 +1959,8 @@ def _write_json(path, obj):
 
 
 def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
-               rclone=RCLONE_BIN, conf_path=RCLONE_CONF):
+               rclone=RCLONE_BIN, conf_path=RCLONE_CONF, src_name="",
+               downscale=1):
     """Drive package -> /vol/src/<name>:
       1. list it on Drive (path, size, Drive's md5) -> input generation; a
          cache dir already started from another generation is refused here,
@@ -1861,6 +1976,11 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
          adopted). stage.json is deleted (and committed) before the sync and
          only written back after 3-4 pass, so a failed restage leaves no
          stage.json and the workers / finalize_r2 refuse.
+    GEN_JSON also binds the cache dir to its source name and downscale
+    factor (binding_refusal). With --src-name OTHER (!= name), steps 2-5 on
+    /vol/src/OTHER are replaced by verify_reused_stage: OTHER's package is
+    reused as staged (nothing synced, deleted or written there) when its
+    stage.json records exactly the current Drive listing, else refused.
     Never raises: -> {ok, error, src, src_remote, generation, n_rows, n_tars,
     bytes, missing, log}."""
     env = os.environ if env is None else env
@@ -1872,7 +1992,8 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
 
     res = {"ok": False, "error": None, "log": log}
     try:
-        job = resolve_job(cache_name, src_drive, "", "stage")
+        job = resolve_job(cache_name, src_drive, "", "stage", src_name,
+                          downscale)
         src, out = Path(job["src"]), Path(job["out"])
         res.update(src=str(src), src_remote=job["src_remote"])
         try:
@@ -1891,6 +2012,8 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
         mk = _read_json(out / GEN_JSON)
         if mk and mk.get("generation") != gen:
             raise SystemExit(generation_refusal(out, gen, mk.get("generation")))
+        if mk and binding_refusal(out, mk, job):
+            raise SystemExit(binding_refusal(out, mk, job))
         lat = out / "latents"
         if mk is None and lat.is_dir() and any(lat.iterdir()):
             raise SystemExit(
@@ -1898,41 +2021,50 @@ def stage_impl(vol, cache_name, src_drive, runner=subprocess.run, env=None,
                 "input is unknown, it is never adopted. Pick a new "
                 f"--cache-name, or delete the cache explicitly: modal volume "
                 f"rm -r {VOLUME_NAME} {str(out)[len(VOL) + 1:]}")
-        # the sync may mutate the inputs: no stage.json (workers / finalize
-        # refuse) until the new state is validated below
-        (src / STAGE_JSON).unlink(missing_ok=True)
-        commit_volume(vol, say)
-        src.mkdir(parents=True, exist_ok=True)
-        t0 = time.time()
-        args = ["--config", conf, "sync", job["src_remote"], str(src)]
-        for pat in STAGE_INCLUDE:
-            args += ["--include", pat]
-        rc = run_rclone(args + ["--checksum", "--transfers", "8",
-                                "--checkers", "16", *RCLONE_COMMON],
-                        renv, runner, rclone).returncode
-        say(f"rclone sync {job['src_remote']} -> {src}: rc {rc} in "
-            f"{(time.time() - t0) / 60:.1f} min")
-        commit_volume(vol, say)
-        if rc != 0:
-            raise RuntimeError(f"rclone sync exit {rc}")
-        if stage_listing(job["src_remote"], conf, renv, runner,
-                         rclone) != files:
-            raise RuntimeError(f"{job['src_remote']} changed while it was "
-                               "staged: re-run once it is final")
-        st = check_staged(src, files)
-        res.update(st)
-        say(f"staged: {st['n_rows']} rows, {st['n_tars']} tars "
-            f"({st['bytes'] / 1e9:.1f} GB), {len(st['missing'])} missing")
-        if st["missing"]:
-            raise RuntimeError(f"{len(st['missing'])} tars named in the "
-                               f"parquet are not in the package, e.g. "
-                               f"{st['missing'][:5]}")
-        _write_json(src / STAGE_JSON, {"src_remote": job["src_remote"],
-                                       "generation": gen, "files": files})
+        if job["src_name"] != job["name"]:
+            st = verify_reused_stage(src, job, files, gen)
+            res.update(st)
+            say(f"reusing {src} as staged (generation matches Drive, no "
+                f"sync): {st['n_rows']} rows, {st['n_tars']} tars "
+                f"({st['bytes'] / 1e9:.1f} GB)")
+        else:
+            # the sync may mutate the inputs: no stage.json (workers /
+            # finalize refuse) until the new state is validated below
+            (src / STAGE_JSON).unlink(missing_ok=True)
+            commit_volume(vol, say)
+            src.mkdir(parents=True, exist_ok=True)
+            t0 = time.time()
+            args = ["--config", conf, "sync", job["src_remote"], str(src)]
+            for pat in STAGE_INCLUDE:
+                args += ["--include", pat]
+            rc = run_rclone(args + ["--checksum", "--transfers", "8",
+                                    "--checkers", "16", *RCLONE_COMMON],
+                            renv, runner, rclone).returncode
+            say(f"rclone sync {job['src_remote']} -> {src}: rc {rc} in "
+                f"{(time.time() - t0) / 60:.1f} min")
+            commit_volume(vol, say)
+            if rc != 0:
+                raise RuntimeError(f"rclone sync exit {rc}")
+            if stage_listing(job["src_remote"], conf, renv, runner,
+                             rclone) != files:
+                raise RuntimeError(f"{job['src_remote']} changed while it "
+                                   "was staged: re-run once it is final")
+            st = check_staged(src, files)
+            res.update(st)
+            say(f"staged: {st['n_rows']} rows, {st['n_tars']} tars "
+                f"({st['bytes'] / 1e9:.1f} GB), {len(st['missing'])} missing")
+            if st["missing"]:
+                raise RuntimeError(f"{len(st['missing'])} tars named in the "
+                                   f"parquet are not in the package, e.g. "
+                                   f"{st['missing'][:5]}")
+            _write_json(src / STAGE_JSON, {"src_remote": job["src_remote"],
+                                           "generation": gen, "files": files})
         if mk is None:
             out.mkdir(parents=True, exist_ok=True)
             _write_json(out / GEN_JSON, {"src_remote": job["src_remote"],
-                                         "generation": gen})
+                                         "generation": gen,
+                                         "src_name": job["src_name"],
+                                         "downscale": job["downscale"]})
         commit_volume(vol, say)
         res["ok"] = True
     except (Exception, SystemExit) as e:  # noqa: BLE001 - reported, never raised
@@ -1973,7 +2105,8 @@ def r2_write_probe(url, env, runner=subprocess.run, rclone=RCLONE_BIN):
 
 def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
                      python=sys.executable, cwd=REMOTE_REPO, env=None,
-                     rclone=RCLONE_BIN, precheck=False):
+                     rclone=RCLONE_BIN, precheck=False, src_name="",
+                     downscale=1):
     """A named cache's finalize: input generation check (staged_generation),
     --write-manifest against the staged package's parquet, then
     metadata.parquet + the manifest's shards to r2:<bucket>/<prefix>/ (rclone
@@ -1985,7 +2118,9 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
     only gets its missing objects (--ignore-existing: nothing, incl.
     metadata.parquet, is ever replaced). precheck: only the generation
     check, that pre-check and a write probe (r2_write_probe), run by --build
-    before any GPU starts. Never touches HF. Never raises: -> {ok, repo,
+    before any GPU starts. src_name / downscale: the cache dir's bound
+    source and factor (staged_generation refuses others); the manifest pass
+    runs with that --downscale. Never touches HF. Never raises: -> {ok, repo,
     error, problems, n_files, bytes, log}."""
     env = os.environ if env is None else env
     log = []
@@ -1997,7 +2132,8 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
     res = {"ok": False, "repo": None, "error": None, "problems": [],
            "log": log}
     try:
-        job = resolve_job(cache_name, "", dest_r2, "finalize")
+        job = resolve_job(cache_name, "", dest_r2, "finalize", src_name,
+                          downscale)
         out = Path(job["out"])
         mpath = out / MANIFEST
         try:
@@ -2037,7 +2173,8 @@ def finalize_r2_impl(vol, cache_name, dest_r2, runner=subprocess.run,
             res["ok"] = True
             return to_plain(res)
         # 2. verify all shards + digests against the staged parquet
-        cmd = finalize_cmd(python=python, out=out, tar_dir=job["src"])
+        cmd = finalize_cmd(python=python, out=out, tar_dir=job["src"],
+                           downscale=job["downscale"])
         say("$ " + " ".join(cmd))
         rc = runner(cmd, cwd=cwd).returncode
         if rc != 0:
@@ -2139,9 +2276,10 @@ if modal is not None:
     @app.function(gpu="L4", cpu=8.0,
                   timeout=DEFAULT_WORKER_TIMEOUT_H * 3600, **mounts)
     def build_worker(i: int, n: int, batch: int, decode_threads: int,
-                     vae_impl: str = "ref", cache_name: str = "") -> dict:
+                     vae_impl: str = "ref", cache_name: str = "",
+                     src_name: str = "", downscale: int = 1) -> dict:
         return build_worker_impl(i, n, batch, decode_threads, vol, vae_impl,
-                                 cache_name)
+                                 cache_name, src_name, downscale)
 
     @app.function(cpu=4.0, timeout=2 * 3600, **mounts)
     def finalize(reset_upload_cache: bool = False) -> dict:
@@ -2151,14 +2289,17 @@ if modal is not None:
     # cpu/memory reservations (rclone + hashing; Modal bills max(req, use))
     @app.function(timeout=STAGE_TIMEOUT_H * 3600, volumes={VOL: vol},
                   secrets=[rclone_secret])
-    def stage(cache_name: str, src_drive: str) -> dict:
-        return stage_impl(vol, cache_name, src_drive)
+    def stage(cache_name: str, src_drive: str, src_name: str = "",
+              downscale: int = 1) -> dict:
+        return stage_impl(vol, cache_name, src_drive, src_name=src_name,
+                          downscale=downscale)
 
     @app.function(timeout=FINALIZE_R2_TIMEOUT_H * 3600, volumes={VOL: vol},
                   secrets=[r2_secret])
-    def finalize_r2(cache_name: str, dest_r2: str,
-                    precheck: bool = False) -> dict:
-        return finalize_r2_impl(vol, cache_name, dest_r2, precheck=precheck)
+    def finalize_r2(cache_name: str, dest_r2: str, precheck: bool = False,
+                    src_name: str = "", downscale: int = 1) -> dict:
+        return finalize_r2_impl(vol, cache_name, dest_r2, precheck=precheck,
+                                src_name=src_name, downscale=downscale)
 
     def _print_prep(p):
         print(f"prep: HF user {p.get('whoami')!r} (token from "
@@ -2262,8 +2403,11 @@ if modal is not None:
     def _stage_local(job):
         """Drive -> /vol/src/NAME on a CPU container; must pass before any
         GPU starts. -> stage result."""
-        print(f"staging {job['src_remote']} -> {job['src']} (CPU container)")
-        st = stage.remote(job["name"], job["src_remote"])
+        print(f"staging {job['src_remote']} -> {job['src']} (CPU container"
+              + (f"; reusing {job['src_name']}'s package, no sync"
+                 if job["src_name"] != job["name"] else "") + ")")
+        st = stage.remote(job["name"], job["src_remote"], job["src_name"],
+                          job["downscale"])
         if not st.get("ok"):
             raise SystemExit("staging FAILED (no GPU started): "
                              + _err_line(st.get("error")))
@@ -2294,14 +2438,20 @@ if modal is not None:
         if named:
             params.update(cache_name=job["name"], out=job["out"],
                           src=job["src"], src_drive=job["src_remote"],
-                          dest_r2=job["dest"])
+                          dest_r2=job["dest"], downscale=job["downscale"])
             n_images = _stage_local(job)["n_rows"]
-            pc = finalize_r2.remote(job["name"], job["dest"], True)
+            pc = finalize_r2.remote(job["name"], job["dest"], True,
+                                    job["src_name"], job["downscale"])
             if not pc.get("ok"):
                 raise SystemExit("R2 pre-check FAILED (no GPU started): "
                                  + _err_line(pc.get("error")))
         print(render_estimate(n_images, gpu, cpu, containers, vae_impl,
                               batch))
+        if job["downscale"] != 1:
+            print(f"--downscale {job['downscale']}: the measured rates are "
+                  "for ~1 MP buckets, so this estimate is an upper bound "
+                  "(the encoder sees 1/downscale^2 of the pixels; webp "
+                  "decode stays full size)")
         p = prep.remote(False)   # VAE once, before N workers would race on it
         _print_prep(p)
         if not named and p.get("can_write") is False:
@@ -2310,7 +2460,8 @@ if modal is not None:
         fn = build_worker.with_options(
             gpu=gpu, cpu=float(cpu), timeout=int(worker_timeout_h * 3600))
         calls = [fn.spawn(i, containers, batch, threads, vae_impl,
-                          job["name"])
+                          job["name"], job["src_name"] or "",
+                          job["downscale"])
                  for i in range(containers)]
         print(f"spawned {containers} workers on {gpu}: {params}")
         workers = []
@@ -2325,7 +2476,9 @@ if modal is not None:
         ok, _ = summarize_workers(workers)
         fin = None
         if ok:
-            fin = (finalize_r2.remote(job["name"], job["dest"]) if named
+            fin = (finalize_r2.remote(job["name"], job["dest"], False,
+                                      job["src_name"], job["downscale"])
+                   if named
                    else finalize.remote(reset_upload_cache=reset_upload_cache))
         path = _write_build_log(params, p, workers, fin)
         if not ok:
@@ -2345,14 +2498,16 @@ if modal is not None:
              worker_timeout_h: float = DEFAULT_WORKER_TIMEOUT_H,
              reset_upload_cache: bool = False,
              impls: str = DEFAULT_IMPLS, vae_impl: str = "ref",
-             cache_name: str = "", src_drive: str = "", dest_r2: str = ""):
+             cache_name: str = "", src_drive: str = "", dest_r2: str = "",
+             src_name: str = "", downscale: int = 1):
         mode = resolve_mode(bench, build, finalize_only, stage_only,
                             profile, reset_upload_cache, cache_name,
-                            src_drive, dest_r2)
+                            src_drive, dest_r2, src_name, downscale)
         if mode == "profile":
             profile_local(gpu)
             return
-        job = resolve_job(cache_name, src_drive, dest_r2, mode)
+        job = resolve_job(cache_name, src_drive, dest_r2, mode, src_name,
+                          downscale)
         if job["name"] and reset_upload_cache:
             raise SystemExit("--reset-upload-cache is for the HF upload of "
                              "the v2 cache (a named cache goes to R2)")
@@ -2364,9 +2519,11 @@ if modal is not None:
         elif stage_only:
             _stage_local(job)
         elif job["name"]:
-            fin = finalize_r2.remote(job["name"], job["dest"])
+            fin = finalize_r2.remote(job["name"], job["dest"], False,
+                                     job["src_name"], job["downscale"])
             path = _write_build_log(
                 {"finalize_only": True, "cache_name": job["name"],
+                 "src_name": job["src_name"], "downscale": job["downscale"],
                  "dest_r2": job["dest"]}, {}, [], fin)
             _check_finalize(fin, path)
         else:
