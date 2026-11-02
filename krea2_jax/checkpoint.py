@@ -96,8 +96,15 @@ def _check_prefixes(prefixes):
 
 
 def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp",
-                      unstack=()):
-    """Load the official DiT safetensors into a (sharded) nested pytree.
+                      unstack=(), cfg=None):
+    """Load the DiT weights into a (sharded) nested pytree.
+
+    path: the official single safetensors file, or a diffusers/maxdiffusion
+    transformer DIRECTORY (`diffusion_pytorch_model.safetensors.index.json`
+    + shards; keys mapped back with `diffusers_key_map(cfg)`, cfg default
+    KREA2_CONFIG). dtype=None keeps every tensor's stored dtype (e.g. the
+    174 F32 norm/modulation/projection tensors stay F32; run such a mixed
+    tree with `dit_forward(act_dtype=jnp.bfloat16)`).
 
     Tensors are read on host CPU, repeated blocks are stacked, and each leaf
     is placed on the mesh. sharding="fsdp" shards each leaf's largest
@@ -119,19 +126,16 @@ def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp",
     flat = {}
     stacked = {}  # prefix -> field -> {idx: array}
 
-    with safe_open(path, framework="flax") as f:
-        keys = list(f.keys())
-        with jax.default_device(cpu):
-            for key in keys:
-                tensor = f.get_tensor(key)
-                if dtype is not None:
-                    tensor = tensor.astype(dtype)
-                m = _STACK_RE.match(key)
-                if m:
-                    prefix, idx, rest = m.group(1), int(m.group(2)), m.group(3)
-                    stacked.setdefault(prefix, {}).setdefault(rest, {})[idx] = tensor
-                else:
-                    flat[key] = tensor
+    with jax.default_device(cpu):
+        for key, tensor in iter_official_tensors(path, cfg):
+            if dtype is not None:
+                tensor = tensor.astype(dtype)
+            m = _STACK_RE.match(key)
+            if m:
+                prefix, idx, rest = m.group(1), int(m.group(2)), m.group(3)
+                stacked.setdefault(prefix, {}).setdefault(rest, {})[idx] = tensor
+            else:
+                flat[key] = tensor
 
     params = {}
     for key, tensor in flat.items():
@@ -167,6 +171,143 @@ def load_krea2_params(path, mesh=None, dtype=None, sharding="fsdp",
             )
             del arr
     return params
+
+
+# ---------------------------------------------------------------------------
+# diffusers / maxdiffusion transformer layout
+# ---------------------------------------------------------------------------
+
+DIFFUSERS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
+
+# official SingleStreamDiT key -> diffusers (maxdiffusion Krea2Transformer)
+# key: pure renames, applied in order (ported from krea2_keymap.py `r2d`,
+# verified 10/17 on all 430 keys of the HF Raw/Turbo files)
+_DIFFUSERS_SUB = (
+    (r"^blocks\.(\d+)\.", r"transformer_blocks.\1."),
+    (r"^txtfusion\.", "text_fusion."),
+    (r"\.attn\.wq\.", ".attn.to_q."), (r"\.attn\.wk\.", ".attn.to_k."),
+    (r"\.attn\.wv\.", ".attn.to_v."), (r"\.attn\.wo\.", ".attn.to_out.0."),
+    (r"\.attn\.gate\.", ".attn.to_gate."),
+    (r"\.attn\.qknorm\.qnorm\.scale$", ".attn.norm_q.weight"),
+    (r"\.attn\.qknorm\.knorm\.scale$", ".attn.norm_k.weight"),
+    (r"\.mlp\.", ".ff."), (r"\.prenorm\.scale$", ".norm1.weight"),
+    (r"\.postnorm\.scale$", ".norm2.weight"),
+    (r"\.mod\.lin$", ".scale_shift_table"),
+    (r"^first\.", "img_in."), (r"^last\.linear\.", "final_layer.linear."),
+    (r"^last\.modulation\.lin$", "final_layer.scale_shift_table"),
+    (r"^last\.norm\.scale$", "final_layer.norm.weight"),
+)
+_DIFFUSERS_SEQ = {
+    "tmlp": {"0": "time_embed.linear_1", "2": "time_embed.linear_2"},
+    "tproj": {"1": "time_mod_proj"},
+    "txtmlp": {"0": "txt_in.norm", "1": "txt_in.linear_1",
+               "3": "txt_in.linear_2"},
+}
+_MOD_LIN_RE = re.compile(r"^blocks\.\d+\.mod\.lin$")
+
+
+def official_to_diffusers_key(key):
+    for pat, rep in _DIFFUSERS_SUB:
+        key = re.sub(pat, rep, key)
+    m = re.match(r"^(tmlp|tproj|txtmlp)\.(\d+)\.(\w+)$", key)
+    if m:
+        leaf = "weight" if m.group(3) == "scale" else m.group(3)
+        return f"{_DIFFUSERS_SEQ[m.group(1)][m.group(2)]}.{leaf}"
+    return key
+
+
+def official_to_diffusers(key, tensor):
+    """(diffusers key, tensor in the diffusers layout). The only value
+    change: blocks.N.mod.lin (6F,) -> scale_shift_table (6, F), same flat
+    order. Dtype and bytes are kept."""
+    if _MOD_LIN_RE.match(key):
+        tensor = tensor.reshape(6, -1)
+    return official_to_diffusers_key(key), tensor
+
+
+def diffusers_key_map(cfg):
+    """{diffusers key: (official key, official shape)} for every DiT tensor
+    of `cfg` (the inverse of `official_to_diffusers_key`, built from it)."""
+    out = {}
+    for key, shape in official_key_shapes(abstract_krea2_params(cfg)).items():
+        dkey = official_to_diffusers_key(key)
+        if dkey in out:
+            raise ValueError(f"diffusers key {dkey} from both "
+                             f"{out[dkey][0]} and {key}")
+        out[dkey] = (key, shape)
+    return out
+
+
+def iter_diffusers_shard(path, kmap, keys=None):
+    """Yield (diffusers key, official key, tensor reshaped to the official
+    shape, stored dtype kept) for `keys` (default: all) of one shard."""
+    with safe_open(str(path), framework="flax") as f:
+        for dkey in sorted(f.keys() if keys is None else keys):
+            if dkey not in kmap:
+                raise ValueError(f"{path}: unknown diffusers key {dkey}")
+            okey, shape = kmap[dkey]
+            t = f.get_tensor(dkey)
+            if math.prod(t.shape) != math.prod(shape):
+                raise ValueError(f"{dkey}: shape {tuple(t.shape)} does not "
+                                 f"fit {okey} {shape}")
+            yield dkey, okey, t.reshape(shape)
+
+
+def iter_official_tensors(path, cfg=None):
+    """Yield (official key, tensor) from an official safetensors file or a
+    diffusers transformer dir (index + shards, every key of `cfg` exactly
+    once). Stored dtypes are kept."""
+    from pathlib import Path
+
+    path = Path(path)
+    if not path.is_dir():
+        with safe_open(str(path), framework="flax") as f:
+            for key in f.keys():
+                yield key, f.get_tensor(key)
+        return
+    import json
+
+    from krea2_jax.config import KREA2_CONFIG
+
+    wmap = json.loads((path / DIFFUSERS_INDEX).read_text())["weight_map"]
+    kmap = diffusers_key_map(cfg or KREA2_CONFIG)
+    extra, missing = sorted(set(wmap) - set(kmap)), sorted(set(kmap) - set(wmap))
+    if extra or missing:
+        raise ValueError(f"{path}: index does not match the model config: "
+                         f"{len(extra)} unknown keys {extra[:3]}, "
+                         f"{len(missing)} missing {missing[:3]}")
+    by_file = {}
+    for dkey, fname in wmap.items():
+        by_file.setdefault(fname, []).append(dkey)
+    for fname in sorted(by_file):
+        for _, okey, t in iter_diffusers_shard(path / fname, kmap,
+                                               by_file[fname]):
+            yield okey, t
+
+
+def save_diffusers_transformer(out_dir, params):
+    """Write a params tree as a one-shard diffusers transformer dir (index +
+    `diffusion_pytorch_model-00001-of-00001.safetensors`), every leaf in its
+    own dtype. Small trees only (tests / smoke runs): the whole tree is
+    gathered on the host."""
+    import json
+    from pathlib import Path
+
+    from safetensors.flax import save_file
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    entries, leaves = _official_entries(params)
+    tensors = {}
+    for name, li, idx, _ in entries:
+        leaf = jnp.asarray(leaves[li])
+        dkey, t = official_to_diffusers(name, leaf if idx is None else leaf[idx])
+        tensors[dkey] = t
+    fname = "diffusion_pytorch_model-00001-of-00001.safetensors"
+    save_file(tensors, str(out / fname))
+    (out / DIFFUSERS_INDEX).write_text(json.dumps(
+        {"metadata": {}, "weight_map": {k: fname for k in sorted(tensors)}}))
+    return out
 
 
 def abstract_krea2_params(cfg, dtype=jnp.float32, unstack=()):

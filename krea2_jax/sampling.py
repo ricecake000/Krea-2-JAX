@@ -1,6 +1,7 @@
 """Flow-matching Euler sampler for the JAX Krea 2 DiT (mirrors sampling.py
 from the official repo)."""
 
+import contextlib
 import math
 from functools import partial
 
@@ -60,10 +61,11 @@ def compact_text(txt, txt_mask, multiple=64):
     )
 
 
-@partial(jax.jit, static_argnames=("cfg", "lora_scale"))
-def _text_tokens(params, lora, cfg, txt, txt_mask, lora_scale):
+@partial(jax.jit, static_argnames=("cfg", "lora_scale", "act_dtype"))
+def _text_tokens(params, lora, cfg, txt, txt_mask, lora_scale, act_dtype=None):
     return text_tokens_forward(
-        params, cfg, txt, txt_mask, lora=lora, lora_scale=lora_scale
+        params, cfg, txt, txt_mask, lora=lora, lora_scale=lora_scale,
+        act_dtype=act_dtype,
     )
 
 
@@ -81,19 +83,19 @@ def cfg_batchable(tok, pos, mask, untok, unpos, unmask):
     jax.jit,
     static_argnames=(
         "cfg", "guidance", "lora_scale", "qchunk", "attn_impl", "attn_mesh",
-        "cfg_batch",
+        "cfg_batch", "act_dtype", "attn_kernel",
     ),
 )
 def _euler_step(
     params, lora, cfg, x, tok, t_curr, dt, pos, mask, untok, unpos, unmask,
     guidance, lora_scale, qchunk, attn_impl="ref", attn_mesh=None,
-    cfg_batch=False,
+    cfg_batch=False, act_dtype=None, attn_kernel=None,
 ):
     t = jnp.full((x.shape[0],), t_curr, dtype=x.dtype)
     fwd = partial(
         dit_forward, params, cfg, lora=lora, lora_scale=lora_scale,
         qchunk=qchunk, remat=False, attn_impl=attn_impl, attn_mesh=attn_mesh,
-        attn_shard="heads",
+        attn_shard="heads", act_dtype=act_dtype, attn_kernel=attn_kernel,
     )
     if (guidance and cfg_batch
             and cfg_batchable(tok, pos, mask, untok, unpos, unmask)):
@@ -131,10 +133,14 @@ def sample_latents(
     mu=None,
     seed=0,
     qchunk=512,
-    attn_impl="ref",   # "ref", "splash" (fused TPU kernel) or "cudnn"
+    attn_impl="ref",   # "ref", "splash" (TPU), "cudnn" or "aiter" (ROCm)
     attn_mesh=None,    # mesh to split splash heads over (multi-device)
     compact=True,      # drop padded text tokens before sampling
     cfg_batch=False,   # CFG: cond + uncond in ONE forward at batch 2B
+    seeds=None,        # per-sample seeds (len B) instead of one `seed`
+    act_dtype=None,    # mixed-dtype params: see model.dit_forward
+    attn_kernel=None,  # aiter: flash_attn_varlen-compatible callable
+    step_ctx=None,     # profiling: step index -> context manager, see below
 ):
     """Euler-integrate the flow ODE. Returns latents (B, C, H/8, W/8).
 
@@ -149,6 +155,13 @@ def sample_latents(
     (e.g. both padded to the same text_rows with compact=False); otherwise
     it falls back to the two-call path (decided at trace time). The default
     False traces exactly the previous two-call step.
+
+    seeds: row i's noise comes from PRNGKey(seeds[i]) alone, so a sample does
+    not depend on the batch it is drawn in (seeds=[s] equals seed=s at B=1).
+
+    step_ctx: when given, step i runs inside `step_ctx(i)` (e.g. a
+    jax.profiler.StepTraceAnnotation) and is waited for before the context
+    exits, so the context spans that step's device work.
     """
     align = cfg.vae_compression * cfg.patch
     if height % align or width % align:
@@ -161,10 +174,17 @@ def sample_latents(
     lat_h, lat_w = height // cfg.vae_compression, width // cfg.vae_compression
     h_tok, w_tok = lat_h // cfg.patch, lat_w // cfg.patch
 
-    rng = jax.random.PRNGKey(seed)
-    noise = jax.random.normal(
-        rng, (B, cfg.channels, lat_h, lat_w), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
+    if seeds is None:
+        noise = jax.random.normal(
+            jax.random.PRNGKey(seed), (B, cfg.channels, lat_h, lat_w),
+            dtype=jnp.float32)
+    else:
+        if len(seeds) != B:
+            raise ValueError(f"{len(seeds)} seeds for a batch of {B}")
+        noise = jnp.concatenate([jax.random.normal(
+            jax.random.PRNGKey(int(s)), (1, cfg.channels, lat_h, lat_w),
+            dtype=jnp.float32) for s in seeds])
+    noise = noise.astype(jnp.bfloat16)
     x = patchify(noise, cfg.patch)
 
     lora_scale = float(lora_scale)
@@ -173,7 +193,8 @@ def sample_latents(
         if compact:
             states, states_mask = compact_text(states, states_mask)
         states_mask = jnp.asarray(states_mask)
-        tok = _text_tokens(params, lora, cfg, states, states_mask, lora_scale)
+        tok = _text_tokens(params, lora, cfg, states, states_mask, lora_scale,
+                           act_dtype=act_dtype)
         pos, mask = build_positions_and_mask(states_mask, h_tok, w_tok)
         return tok, pos, mask
 
@@ -186,13 +207,18 @@ def sample_latents(
         untok, unpos, unmask = tok, pos, mask  # unused placeholders
 
     ts = timestep_schedule(cfg, x.shape[1], steps, mu=mu)
-    for tcurr, tprev in zip(ts[:-1], ts[1:]):
-        x = _euler_step(
-            params, lora, cfg, x, tok, tcurr, tprev - tcurr, pos, mask,
-            untok, unpos, unmask,
-            guidance=float(guidance) if use_cfg else 0.0,
-            lora_scale=lora_scale, qchunk=qchunk,
-            attn_impl=attn_impl, attn_mesh=attn_mesh,
-            cfg_batch=bool(cfg_batch) and use_cfg,
-        )
+    for i, (tcurr, tprev) in enumerate(zip(ts[:-1], ts[1:])):
+        ctx = step_ctx(i) if step_ctx is not None else contextlib.nullcontext()
+        with ctx:
+            x = _euler_step(
+                params, lora, cfg, x, tok, tcurr, tprev - tcurr, pos, mask,
+                untok, unpos, unmask,
+                guidance=float(guidance) if use_cfg else 0.0,
+                lora_scale=lora_scale, qchunk=qchunk,
+                attn_impl=attn_impl, attn_mesh=attn_mesh,
+                cfg_batch=bool(cfg_batch) and use_cfg,
+                act_dtype=act_dtype, attn_kernel=attn_kernel,
+            )
+            if step_ctx is not None:
+                x.block_until_ready()
     return unpatchify(x, cfg.patch, cfg.channels, lat_h, lat_w)

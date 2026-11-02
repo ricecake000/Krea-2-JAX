@@ -198,3 +198,25 @@ def test_export_full_refuses_mismatched_base(train_state, tiny_ckpt, bad, tmp_pa
     assert "do not match" in proc.stderr and victim in proc.stderr, proc.stderr[-2000:]
     assert dest.read_bytes() == b"previous export"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["bad.safetensors", "model.safetensors"]
+
+
+def test_diffusers_dir_round_trip_keeps_dtypes(tmp_path):
+    from krea2_jax import checkpoint as ck
+    from krea2_jax.config import Krea2Config
+    from krea2_jax.model import build_positions_and_mask, dit_forward
+    cfg = Krea2Config(**TINY)
+    lp = jax.tree_util.tree_flatten_with_path(ck.abstract_krea2_params(cfg))[0]
+    f32 = lambda p: "scale" in p or "mod" in p or "first" in p or "tproj" in p
+    vals = [jax.random.normal(jax.random.PRNGKey(i), l.shape).astype(
+        jnp.float32 if f32(jax.tree_util.keystr(p)) else jnp.bfloat16) for i, (p, l) in enumerate(lp)]
+    params = jax.tree.unflatten(jax.tree.structure(ck.abstract_krea2_params(cfg)), vals)
+    assert ck.official_to_diffusers("blocks.1.mod.lin", jnp.zeros(6 * cfg.features))[1].shape == (6, cfg.features)
+    assert [ck.official_to_diffusers_key(k) for k in ("blocks.3.attn.qknorm.qnorm.scale", "txtmlp.0.scale", "tproj.1.bias")] == [
+        "transformer_blocks.3.attn.norm_q.weight", "txt_in.norm.weight", "time_mod_proj.bias"]
+    back = load_krea2_params(str(ck.save_diffusers_transformer(tmp_path / "t", params)), cfg=cfg)
+    for a, b in zip(vals, jax.tree.leaves(back)):
+        assert a.dtype == b.dtype and np.array_equal(np.asarray(a, np.float32), np.asarray(b, np.float32))
+    pos, mask = build_positions_and_mask(jnp.ones((1, 8), bool), 2, 2)
+    out = dit_forward(back, cfg, jnp.zeros((1, 4, 16), jnp.bfloat16), jnp.zeros((1, 8, 3, 64)), jnp.ones((1,)),
+                      pos, mask, remat=False, act_dtype=jnp.bfloat16)
+    assert out.dtype == jnp.bfloat16 and bool(jnp.isfinite(out.astype(jnp.float32)).all())
