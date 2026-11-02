@@ -68,8 +68,8 @@ import train_full as tf
 from aot_analysis import bucket_and_text_config
 from jax.sharding import NamedSharding, PartitionSpec as P
 from krea2_jax.checkpoint import (
-    abstract_krea2_params, batch_sharding, load_krea2_params, make_mesh,
-    param_shardings,
+    abstract_krea2_params, batch_sharding, fuse_projection_params,
+    load_krea2_params, make_mesh, param_shardings,
 )
 from krea2_jax.config import KREA2_CONFIG
 from krea2_jax.model import build_positions_and_mask_bucketed, dit_forward
@@ -112,6 +112,16 @@ def parse_args(argv=None):
                     help="as train_full.py --layer-loop: 'unroll' keeps the "
                          "blocks as per-layer arrays (no per-layer slice/DUS "
                          "copies, longer compile)")
+    ap.add_argument("--fuse-proj", choices=["off", "concat", "prefused"],
+                    default="off",
+                    help="projection fusion: 'concat' concatenates each "
+                         "attention's wq/wk/wv/gate (and each SwiGLU's "
+                         "gate/up) weights inside the step and runs one GEMM "
+                         "(dit_forward fuse_proj='concat'); 'prefused' holds "
+                         "the weights in the fused layout "
+                         "(checkpoint.fuse_projection_params, applied to the "
+                         "abstract tree before sharding/random init; "
+                         "--random-weights only); 'off' = separate GEMMs")
     ap.add_argument("--base-sharding", choices=["fsdp", "replicate"],
                     default="fsdp",
                     help="weight placement (train mode always keeps the fp32 "
@@ -135,6 +145,10 @@ def parse_args(argv=None):
                          "this directory (jax.profiler, perfetto trace); they "
                          "are excluded from the reported timing")
     args = ap.parse_args(argv)
+    if args.fuse_proj == "prefused" and not args.random_weights:
+        ap.error("--fuse-proj prefused needs --random-weights (the fused "
+                 "layout is built on the abstract tree; fusing a loaded "
+                 "checkpoint is not implemented)")
     if args.profile_dir is not None and args.steps <= PROFILE_STEPS:
         ap.error(f"--profile-dir needs --steps > {PROFILE_STEPS} (the "
                  f"{PROFILE_STEPS} profiled steps are not timed)")
@@ -238,7 +252,8 @@ def main(argv=None):
           f"{args.img_tokens} img rows + {args.text_rows} text rows -> "
           f"{padded} tokens) | remat {args.remat_policy} | "
           f"attn {args.attn} | act-sharding {args.act_sharding} | "
-          f"layer-loop {args.layer_loop} | base {args.base_sharding}")
+          f"layer-loop {args.layer_loop} | base {args.base_sharding} | "
+          f"fuse-proj {args.fuse_proj}")
 
     # --- weights ---
     wdtype = jnp.float32 if args.mode == "train" else jnp.bfloat16
@@ -246,6 +261,8 @@ def main(argv=None):
     unstack = ("blocks",) if args.layer_loop == "unroll" else ()
     if args.random_weights:
         abstract = abstract_krea2_params(cfg, dtype=wdtype, unstack=unstack)
+        if args.fuse_proj == "prefused":
+            abstract = fuse_projection_params(abstract)
         pshard = param_shardings(abstract, mesh, args.base_sharding)
         params = random_params(abstract, pshard, args.seed, wdtype)
     else:
@@ -268,10 +285,12 @@ def main(argv=None):
     ])
     remat = tf.REMAT_MODES[args.remat_policy]
     act = tf.act_sharding_for(hp, mesh)
+    # prefused: the fused keys select the fused path; the flag stays "off"
+    model_fuse = "concat" if args.fuse_proj == "concat" else "off"
     fwd_kw = dict(lora=None, qchunk=args.qchunk, remat=remat,
                   attn_impl=args.attn, attn_mesh=mesh,
                   attn_block=args.attn_block, act_sharding=act,
-                  layer_loop=args.layer_loop)
+                  layer_loop=args.layer_loop, fuse_proj=model_fuse)
 
     def make_inputs(img, hw, txt_mask, key):
         k_t, k_n = jax.random.split(key)
@@ -335,6 +354,7 @@ def main(argv=None):
         train_step = tf.make_train_step(
             cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
             args.img_tokens, mu_override=args.timestep_mu,
+            fuse_proj=model_fuse,
         )
         params = (params, opt_state, ema)
 

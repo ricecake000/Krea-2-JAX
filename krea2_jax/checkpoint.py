@@ -261,6 +261,58 @@ def abstract_krea2_params(cfg, dtype=jnp.float32, unstack=()):
     }
 
 
+ATTN_FUSE_KEYS = ("wq", "wk", "wv", "gate")   # -> "wqkvg"
+MLP_FUSE_KEYS = ("gate", "up")                # -> "wgu" (down kept)
+
+
+def _concat_leaves(leaves, axis):
+    """jnp.concatenate, or the concatenated ShapeDtypeStruct (no sharding:
+    the caller derives it, e.g. with `param_shardings`)."""
+    if all(isinstance(a, jax.ShapeDtypeStruct) for a in leaves):
+        shape = list(leaves[0].shape)
+        shape[axis] = sum(int(a.shape[axis]) for a in leaves)
+        return jax.ShapeDtypeStruct(tuple(shape), leaves[0].dtype)
+    return jnp.concatenate(leaves, axis=axis)
+
+
+def _fuse_linears(node, keys):
+    weights = [node[k]["weight"] for k in keys]
+    out = {"weight": _concat_leaves(weights, -2)}
+    nb = sum("bias" in node[k] for k in keys)
+    if nb not in (0, len(keys)):
+        raise ValueError(f"bias on only {nb} of {list(keys)}")
+    if nb:
+        out["bias"] = _concat_leaves([node[k]["bias"] for k in keys], -1)
+    return out
+
+
+def fuse_projection_params(tree):
+    """The prefused layout `model.dit_forward` runs as fused projections.
+
+    Every attention dict (sibling keys wq/wk/wv/gate) gets "wqkvg" = the
+    four linears concatenated along the out axis (-2) in that order (biases
+    along -1 when present) and loses those four keys; every SwiGLU dict
+    (gate/up/down) gets "wgu" = [gate; up] and keeps down. The attention
+    "gate" and the MLP "gate" are told apart by their siblings. Works on
+    real arrays or ShapeDtypeStruct leaves, stacked (leading layer axis) or
+    per-layer-list layouts; other leaves are returned as is. Not a
+    checkpoint format: save/export only know the unfused keys.
+    """
+    if isinstance(tree, (list, tuple)):
+        return type(tree)(fuse_projection_params(t) for t in tree)
+    if not isinstance(tree, dict):
+        return tree
+    if set(ATTN_FUSE_KEYS) <= tree.keys():
+        fused = {k: v for k, v in tree.items() if k not in ATTN_FUSE_KEYS}
+        fused["wqkvg"] = _fuse_linears(tree, ATTN_FUSE_KEYS)
+        return fused
+    if {"gate", "up", "down"} <= tree.keys():
+        fused = {k: v for k, v in tree.items() if k not in MLP_FUSE_KEYS}
+        fused["wgu"] = _fuse_linears(tree, MLP_FUSE_KEYS)
+        return fused
+    return {k: fuse_projection_params(v) for k, v in tree.items()}
+
+
 def _get_subtree(tree, keys):
     node = tree
     for k in keys:
