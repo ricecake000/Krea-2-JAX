@@ -59,6 +59,16 @@ dec_s (one image; --est-decode-s-per-mp, 3.0 on gpu = conservative estimate,
 --est-encode-s-per-mp 1.0, measured 0.7-0.8 at q70 s6). Printed once at
 startup as the verbatim line `DRAIN_BUDGET_S=<n>`: send TERM at least that
 long before the deadline (lower it with a smaller --queue-depth or --batch).
+It is also a hard limit: once the stop is DRAIN_BUDGET_S old (measured from
+the first signal) with work still pending (a hung VAE decode, a stalled AVIF
+encode), the drain gives up, logs the verbatim line `DRAIN_TIMEOUT
+pending=<ids>` and goes straight into the bounded shutdown below (decoder and
+pool SIGKILLed); exit 3 when every image recorded in this run has its .avif
+(the pending ids render on resume), else 1. A DRAIN_TIMEOUT on a healthy
+pipeline means the --est-* constants are too low: raise them. Without a stop
+request the end-of-run drain is NOT time-limited (it waits for every
+submitted job; a hang there is the caller's timeout's job, and its TERM then
+starts the bounded drain).
 
 Children: the decode worker and the AVIF pool processes ignore SIGINT/SIGTERM
 (the main process drains) and each runs a watchdog thread that hard-exits
@@ -406,6 +416,12 @@ class Renderer:
         self.cond = threading.Condition(self.lock)
         self.fatal = None
         self.stop = False
+        self.stop_t = None           # monotonic time of the first signal
+        self.timed_out = False       # the stop's drain budget ran out
+        self.abandon = False         # close() gave up the remaining encodes
+        self.pending = {}            # job n -> ids sent to the decoder
+        self.enc_ids = set()         # ids in the AVIF pool
+        self.run_ids = set()         # ids recorded in this run
         self.closing = False         # close() started: collector stops
         self.closed = False          # manifest closed: no more records
         self.inflight = 0            # jobs sent to the decoder, not back yet
@@ -491,12 +507,13 @@ class Renderer:
                     a = self.args
                     with self.cond:
                         self.encoding += 1
+                        self.enc_ids.add(rec["id"])
                     try:
                         fut = self.pool.submit(encode_avif, img, str(path),
                                                a.avif_quality, a.avif_speed,
                                                a.avif_subsampling)
                     except RuntimeError as e:   # pool shut down / broken
-                        self._encode_finished()
+                        self._encode_finished(rec["id"])
                         if not self._quit():
                             self._fail(f"AVIF pool: {e!r}")
                         return
@@ -504,25 +521,28 @@ class Renderer:
                         lambda f, rec=rec, ds=ds: self._encoded(f, rec, ds))
             with self.cond:
                 self.inflight -= 1
+                self.pending.pop(job["n"], None)
                 self.cond.notify_all()
 
-    def _encode_finished(self):
+    def _encode_finished(self, rid):
         self.slots.release()
         with self.cond:
             self.encoding -= 1
+            self.enc_ids.discard(rid)
             self.cond.notify_all()
 
     def _encoded(self, fut, rec, decode_s):
         try:
             self._record(fut, rec, decode_s)
         finally:
-            self._encode_finished()
+            self._encode_finished(rec["id"])
 
     def _record(self, fut, rec, decode_s):
         try:
             nbytes, enc_s = fut.result()
         except BaseException as e:  # noqa: BLE001
-            self._fail(f"AVIF encode of {rec['id']} failed: {e!r}")
+            if not self.abandon:   # else: cancelled/killed by close()
+                self._fail(f"AVIF encode of {rec['id']} failed: {e!r}")
             return
         row = dict(rec, decode_s=round(decode_s, 3), encode_s=round(enc_s, 3),
                    bytes=nbytes,
@@ -535,6 +555,7 @@ class Renderer:
             os.fsync(self.manf.fileno())
             self.done += 1
             self.run_imgs += 1
+            self.run_ids.add(rec["id"])
             self.run_bytes += nbytes
             if rec["id"] in self.excluded_ids:
                 self.excluded_imgs += 1
@@ -561,6 +582,28 @@ class Renderer:
         if self.fatal is not None:
             raise RuntimeError(self.fatal)
 
+    def request_stop(self):
+        """Signal handler side: no new batch; the drain deadline runs from
+        the FIRST signal (a repeated signal does not extend it)."""
+        if self.stop_t is None:
+            self.stop_t = time.monotonic()
+        self.stop = True
+
+    def deadline_hit(self):
+        """True once a stop was requested DRAIN_BUDGET_S ago; the first
+        call that sees it logs `DRAIN_TIMEOUT pending=<ids>`. Never call it
+        while holding self.cond (log() takes the same lock)."""
+        if self.stop_t is None or (time.monotonic()
+                                   < self.stop_t + self.drain_budget):
+            return False
+        if not self.timed_out:
+            self.timed_out = True
+            with self.cond:
+                ids = sorted({i for v in self.pending.values() for i in v}
+                             | self.enc_ids)
+            self.log(f"DRAIN_TIMEOUT pending={','.join(ids) or '-'}")
+        return True
+
     def step_ctx(self, _i):
         """Per sampler step (the sampler syncs each step when given one):
         abort the batch on an error or a stop request."""
@@ -583,53 +626,78 @@ class Renderer:
             try:
                 with self.cond:
                     self.inflight += 1
+                    self.pending[job["n"]] = [r["id"] for r in job["recs"]]
                 self.dec_in.put(job, timeout=1)
                 return True
             except queue.Full:
                 with self.cond:
                     self.inflight -= 1
+                    self.pending.pop(job["n"], None)
                 if not self.worker.is_alive():
                     self._fail("decode worker died")
 
     def drain_decoder(self):
-        """Wait until every submitted job came back from the decoder."""
-        with self.cond:
-            while self.inflight > 0 and self.fatal is None:
-                self.cond.wait(timeout=5)
+        """Wait until every submitted job came back from the decoder.
+        Unbounded without a stop request (a hang there is the caller's
+        timeout's job); once a stop was requested, StopRequested when its
+        drain budget runs out (DRAIN_TIMEOUT, close() then kills)."""
+        while True:
+            with self.cond:
+                if self.inflight <= 0 or self.fatal is not None:
+                    break
+                self.cond.wait(timeout=1)
+            if self.deadline_hit():
+                raise StopRequested
         self.check()
 
     def close(self):
         """Bounded on every path: stop the decoder (sentinel when it can
         still take it, join with a timeout, then SIGKILL), wait for the
         encodes (up to the drain budget; 5 s after an error), shut the pool
-        down and SIGKILL any worker left, close the manifest."""
-        if self.fatal is None and self.worker.is_alive():
+        down and SIGKILL any worker left, close the manifest. Once a stop
+        was requested every wait also ends at the stop's drain deadline;
+        after a DRAIN_TIMEOUT (or an error) the decoder gets no sentinel
+        and the kills follow within seconds."""
+        def quick():
+            return self.fatal is not None or self.deadline_hit()
+
+        if not quick() and self.worker.is_alive():
             try:
                 self.dec_in.put(None, timeout=5)
             except queue.Full:
                 pass
             else:   # the collector returns on "done" after the last result
-                self.collector.join(timeout=self.drain_budget)
+                end = time.monotonic() + self.drain_budget
+                while (self.collector.is_alive() and not quick()
+                       and time.monotonic() < end):
+                    self.collector.join(timeout=1)
         self.closing = True
         self.collector.join(timeout=5)
-        self.worker.join(timeout=5 if self.fatal is None else 1)
+        self.worker.join(timeout=1 if quick() else 5)
         if self.worker.is_alive():
             self.log("killing the decode worker")
             self.worker.kill()
             self.worker.join(timeout=10)
         self.dec_in.cancel_join_thread()   # no exit-time feeder join
-        deadline = time.time() + (self.drain_budget if self.fatal is None
+        end = time.monotonic() + (self.drain_budget if self.fatal is None
                                   else 5)
-        with self.cond:
-            while self.encoding > 0 and time.time() < deadline:
-                self.cond.wait(timeout=1)
-            left = self.encoding
+        while True:
+            with self.cond:
+                left = self.encoding
+            if not left or quick() or time.monotonic() >= end:
+                break
+            with self.cond:
+                self.cond.wait_for(lambda: self.encoding == 0, timeout=1)
+        with self.lock:
+            self.abandon = True   # cancelled/killed encodes are no error
         if left:   # log() takes the lock: never call it under self.cond
-            self.log(f"giving up on {left} AVIF encodes")
+            self.log(f"giving up on {left} AVIF encodes (render on resume)")
         procs = list((self.pool._processes or {}).values())
         self.pool.shutdown(wait=False, cancel_futures=True)
+        end = time.monotonic() + (1 if left or quick() else 5)
         for p in procs:
-            p.join(timeout=5)
+            p.join(timeout=max(0.0, end - time.monotonic()))
+        for p in procs:
             if p.is_alive():
                 p.kill()
                 p.join(timeout=10)
@@ -673,6 +741,8 @@ def main(argv=None):
     (out / "tmp").mkdir(exist_ok=True)
     for f in (out / "tmp").glob("*"):
         f.unlink()
+    for f in (out / "img").glob("*.avif.tmp.*"):   # killed mid-encode
+        f.unlink()
     prompts = load_prompts(args.prompts, args.limit)
     torn = repair_manifest(out)   # BEFORE the done set (record = full line)
     done = done_ids(out)
@@ -701,7 +771,7 @@ def main(argv=None):
 
     def on_signal(signum, _frame):
         stop_sig.append(signum)
-        r.stop = True
+        r.request_stop()
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
@@ -716,8 +786,9 @@ def main(argv=None):
     rc = 1
     try:
         rc = render(args, cfg, r, todo)
-    except StopRequested:   # during the profile phase; close() drains
-        r.log("stop requested during profiling: draining")
+    except StopRequested:   # profile phase (close() drains) or DRAIN_TIMEOUT
+        if not r.timed_out:
+            r.log("stop requested during profiling: draining")
         rc = 0
     except BaseException as e:  # noqa: BLE001
         if r.fatal is None:
@@ -731,6 +802,12 @@ def main(argv=None):
             rc = 1
     if r.fatal is not None:
         rc = 1
+    elif r.timed_out and rc == 0:   # invariant: record only a written .avif
+        bad = sorted(i for i in r.run_ids
+                     if not (out / "img" / f"{i}.avif").is_file())
+        if bad:
+            r.log(f"ERROR recorded without an .avif: {bad}")
+        rc = 1 if bad else 3
     final = done_ids(out) & {str(p["id"]) for p in prompts}
     wall = time.time() - r.t_start if r.t_start else 0.0
     spi = r.s_per_img()
