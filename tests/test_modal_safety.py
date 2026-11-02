@@ -228,6 +228,38 @@ def test_stage_pins_input_generation_and_needs_every_tar_in_package(tmp_path, mo
         (src / mcl.STAGE_JSON).read_text())["generation"]
 
 
+@pytest.mark.parametrize("case", ["ok", "drive changed", "bound to factor 1"])
+def test_stage_reuses_another_package_only_at_its_generation(tmp_path, monkeypatch, case):
+    pa, pq = pytest.importorskip("pyarrow"), pytest.importorskip("pyarrow.parquet")
+    monkeypatch.setattr(mcl, "VOL_OUT", str(tmp_path / "krea2"))
+    monkeypatch.setattr(mcl, "VOL_SRC", str(tmp_path / "src"))
+    src, out, calls = tmp_path / "src/v3", tmp_path / "krea2-v3-512", []
+    (src / "data").mkdir(parents=True), (src / "data/train-0000.tar").write_bytes(b"t")
+    pq.write_table(pa.table({"id": [0], "tar": ["data/train-0000.tar"]}), src / "metadata.parquet")
+    listing = {"metadata.parquet": (src / "metadata.parquet").stat().st_size, "data/train-0000.tar": 1}
+    files = {p: {"size": n, "md5": "m"} for p, n in listing.items()}
+    gen = mcl.input_generation(files)
+    (src / mcl.STAGE_JSON).write_text(st := json.dumps({"src_remote": mcl.resolve_drive_src("selection_v3/package"),
+                                                         "generation": gen, "files": files}))
+    if case == "bound to factor 1":
+        out.mkdir(parents=True), (out / mcl.GEN_JSON).write_text(json.dumps({"generation": gen}))
+    r = mcl.stage_impl(SimpleNamespace(reload=lambda: None, commit=lambda: None), "v3-512", "selection_v3/package",
+                       runner=fake_rclone(calls, {**listing, **({"data/train-0000.tar": 2} if "drive" in case else {})}),
+                       env={"RCLONE_CONF_B64": "eA=="}, conf_path=str(tmp_path / "c.conf"), src_name="v3", downscale=2)
+    assert r["ok"] is (case == "ok") and not [c for c in calls if "sync" in c]
+    assert r["ok"] or ("holds input generation" if "drive" in case else "is bound to") in r["error"]
+    assert (src / mcl.STAGE_JSON).read_text() == st   # the reused package is never re-staged or touched
+    job = mcl.resolve_job("v3-512", mode="worker", src_name="v3", downscale=2)
+    assert case != "ok" or (mcl.staged_generation(job) == gen and json.loads((out / mcl.GEN_JSON).read_text())
+                            == {"src_remote": json.loads(st)["src_remote"], "generation": gen, "src_name": "v3",
+                                "downscale": 2})
+    assert mcl.finalize_cmd(out=job["out"], tar_dir=job["src"], downscale=2)[-4:] == [
+        "--downscale", "2", "--tar-dir", str(src)]
+    for bad in ({"src_name": "v3"}, {"downscale": 2}):   # a worker / finalize of another source or factor
+        with pytest.raises(SystemExit):
+            mcl.staged_generation(mcl.resolve_job("v3-512", mode="worker", **bad))
+
+
 TE = {"repo": mef.TEXT_REPO, "revision": "te-rev-1"}
 HF_ID = {"repo": mef.BASE_REPO, "revision": "c0ffee", "file": mef.BASE_FILE, "size": 25_000}
 R2_ID = {"key": "krea2-fullft/run2/model.safetensors", "etag": "e2", "size": 25_600}

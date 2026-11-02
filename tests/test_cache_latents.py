@@ -183,3 +183,29 @@ def test_pipelined_encode_matches_sync_reference(src, tmp_path):
             ref.update({str(s["id"]): lat[k].view(torch.int16).numpy() for k, s in enumerate(g[i:i + 2])})
     assert set(got := read_shard(tmp_path / "a.safetensors")[1]) == set(ref) and all(
         np.array_equal(got[k].view(np.int16), ref[k]) for k in ref)
+
+
+def test_downscale_halves_latents_and_parquet_and_never_mixes_factors(src, cache, tmp_path):
+    """--downscale 2: one exact LANCZOS 2x resize -> (16, h/16, w/16); halved parquet the trainer opens; no mixing."""
+    from krea2_jax.data import BucketDataset
+    from krea2_jax.text_template import CaptionTemplate
+    out, enc = tmp_path / "c512", ["--tar-dir", str(src[0]), "--vae-stub", "--device", "cpu", "--decode-threads", "2"]
+    cl.main(enc + ["--out", str(out), "--batch", "2", "--downscale", "2"])
+    cl.main(["--tar-dir", str(src[0]), "--out", str(out), "--write-manifest", "--downscale", "2"])
+    shard = out / "latents/train-0000.safetensors"
+    meta, tensors = read_shard(shard)
+    assert meta["downscale"] == "2" and json.loads((out / "latents/manifest.json").read_text())["downscale"] == 2
+    for sid, w, h, _, _ in SAMPLES[:2]:   # stored at their bucket size
+        im = Image.open(io.BytesIO(src[1][sid])).convert("RGB").resize((w // 2, h // 2), Image.LANCZOS)
+        x = torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1).float()[None] / 127.5 - 1.0
+        want = cl.StubEncoder()(x)[0].to(torch.bfloat16).view(torch.int16).numpy()
+        assert tensors[str(sid)].shape == (16, h // 16, w // 16) and np.array_equal(tensors[str(sid)].view(np.int16), want)
+    rows = pq.read_table(out / "metadata.parquet", columns=["id", "bucket_w", "bucket_h"]).to_pylist()
+    assert rows == [{"id": s[0], "bucket_w": s[1] // 2, "bucket_h": s[2] // 2} for s in SAMPLES]
+    assert BucketDataset(out, CaptionTemplate(make_tiny_tokenizer(tmp_path / "tok"), text_rows=16)).n == len(SAMPLES)
+    assert cl.shard_done(shard, "stub", TAR0, 3, downscale=2) and not cl.shard_done(shard, "stub", TAR0, 3)
+    for argv, msg in ((enc + ["--out", str(out)], "another downscale factor"),
+                      (enc + ["--out", str(cache), "--downscale", "2"], "another downscale factor"),
+                      (["--tar-dir", str(src[0]), "--out", str(out), "--write-manifest"], "wrong downscale: 2")):
+        with pytest.raises(SystemExit, match=msg):
+            cl.main(argv)
