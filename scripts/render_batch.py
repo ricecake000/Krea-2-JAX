@@ -37,7 +37,15 @@ same command. A manifest record counts only when newline-terminated: a torn
 last record (even complete JSON) is cut at startup BEFORE the done set is
 computed, so its image renders again. Exit 0 when every (limited) prompt is
 done, 3 after a clean SIGTERM/SIGINT stop (pipeline drained, manifest
-consistent), 1 on errors.
+consistent), 1 on errors, 4 when another renderer holds OUTDIR.
+
+OUTDIR lock: before any cleanup, manifest repair or read, the process takes
+an exclusive non-blocking flock on OUTDIR/.render.lock and holds it for its
+whole lifetime (the fd is close-on-exec, so the spawned decode worker and
+AVIF pool never hold it; the kernel drops it when the process dies, kill -9
+included). If it is held, the verbatim line
+`RENDER_LOCKED <OUTDIR> held by another renderer` is printed and the
+process exits 4 without touching OUTDIR.
 
 Clean stop (SIGTERM/SIGINT): no new batch is admitted from that moment. The
 DiT batch being sampled is aborted at its next sampler-step boundary (steps
@@ -133,6 +141,7 @@ value of that flag).
 """
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -152,6 +161,7 @@ TEXT_ROWS = 512
 AVIF_QUALITY, AVIF_SPEED, AVIF_SUBSAMPLING = 70, 6, "4:2:0"
 JAX_MEM_FRACTION = 0.6
 MANIFEST, LOG = "manifest.jsonl", "render.log"
+_OUT_LOCK = None   # fd of OUTDIR/.render.lock, held until exit (main)
 
 
 def parse_args(argv=None):
@@ -737,6 +747,18 @@ def main(argv=None):
     args = parse_args(argv)
     setup_env(args)   # before anything can import jax
     out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    # Held for the process lifetime (module-global ref): no cleanup or
+    # manifest repair may run under a live renderer on the same OUTDIR.
+    # os.open fds are non-inheritable (O_CLOEXEC); spawn children exec.
+    global _OUT_LOCK
+    _OUT_LOCK = os.open(out / ".render.lock",
+                        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(_OUT_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"RENDER_LOCKED {out} held by another renderer", flush=True)
+        return 4
     (out / "img").mkdir(parents=True, exist_ok=True)
     (out / "tmp").mkdir(exist_ok=True)
     for f in (out / "tmp").glob("*"):
