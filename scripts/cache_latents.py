@@ -10,7 +10,9 @@ exactly like cache_dataset.VaeEncoder) as bf16.
 
 VAE encode path (--vae-impl, scripts/vae_fast.py): "ref" = diffusers
 vae.encode (default), "2d" = equivalent single-frame 2D conv encoder, "2d-compile"
-= the same under torch.compile. Recorded as shard metadata "vae_impl"
+= the same under torch.compile, "2d-compile-cl" = 2d-compile with module and
+input in channels_last (latents still come out contiguous NCHW). Recorded as
+shard metadata "vae_impl"
 (informational: shard_done ignores it, so shards of any impl stay valid).
 
 Output (<out>):
@@ -568,7 +570,8 @@ def build_parser():
     ap.add_argument("--vae-impl", choices=VAE_IMPLS, default="ref",
                     help="VAE encode path (scripts/vae_fast.py): ref = "
                          "diffusers vae.encode, 2d = equivalent single-frame "
-                         "2D encoder, 2d-compile = 2d under torch.compile; "
+                         "2D encoder, 2d-compile = 2d under torch.compile, "
+                         "2d-compile-cl = 2d-compile in channels_last; "
                          "stored as shard metadata vae_impl")
     ap.add_argument("--decode-threads", type=int, default=6,
                     help="CPU threads decoding WebP ahead of the VAE")

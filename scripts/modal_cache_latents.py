@@ -20,11 +20,14 @@ HF_HOME=/vol/hf, and reports whether the HF token can write. Then one
 ~1 MP so the per-image cost is near-constant) with cache_latents.decode, time
 single-threaded decode, then per VAE encode path of --impls
 (scripts/vae_fast.py: ref = diffusers, 2d = single-frame 2D encoder,
-2d-compile = 2d under torch.compile): a correctness gate on 2 real images
+2d-compile = 2d under torch.compile, 2d-compile-cl = 2d-compile with module
+and input in channels_last; the default --impls leaves 2d-compile-cl out,
+pass it explicitly): a correctness gate on 2 real images
 against ref (gate_check: with TF32 off, fp32 posterior mean, std and seeded
 normalized sample max rel error < 1e-4; in bf16, mean and std error vs the
 fp32 ref <= 1.5 x the ref's own bf16 error + 1e-3; else the impl is skipped;
-the first bf16 call of 2d-compile is its compile time), then a batch ladder 4/8/16/32 of the impl
+the first bf16 call of 2d-compile(-cl) is its compile time), then a batch
+ladder 4/8/16/32 of the impl
 on the CPU float32 tensors exactly like production (stack + H2D + encode +
 bf16 D2H, 1 CPU thread), each >= max(64 images, 3 batches) and >= 10 s after
 one warmup call, stopping at the first OOM. A GPU type that is unavailable
@@ -36,7 +39,8 @@ within 5% of it is a tie, broken by higher img/s) and the exact build
 command (incl. --vae-impl). torch.compile artifacts live in /vol/inductor,
 so the build workers reuse the bench's compile.
 Output: /home/mj/krea2-ops/mi350x/results/modal/cache_bench_<ts>/{report.md,bench.json}.
-Rough cost of a full bench: ~10 min per GPU type with all three impls.
+Rough cost of a full bench: ~10 min per GPU type with the three default
+impls (+ one more compile with 2d-compile-cl).
 
 Mode 2 (--build): `prep` (VAE only; aborts before any GPU starts when the
 token is clearly read-only), then --containers `build_worker` containers on
@@ -82,8 +86,9 @@ parquet names is in the listing and on disk, and records the generation in
 Then finalize_r2's pre-check (generation, the prefix, and a write probe
 object .write-probe-<random> written + deleted under it, so read-only
 credentials fail here); a failure of either stops before any GPU starts.
-Then the cost estimate (build_estimate at the measured v2 rate, the staged
-row count), prep (VAE only; no HF write check), the workers
+Then the cost estimate (build_estimate at a measured rate of the same
+gpu/impl/batch, MEASURED_RATES, and the staged row count), prep (VAE only;
+no HF write check), the workers
 (cache_latents.py --tar-dir /vol/src/NAME --out /vol/krea2-NAME), and
 `finalize_r2` (CPU, secret krea2-r2 only, never HF): --write-manifest
 against the staged parquet, then rclone copy --checksum of metadata.parquet +
@@ -99,22 +104,29 @@ replaced, metadata.parquet included). A prefix without one is resumed.
 it, are refused.
 
 v3 recipe (package gdrive:danbooru_pipeline/selection_v3/package, 196,099
-images / 200 tars; no bench needed again: the v2 build's B200 setup):
+images / 200 tars; no bench needed again: the v2 build's B200 setup with
+the channels_last impl of the 11/02 profile, parity-checked there):
     modal run scripts/modal_cache_latents.py --stage-only --cache-name v3 \
         --src-drive selection_v3/package           # optional: CPU only, early
     modal run --detach scripts/modal_cache_latents.py --build --cache-name v3 \
         --src-drive selection_v3/package --dest-r2 latents_v3/ --gpu B200 \
         --containers 1 --batch 4 --cpu 8 --worker-timeout-h 4 \
-        --vae-impl 2d-compile
+        --vae-impl 2d-compile-cl
     modal run scripts/modal_cache_latents.py --finalize-only --cache-name v3 \
         --dest-r2 latents_v3/                      # after a laptop disconnect
-Estimate (build_estimate, prices of PRICES_DATE, v2 rate 41.0 img/s per
-B200 container): 1 x B200 = $9.50 for the GPU container (1.33 GPU-h + 3
-min startup at $6.88/h), ~83 min wall (user 11/02: one container, wall time
-does not matter; 2 x B200 = $9.84 / ~43 min); plus the CPU stage +
-finalize_r2 containers (cents to well under $1) and R2 storage (~100 GB,
-~$1.5/month). --worker-timeout-h 4 is ~2.9x the ~1.4 h wall (the cost model
-itself says 3). The training node downloads the cache with DATA_SOURCE=r2
+Estimate (build_estimate, prices of PRICES_DATE, user 11/02: one container,
+wall time does not matter): 2d-compile-cl at the B200 profile's run_ladder
+rate 110.5 img/s (PROFILE_CL_RATE; no image decode, so optimistic: the v2
+build ran at 41.0 img/s where run_ladder measured 59.0 for 2d-compile, and 8
+decode threads may not feed 110 img/s): 1 x B200 = $3.74 for the GPU
+container (0.49 GPU-h + 3 min startup at $6.88/h), ~33 min wall. Fallback
+--vae-impl 2d-compile (the v2 build's impl, v2 rate 41.0 img/s; also the
+cl cost if it only reaches that rate): 1 x B200 = $9.50 (1.33 GPU-h), ~83
+min wall (2 x B200 = $9.84 / ~43 min). Plus the CPU stage + finalize_r2
+containers (cents to well under $1) and R2 storage (~100 GB, ~$1.5/month).
+--worker-timeout-h 4 is a cap, not a charge: ~2.9x the v2 rate's ~1.4 h
+wall (the cost model says 3 h at the v2 rate, 2 h at the profile rate).
+The training node downloads the cache with DATA_SOURCE=r2
 DATA_R2_PREFIX=latents_v3 (krea2-ops/node).
 
 Mode 4 (--profile): where the encoder's GPU time goes (scripts/vae_profile.py)
@@ -212,12 +224,14 @@ MIN_SECONDS = 10.0
 DECODE_TIMING_N = 32     # single-threaded decode timing sample
 DECODE_POOL = 16         # threads decoding the bench set (8 physical cores)
 BENCH_CPU = 8
-BENCH_TIMEOUT_S = 45 * 60   # one bench container: 3 impls incl. 2 compiles
+BENCH_TIMEOUT_S = 45 * 60   # one bench container: the 3 default impls
 BENCH_WAIT_S = 75 * 60   # local wait for all bench containers (incl. queueing)
 # VAE encode paths (scripts/vae_fast.py IMPLS; repeated here so this module
 # imports without torch)
-VAE_IMPLS = ("ref", "2d", "2d-compile")
-DEFAULT_IMPLS = ",".join(VAE_IMPLS)
+VAE_IMPLS = ("ref", "2d", "2d-compile", "2d-compile-cl")
+# --bench default: 2d-compile-cl (one more compile pair) only on request
+BENCH_DEFAULT_IMPLS = ("ref", "2d", "2d-compile")
+DEFAULT_IMPLS = ",".join(BENCH_DEFAULT_IMPLS)
 # correctness gate of an impl vs ref on the real VAE (gate_check):
 #   fp32: posterior mean, std and seeded normalized sample max rel < CHECK_TOL
 #   production dtype (bf16): impl mean/std error vs ref fp32 <=
@@ -335,6 +349,19 @@ FINALIZE_R2_TIMEOUT_H = 8   # ~2x v2: hash ~100 GB + upload ~100 GB
 # (after VAE load / compile) -> img/s per container
 V2_BUILD = {"gpu": "B200", "impl": "2d-compile", "batch": 4, "cores": 8,
             "img_s": 96_848 / ((17.8 + 21.6) * 60)}
+# measured B200 profile (2026-11-02, /home/mj/krea2-ops/mi350x/results/modal/
+# vae_profile_20261102-102843/report.md, section e): run_ladder at batch 4,
+# 1216x832 seeded inputs, CPU stack + H2D + encode + bf16 D2H on an 8-core
+# container, WITHOUT image decode (a real build also decodes webp on CPU, so
+# its rate may be lower; there run_ladder 2d-compile = 59.0 vs the v2 build's
+# 41.0 img/s, and 8 decode threads may not keep up with 110 img/s)
+PROFILE_CL_RATE = {"gpu": "B200", "impl": "2d-compile-cl", "batch": 4,
+                   "cores": 8, "img_s": 110.5,
+                   "label": "B200 profile run_ladder 2026-11-02, no image "
+                            "decode: the real build decodes webp on CPU and "
+                            "may be slower"}
+# per-container rates render_estimate knows, by (gpu, impl, batch)
+MEASURED_RATES = (dict(V2_BUILD, label="v2 build"), PROFILE_CL_RATE)
 RCLONE_INSTALL = (
     "python -c \"import sys, urllib.request as u; open('/tmp/rclone.zip', "
     "'wb').write(u.urlopen(u.Request(sys.argv[1], headers={'User-Agent': "
@@ -466,7 +493,7 @@ def cost_row(res, n_images=N_IMAGES, overhead_min=DEFAULT_OVERHEAD_MIN,
         "fp32_err": check.get("fp32_mean_max_rel"),
         "bf16_err": check.get("bf16_mean_max_rel"),
         "compile_s": check.get("first_call_s")
-        if res.get("impl") == "2d-compile" else None,
+        if res.get("impl") in ("2d-compile", "2d-compile-cl") else None,
         "peak_gib": res.get("best_peak_gib"), "decode": dec, "cores": cores,
         "usd_h": hourly, "usd_per_1k": hourly / (img_s * 3600) * 1000,
         "hours_1": hours, "overhead_h": over,
@@ -546,7 +573,7 @@ def render_bench_report(results, rows, choice, prep=None,
            f"{CHECK_IMAGES} real images. Gate: fp32 mean, std and seeded "
            f"normalized sample < {CHECK_TOL:g}, bf16 mean and std <= "
            f"{BF16_SLACK:g} x the ref's own bf16 error + {BF16_ABS:g}. "
-           "compile s = first bf16 call of 2d-compile.", ""]
+           "compile s = first bf16 call of 2d-compile(-cl).", ""]
     if prep:
         out += [f"HF token: user {prep.get('whoami')!r}, can write "
                 f"{prep.get('can_write')} ({prep.get('write_reason')})", ""]
@@ -1023,7 +1050,7 @@ def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print,
     -> (checks {impl: {fp32_*_max_rel, bf16_*_max_rel, ref_bf16_*_max_rel,
     first_call_s, ok, fail_reasons[, error]}}, encoders {impl: FastEncoder
     at the production dtype} for the impls that passed). first_call_s is the
-    first production-dtype call (2d-compile: its compile time). factory
+    first production-dtype call (2d-compile(-cl): its compile time). factory
     {name: fn(vae) -> encoder} builds the named impls (variants of the
     profile, scripts/vae_profile.py); the others are vae_fast.make_encoder."""
     import torch
@@ -1109,7 +1136,8 @@ def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print,
     return checks, encoders
 
 
-def bench_gpu_impl(gpu_requested, n_decode, impls=VAE_IMPLS, *, vae=None,
+def bench_gpu_impl(gpu_requested, n_decode, impls=BENCH_DEFAULT_IMPLS, *,
+                   vae=None,
                    tar=None, bucket=BENCH_BUCKET, device="cuda",
                    ladder=LADDER, min_images=MIN_IMAGES,
                    min_seconds=MIN_SECONDS, decode_timing_n=DECODE_TIMING_N,
@@ -1619,16 +1647,21 @@ def build_estimate(n_images, containers, gpu=V2_BUILD["gpu"],
 
 
 def render_estimate(n_images, gpu, cpu, containers, vae_impl, batch):
-    """One line: build_estimate at the measured v2 rate when the build
-    matches its config (gpu, impl, batch), else a note."""
-    v = V2_BUILD
-    if (gpu_key(gpu), vae_impl, batch) != (v["gpu"], v["impl"], v["batch"]):
+    """One line: build_estimate at the MEASURED_RATES entry matching the
+    build's (gpu, impl, batch), labelled with its source, else a note."""
+    key = (gpu_key(gpu), vae_impl, batch)
+    v = next((r for r in MEASURED_RATES
+              if (r["gpu"], r["impl"], r["batch"]) == key), None)
+    if v is None:
+        known = "; ".join(f"{r['gpu']}/{r['impl']}/batch {r['batch']} at "
+                          f"{r['img_s']:.1f} img/s ({r['label']})"
+                          for r in MEASURED_RATES)
         return (f"estimate: no measured rate for {gpu}/{vae_impl}/batch "
-                f"{batch} (measured: {v['gpu']}/{v['impl']}/batch "
-                f"{v['batch']} at {v['img_s']:.1f} img/s per container)")
-    e = build_estimate(n_images, containers, gpu=gpu, cores=cpu)
+                f"{batch} (measured per container: {known})")
+    e = build_estimate(n_images, containers, gpu=gpu, cores=cpu,
+                       img_s=v["img_s"])
     return (f"estimate: {n_images} images on {containers} x {gpu} at "
-            f"{v['img_s']:.1f} img/s each (v2 build): ${e['usd']:.2f} GPU "
+            f"{v['img_s']:.1f} img/s each ({v['label']}): ${e['usd']:.2f} GPU "
             f"containers (${e['usd_h']:.2f}/h each, {e['gpu_h']:.2f} h + "
             f"{containers} x {DEFAULT_OVERHEAD_MIN:g} min startup; memory "
             f"billed by use, modelled as {MEM_GIB} GiB), wall "

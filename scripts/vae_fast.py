@@ -29,18 +29,24 @@ VaeEncoder.to_dtype().
 
 make_encoder(vae_encoder, impl) -> callable with the same contract as
 cache_latents.vae_encode_batch (imgs (N, 3, H, W) in [-1, 1] -> normalized
-latents (N, 16, H/8, W/8), contiguous even when cuDNN / inductor pick a
-channels_last layout); impl "ref" (diffusers), "2d" or "2d-compile"
-(torch.compile(dynamic=True) of the 2D encoder; posterior sampling stays
-eager). The 2d variants turn on torch.backends.cudnn.benchmark.
+latents (N, 16, H/8, W/8), contiguous NCHW even when cuDNN / inductor /
+2d-compile-cl compute in channels_last); impl "ref" (diffusers), "2d",
+"2d-compile" (torch.compile(dynamic=True) of the 2D encoder) or
+"2d-compile-cl" (the same with module weights and input in channels_last:
+no NCHW<->NHWC transpose kernels around cuDNN's NHWC convs; B200 bf16
+batch 4 run_ladder 110.5 vs 59.0 img/s, scripts/vae_profile.py report
+2026-11-02). Posterior sampling stays eager (same noise draw for every
+impl). The 2d variants turn on torch.backends.cudnn.benchmark.
 Parity: tests/test_vae_fast.py (tiny random VAE, CPU fp32).
 """
+
+import copy
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-IMPLS = ("ref", "2d", "2d-compile")
+IMPLS = ("ref", "2d", "2d-compile", "2d-compile-cl")
 
 
 def _cls(m):
@@ -222,6 +228,13 @@ class Encoder2d(nn.Module):
         return x
 
 
+def channels_last_copy(net):
+    """Deep copy of an Encoder2d with its 4D weights in channels_last. A copy
+    because Encoder2d shares Conv2d modules (downsample, attention qkv/proj)
+    with the VAE, whose own layout the ref path must keep."""
+    return copy.deepcopy(net).to(memory_format=torch.channels_last)
+
+
 def posterior(moments):
     """DiagonalGaussianDistribution's (mean, std) of moments (B, 2z, ...)."""
     mean, logvar = torch.chunk(moments, 2, dim=1)
@@ -247,6 +260,12 @@ class FastEncoder:
             self.forward = self.net
             if impl == "2d-compile":
                 self.forward = torch.compile(self.net, dynamic=True)
+            elif impl == "2d-compile-cl":
+                cl = torch.channels_last
+                self.net = channels_last_copy(self.net)
+                compiled = torch.compile(self.net, dynamic=True)
+                self.forward = lambda x: compiled(
+                    x.contiguous(memory_format=cl))
 
     @torch.no_grad()
     def dist(self, imgs):
@@ -265,8 +284,8 @@ class FastEncoder:
         mean, std = self.dist(imgs)
         z = mean + std * torch.randn(mean.shape, device=mean.device,
                                      dtype=mean.dtype)
-        # cuDNN (benchmark) / inductor may pick channels_last; callers
-        # (cache_latents -> safetensors) need the default layout
+        # cuDNN (benchmark) / inductor / 2d-compile-cl may yield channels_last;
+        # callers (cache_latents -> safetensors) need contiguous NCHW
         return ((z - self.mean) / self.std).contiguous()
 
 
