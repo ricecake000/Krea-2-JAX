@@ -12,7 +12,8 @@ still run; a deadline skips sections once `budget_s` is used up):
   stages     eager 2d at the VAE dtype, `batch` images on the device: CUDA
              event time per stage, % of total, achieved TFLOP/s
   parity     check_impls (scripts/modal_cache_latents.py) of the variants
-             2d-compile, 2d-compile-cl (module + input channels_last), 2d on
+             2d-compile, 2d-compile-cl (vae_fast: module + input
+             channels_last), 2d on
              2 seeded images: fp32 err < CHECK_TOL, bf16 err vs the ref's own
   profiler   torch.profiler over `prof_iters` production steps of the
              parity-checked 2d-compile (CPU stack + H2D + encode + bf16 D2H):
@@ -34,7 +35,6 @@ markdown renderer works on the plain result dict.
 """
 
 import contextlib
-import copy
 import gzip
 import math
 import os
@@ -151,22 +151,6 @@ def sdpa_backend_from_kernels(names):
     if re.search(r"gemm|bmm|softmax|nvjet", s):
         return "MATH"
     return None
-
-
-def channels_last_encoder(vae):
-    """2d-compile with module and input in channels_last. The 2D net is a deep
-    copy: Encoder2d shares Conv2d modules (downsample, attention qkv/proj)
-    with the VAE, whose own layout the ref path must keep."""
-    import torch
-    import vae_fast
-
-    enc = vae_fast.make_encoder(vae, "2d")
-    cl = torch.channels_last
-    net = copy.deepcopy(enc.net).to(memory_format=cl)
-    compiled = torch.compile(net, dynamic=True)
-    enc.net = net
-    enc.forward = lambda x: compiled(x.contiguous(memory_format=cl))
-    return enc
 
 
 def max_autotune_encoder(vae):
@@ -327,11 +311,10 @@ def sec_stages(c):
 
 
 def sec_parity(c):
-    factory = {"2d-compile-cl": channels_last_encoder}
     x = c.x_cpu[:CHECK_IMAGES]
     checks, c.encoders = c.check_impls(
         c.vae, list(VARIANTS), x, cuda=c.torch.cuda if c.cuda else None,
-        log=c.log, factory=factory)
+        log=c.log)
     return {"checks": checks}
 
 

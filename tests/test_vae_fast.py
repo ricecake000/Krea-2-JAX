@@ -25,19 +25,24 @@ def tiny_encoder(seed=0):
     return enc
 
 
+@pytest.mark.parametrize("impl", ["2d", "2d-compile-cl"])  # cl eager: torch.compile stubbed below
 @pytest.mark.parametrize("h,w", [(96, 64), (48, 112)])
 @pytest.mark.parametrize("b", [1, 3])
-def test_2d_posterior_matches_reference(h, w, b):
+def test_2d_posterior_matches_reference(h, w, b, impl, monkeypatch):
     import vae_fast
+    monkeypatch.setattr(torch, "compile", lambda net, **kw: net)
     enc = tiny_encoder()
     imgs = torch.rand(b, 3, h, w, generator=torch.Generator().manual_seed(h * 1000 + w + b)) * 2 - 1
     with torch.no_grad():
         m_ref, s_ref = vae_fast.make_encoder(enc, "ref").dist(imgs)
-        m, s = vae_fast.make_encoder(enc, "2d").dist(imgs)
-    assert m.shape == m_ref.shape == (b, 16, h // 8, w // 8)
+        fast = vae_fast.make_encoder(enc, impl)
+        m, s = fast.dist(imgs)
+        z = fast(imgs)  # cache_latents output contract: contiguous NCHW; the VAE's own weights untouched
+    assert m.shape == m_ref.shape == z.shape == (b, 16, h // 8, w // 8) and z.is_contiguous()
+    assert all(p.is_contiguous() for p in enc.vae.parameters())
     for a, r in ((m, m_ref), (s, s_ref)):
         assert ((a - r).abs().max() / r.abs().max()).item() < 1e-5
     import vae_profile  # its stage-split forward (timing, FLOPs) == forward, bitwise
-    net = vae_fast.make_encoder(enc, "2d").net
+    net = fast.net
     with torch.no_grad():
         assert torch.equal(vae_profile.run_stages(net, imgs), net(imgs))

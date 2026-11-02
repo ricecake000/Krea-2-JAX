@@ -111,7 +111,7 @@ REQUIRED_COLS = (("id", "action", "status", "bucket_w", "bucket_h")
 UNAPPLIED_MODES = ("fail", "keep", "remove")
 DEFAULT_GPU = "B200"
 DEFAULT_VAE_IMPL = "2d"   # eager: no compile per (bucket, batch) shape
-VAE_IMPLS = ("ref", "2d", "2d-compile")
+VAE_IMPLS = ("ref", "2d", "2d-compile", "2d-compile-cl")   # vae_fast.IMPLS
 VOL_PATCHES = "/vol/patches"
 ENCODE_TIMEOUT_S = 60 * 60
 
