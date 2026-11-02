@@ -444,7 +444,8 @@ def test_phase_schedule(extra, lrs):
     (["--decay-start", "5"], "--decay-start 5 must be in"),
     (["--decay-start", "50", "--cosine-decay"], "mutually exclusive"),
     (P2 + ["--decay-start", "30"], "decay must start in phase 2"),
-    (["--snapshot-steps", "50,101"], "<= --steps")])
+    (["--snapshot-steps", "50,101"], "must be < --steps"),
+    (["--snapshot-steps", "50,100"], "must be < --steps")])
 def test_phase_args_refused(extra, msg):
     with pytest.raises(SystemExit, match=re.escape(msg)):
         train_full.validate_phase_args(train_full.parse_args(ARGS + extra))

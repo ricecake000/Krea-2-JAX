@@ -44,7 +44,8 @@ decay increment above --min-lr).
 --snapshot-steps a,b,...: after those steps' updates, the raw fp32 params
 are written (official keys, F32) to OUT/snapshots/ for post-hoc averaging
 (scripts/average_snapshots.py); each completed file is announced as
-`snapshot <abs path> <bytes>`.
+`snapshot <abs path> <bytes>`. Snapshot steps must be < --steps (the final
+params are in the final checkpoint / export).
 
 Outputs under --output-dir:
     ckpt/<step>/                   orbax train state (params, opt_state, ema)
@@ -720,7 +721,9 @@ def parse_args(argv=None):
                          "--warmup-steps <= D < --steps, and D >= "
                          "--phase2-start when two-phase")
     ph.add_argument("--snapshot-steps", default="",
-                    help="comma-separated steps (<= --steps) after which the "
+                    help="comma-separated steps (< --steps; the final "
+                         "params are in the final checkpoint/export) after "
+                         "which the "
                          "raw fp32 params are written to "
                          "OUT/snapshots/model_stepNNNNNN_f32.safetensors")
     return ap.parse_args(argv)
@@ -766,9 +769,10 @@ def validate_phase_args(args):
             raise SystemExit(f"--decay-start {D} < --phase2-start {S}: the "
                              "decay must start in phase 2")
     snaps = parse_save_steps(args.snapshot_steps, "--snapshot-steps")
-    if any(s > args.steps for s in snaps):
-        raise SystemExit(f"--snapshot-steps {sorted(snaps)}: every step must "
-                         f"be <= --steps {args.steps}")
+    if any(s >= args.steps for s in snaps):
+        raise SystemExit(f"--snapshot-steps {sorted(snaps)}: the final params "
+                         "are in the final checkpoint/export; snapshot steps "
+                         f"must be < --steps {args.steps}")
     return snaps
 
 

@@ -521,7 +521,7 @@ Useful knobs:
 | `--prefetch` / `--loader-workers` | 4 / 4 | streaming loader queue depth / reader threads |
 | `--phase2-start S` + `--phase2-data-dir/-batch-size/-img-tokens/-lr` | – | two-phase curriculum: steps 1..S on the phase-1 flags, S+1..`--steps` on phase 2 (see below) |
 | `--decay-start D` | – | WSD: linear decay from the LR in force at D to `--min-lr` at `--steps`; not with `--cosine-decay` |
-| `--snapshot-steps` | – | comma-separated steps after which the raw fp32 params go to `snapshots/model_stepNNNNNN_f32.safetensors` (for `scripts/average_snapshots.py`) |
+| `--snapshot-steps` | – | comma-separated steps (< `--steps`; the final params are in the final checkpoint/export) after which the raw fp32 params go to `snapshots/model_stepNNNNNN_f32.safetensors` (for `scripts/average_snapshots.py`) |
 
 The step log prints `loss`, a smoothed `ema_loss`, the pre-clip gradient
 norm (`gnorm`), the LR and `s/it`.
@@ -666,7 +666,8 @@ dataset_fingerprint, n_samples}` is the hard resume key `phase2`;
 present; phase 1's is re-hashed only while it still has steps to run.
 `--resume-new-dataset` and `--cosine-decay` cannot be combined with it.
 
-`--snapshot-steps a,b,...` writes the raw fp32 params (official keys, F32)
+`--snapshot-steps a,b,...` (each < `--steps`: the final params are in the
+final checkpoint/export) writes the raw fp32 params (official keys, F32)
 after those steps to `snapshots/model_stepNNNNNN_f32.safetensors` (never
 rotated by `--keep`; the device->host copy blocks one step, the atomic
 write runs in a background thread joined before exit) and prints
