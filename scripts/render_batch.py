@@ -85,7 +85,8 @@ blocking or ringing at either.
 
 ROCm notes: needs JAX_PLATFORMS=rocm,cpu (the loader stages tensors on the
 CPU device; ',cpu' is appended here when missing) and, for --attn aiter,
-XLA_FLAGS=--xla_gpu_enable_command_buffer= (added here when missing).
+XLA_FLAGS=--xla_gpu_enable_command_buffer= (forced here, replacing any other
+value of that flag).
 """
 
 import argparse
@@ -415,11 +416,16 @@ class Renderer:
                  f"RENDER done={n}/{N} last_id={rec['id']} s_per_img=? ETA=?")
 
     def s_per_img(self):
-        """Steady-state wall seconds per image (warm-up/profile excluded)."""
-        imgs = self.run_imgs - self.excluded_imgs
-        if self.t_start is None or imgs <= 0:
+        """Wall seconds per image this run, warm-up/profile excluded once a
+        steady-state image exists (before that: all images, so it is always
+        a number once one image is done)."""
+        if self.t_start is None or self.run_imgs <= 0:
             return None
-        return max(time.time() - self.t_start - self.excluded_s, 0.0) / imgs
+        wall = time.time() - self.t_start
+        imgs = self.run_imgs - self.excluded_imgs
+        if imgs <= 0 or wall - self.excluded_s <= 0:
+            return wall / self.run_imgs
+        return (wall - self.excluded_s) / imgs
 
     def check(self):
         if self.fatal is not None:
@@ -479,10 +485,11 @@ def setup_env(args):
     plats = os.environ.get("JAX_PLATFORMS")
     if plats and "cpu" not in plats.split(","):
         os.environ["JAX_PLATFORMS"] = plats + ",cpu"
-    flag = "--xla_gpu_enable_command_buffer="
-    if args.attn == "aiter" and flag not in os.environ.get("XLA_FLAGS", ""):
-        os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " "
-                                   + flag).strip()
+    if args.attn == "aiter":   # aiter FFI + HIP graph capture crash
+        keep = [f for f in os.environ.get("XLA_FLAGS", "").split()
+                if not f.startswith("--xla_gpu_enable_command_buffer")]
+        os.environ["XLA_FLAGS"] = " ".join(
+            keep + ["--xla_gpu_enable_command_buffer="])
 
 
 def main(argv=None):
