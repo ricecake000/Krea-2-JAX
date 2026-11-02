@@ -484,7 +484,7 @@ def masked_flow_loss(v, target, n_img):
 
 
 def make_train_step(cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
-                    img_tokens, mu_override=None):
+                    img_tokens, mu_override=None, fuse_proj="off"):
     """The jitted full fine-tuning step (bucketed data, online text encoder).
 
     Returns train_step(params, opt_state, ema, txt_params, img, hw, ids,
@@ -501,7 +501,8 @@ def make_train_step(cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
     fields used: logit_mean, logit_std, qchunk, attn, attn_block,
     remat_policy, ema_decay, act_sharding, layer_loop (params, pshard and
     the opt/ema trees must then hold `blocks` as a per-layer list for
-    "unroll", stacked for "scan"). Shared by train_full.main,
+    "unroll", stacked for "scan"). fuse_proj: dit_forward's (benchmarks
+    only; train_full.main leaves it "off"). Shared by train_full.main,
     scripts/aot_analysis.py (abstract shapes) and scripts/bench_step.py.
     """
     remat = REMAT_MODES[hp.remat_policy]
@@ -541,6 +542,7 @@ def make_train_step(cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
                 lora=None, qchunk=hp.qchunk, remat=remat,
                 attn_impl=hp.attn, attn_mesh=mesh, attn_block=hp.attn_block,
                 act_sharding=act, layer_loop=hp.layer_loop,
+                fuse_proj=fuse_proj,
             )
             return masked_flow_loss(v, target, n_img)
 

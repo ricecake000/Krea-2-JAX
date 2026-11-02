@@ -86,6 +86,19 @@ def parse_args(argv=None):
                     help="as train_full.py --layer-loop: 'unroll' keeps the "
                          "blocks as per-layer arrays (no per-layer slice/DUS "
                          "copies, longer compile)")
+    ap.add_argument("--fuse-proj",
+                    choices=["off", "concat", "concat-attn", "prefused"],
+                    default="off",
+                    help="projection fusion: 'concat' concatenates each "
+                         "attention's wq/wk/wv/gate (and each SwiGLU's "
+                         "gate/up) weights inside the step and runs one GEMM "
+                         "(dit_forward fuse_proj='concat'); 'concat-attn' "
+                         "does that for the attention projections only "
+                         "(SwiGLU gate/up stay two GEMMs); 'prefused' holds "
+                         "the weights in the fused layout "
+                         "(checkpoint.fuse_projection_params, applied to the "
+                         "abstract tree before sharding/init); 'off' = "
+                         "separate GEMMs")
     ap.add_argument("--ema-decay", type=float, default=0.999,
                     help="0 drops the EMA tree from the step")
     ap.add_argument("--qchunk", type=int, default=256,
@@ -253,7 +266,8 @@ def main(argv=None):
 
     import train_full as tf
     from krea2_jax.checkpoint import (
-        abstract_krea2_params, batch_sharding, make_mesh, param_shardings,
+        abstract_krea2_params, batch_sharding, fuse_projection_params,
+        make_mesh, param_shardings,
     )
     from krea2_jax.config import KREA2_CONFIG
     from krea2_jax.qwen3_text import abstract_qwen3_text_params
@@ -298,6 +312,8 @@ def main(argv=None):
     abs_params = abstract_krea2_params(
         cfg, dtype=jnp.float32,
         unstack=("blocks",) if args.layer_loop == "unroll" else ())
+    if args.fuse_proj == "prefused":
+        abs_params = fuse_projection_params(abs_params)
     pshard = param_shardings(abs_params, mesh)
     params = jax.tree.map(
         lambda s, sh: jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=sh),
@@ -327,7 +343,7 @@ def main(argv=None):
           f"{txt_len_total} tokens/sample (prefix {txt_cfg.prefix_len})")
     print(f"step: batch {B} ({B // n_dev}/device) | remat {args.remat_policy} | "
           f"attn {args.attn} | act-sharding {args.act_sharding} | "
-          f"layer-loop {args.layer_loop} | "
+          f"layer-loop {args.layer_loop} | fuse-proj {args.fuse_proj} | "
           f"qchunk {args.qchunk} | ema {args.ema_decay or 'off'}")
 
     hp = tf.parse_args([
@@ -360,6 +376,8 @@ def main(argv=None):
     train_step = tf.make_train_step(
         cfg, hp, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
         args.img_tokens, mu_override=args.timestep_mu,
+        # prefused: the fused keys select the fused path
+        fuse_proj="off" if args.fuse_proj == "prefused" else args.fuse_proj,
     )
     t0 = time.time()
     lowered = train_step.lower(params, opt_state, ema, txt_params, b_img, b_hw,

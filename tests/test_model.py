@@ -11,12 +11,13 @@ import pytest
 
 from helpers import TINY
 from krea2_jax.checkpoint import (
-    abstract_krea2_params, batch_sharding, load_krea2_params, make_mesh,
-    official_key_shapes, param_shardings, save_krea2_params, stack_blocks)
+    abstract_krea2_params, batch_sharding, fuse_projection_params, load_krea2_params,
+    make_mesh, official_key_shapes, param_shardings, save_krea2_params, stack_blocks,
+    unstack_blocks)
 from krea2_jax.config import KREA2_CONFIG, Krea2Config
 from krea2_jax.model import (
     build_positions_and_mask_bucketed, dit_forward, scaled_dot_product_attention,
-    varlen_reference_kernel)
+    swiglu_forward, varlen_reference_kernel)
 
 B, LTXT, NIMG = 8, 6, 64
 HW = np.array([(8, 8), (6, 8), (8, 6), (4, 4)] * 2)
@@ -98,6 +99,37 @@ def test_unroll_list_blocks_matches_scan(tmp_path, mesh):
     with pytest.raises(ValueError, match="layer_loop"):
         dit_forward(params, cfg, *inp[:5], layer_loop="while")
 
+
+@pytest.mark.parametrize("mode,loop", [
+    ("concat", "scan"), ("concat-attn", "scan"), ("prefused", "scan"),
+    ("prefused", "unroll")])
+def test_fused_projections_match_off(mode, loop):
+    """fuse_proj concat / concat-attn / prefused == unfused: output, input + param grads
+    (unfused grads fused); SwiGLU gate/up fused only by concat; fused paths refuse LoRA."""
+    cfg, params, inp = setup(128)
+    params = unstack_blocks(params) if loop == "unroll" else params
+    def loss(p, img, fuse):
+        out = dit_forward(p, cfg, img, *inp[1:5], remat="dots", layer_loop=loop,
+                          act_sharding=batch_sharding(make_mesh()), fuse_proj=fuse)
+        out = out * (inp[5] != 0)
+        return jnp.sum(out * inp[5]), out
+    f = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True), static_argnums=2)
+    (_, out0), (g0, gi0) = f(params, inp[0], "off")
+    fp = fuse_projection_params(params) if mode == "prefused" else params
+    fuse = "off" if mode == "prefused" else mode
+    (_, out), (g, gi) = f(fp, inp[0], fuse)
+    assert rel_err(out, out0) < 1e-5 and rel_err(gi, gi0) < 1e-5
+    assert tree_rel_err(fuse_projection_params(g) if mode != "prefused" else g,
+                        fuse_projection_params(g0)) < 1e-5
+    names = str(jax.tree.structure(fp))
+    assert ("'wqkvg'" in names and "'wgu'" in names and "'wk'" not in names) == (
+        mode == "prefused")
+    m = jax.tree.map(lambda a: a[0], setup(128)[1]["blocks"]["mlp"])
+    jx = jax.make_jaxpr(lambda x: swiglu_forward(x, m, fuse_proj=fuse))(jnp.ones((2, 128)))
+    assert ("concatenate" in str(jx)) == (mode == "concat")
+    with pytest.raises(ValueError, match="LoRA"):
+        swiglu_forward(inp[0], setup(128)[1]["blocks"]["mlp"], lora={"up": {}},
+                       fuse_proj="concat")
 
 def test_chunked_ref_attention_saves_no_attention_matrix():
     """Under grad the q-chunk map must not keep every chunk's softmax for the backward:

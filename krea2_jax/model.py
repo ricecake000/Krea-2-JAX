@@ -104,6 +104,43 @@ def linear(x, p, lora=None, lora_scale=1.0, act_sharding=None):
     return _constrain(y, act_sharding)
 
 
+FUSE_PROJ_MODES = ("off", "concat", "concat-attn")
+
+
+def _fused_linear(x, p, fused_key, keys, sizes, lora, act_sharding):
+    """One linear for several projections of the same input, split on the
+    last axis by `sizes` (the row counts of `keys`, in order).
+
+    p[fused_key] (a prefused tree, `checkpoint.fuse_projection_params`) is
+    used as is; otherwise the weights p[k] are concatenated along the out
+    axis (-2) inside the traced function (fuse_proj="concat"/"concat-attn"),
+    biases along -1 when every k has one. Refuses LoRA on any of `keys` (the
+    fused GEMM has no per-target delta).
+    """
+    bad = [k for k in keys if _lget(lora, k) is not None]
+    if bad:
+        raise ValueError(f"fused projections ({fused_key}) do not support "
+                         f"LoRA on {bad}; use fuse_proj='off' and unfused "
+                         "params")
+    if fused_key in p:
+        fp = p[fused_key]
+    else:
+        nb = sum("bias" in p[k] for k in keys)
+        if nb not in (0, len(keys)):
+            raise ValueError(f"fuse_proj concat: bias on only {nb} of "
+                             f"{list(keys)}")
+        fp = {"weight": jnp.concatenate([p[k]["weight"] for k in keys],
+                                        axis=-2)}
+        if nb:
+            fp["bias"] = jnp.concatenate([p[k]["bias"] for k in keys],
+                                         axis=-1)
+    if fp["weight"].shape[-2] != sum(sizes):
+        raise ValueError(f"{fused_key} has {fp['weight'].shape[-2]} rows, "
+                         f"expected {sum(sizes)} = {' + '.join(map(str, sizes))}")
+    y = linear(x, fp, act_sharding=act_sharding)
+    return jnp.split(y, np.cumsum(sizes)[:-1].tolist(), axis=-1)
+
+
 def rms_norm(x, scale, eps=1e-5):
     """float32 RMSNorm with zero-centered scale (matches reference)."""
     t = x.astype(jnp.float32)
@@ -553,17 +590,32 @@ def attention_forward(
     x, p, heads, kvheads, freqs=None, keymask=None, lora=None, lora_scale=1.0,
     qchunk=512, attn_impl="ref", attn_mesh=None, attn_block=256,
     attn_interpret=False, attn_shard="batch", act_sharding=None,
-    attn_kernel=None,
+    attn_kernel=None, fuse_proj="off",
 ):
-    """Sigmoid-gated multi-head attention (`Attention` in the reference)."""
+    """Sigmoid-gated multi-head attention (`Attention` in the reference).
+
+    fuse_proj: see `_fused_linear`. A prefused tree (`p["wqkvg"]`, rows
+    [wq; wk; wv; gate], from `checkpoint.fuse_projection_params`) always
+    takes the fused path; "concat" and "concat-attn" concatenate the four
+    weights in the traced function; "off" with unfused params runs four
+    linears.
+    """
     B, L, _ = x.shape
-    headdim = p["wq"]["weight"].shape[0] // heads
     sh = act_sharding
 
-    q = linear(x, p["wq"], _lget(lora, "wq"), lora_scale, act_sharding=sh)
-    k = linear(x, p["wk"], _lget(lora, "wk"), lora_scale, act_sharding=sh)
-    v = linear(x, p["wv"], _lget(lora, "wv"), lora_scale, act_sharding=sh)
-    gate = linear(x, p["gate"], _lget(lora, "gate"), lora_scale, act_sharding=sh)
+    if "wqkvg" in p or fuse_proj in ("concat", "concat-attn"):
+        headdim = p["qknorm"]["qnorm"]["scale"].shape[-1]
+        sizes = (heads * headdim, kvheads * headdim, kvheads * headdim,
+                 x.shape[-1])
+        q, k, v, gate = _fused_linear(x, p, "wqkvg", ("wq", "wk", "wv", "gate"),
+                                      sizes, lora, sh)
+    else:
+        headdim = p["wq"]["weight"].shape[0] // heads
+        q = linear(x, p["wq"], _lget(lora, "wq"), lora_scale, act_sharding=sh)
+        k = linear(x, p["wk"], _lget(lora, "wk"), lora_scale, act_sharding=sh)
+        v = linear(x, p["wv"], _lget(lora, "wv"), lora_scale, act_sharding=sh)
+        gate = linear(x, p["gate"], _lget(lora, "gate"), lora_scale,
+                      act_sharding=sh)
 
     q = q.reshape(B, L, heads, headdim).transpose(0, 2, 1, 3)
     k = k.reshape(B, L, kvheads, headdim).transpose(0, 2, 1, 3)
@@ -594,10 +646,20 @@ def attention_forward(
     return linear(out, p["wo"], _lget(lora, "wo"), lora_scale, act_sharding=sh)
 
 
-def swiglu_forward(x, p, lora=None, lora_scale=1.0, act_sharding=None):
+def swiglu_forward(x, p, lora=None, lora_scale=1.0, act_sharding=None,
+                   fuse_proj="off"):
+    """down(silu(gate(x)) * up(x)); prefused `p["wgu"]` (rows [gate; up]) or
+    fuse_proj="concat" runs gate and up as one linear (`_fused_linear`);
+    "concat-attn" and "off" keep two linears."""
     sh = act_sharding
-    g = linear(x, p["gate"], _lget(lora, "gate"), lora_scale, act_sharding=sh)
-    u = linear(x, p["up"], _lget(lora, "up"), lora_scale, act_sharding=sh)
+    if "wgu" in p or fuse_proj == "concat":
+        hidden = p["down"]["weight"].shape[-1]
+        g, u = _fused_linear(x, p, "wgu", ("gate", "up"), (hidden, hidden),
+                             lora, sh)
+    else:
+        g = linear(x, p["gate"], _lget(lora, "gate"), lora_scale,
+                   act_sharding=sh)
+        u = linear(x, p["up"], _lget(lora, "up"), lora_scale, act_sharding=sh)
     return linear(jax.nn.silu(g) * u, p["down"], _lget(lora, "down"),
                   lora_scale, act_sharding=sh)
 
@@ -606,7 +668,8 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
                         lora=None, lora_scale=1.0, qchunk=512,
                         attn_impl="ref", attn_mesh=None, attn_block=256,
                         attn_interpret=False, attn_shard="batch",
-                        act_sharding=None, attn_kernel=None):
+                        act_sharding=None, attn_kernel=None,
+                        fuse_proj="off"):
     mods = tvec6 + p["mod"]["lin"]  # (B, 1, 6*features)
     prescale, preshift, pregate, postscale, postshift, postgate = jnp.split(
         mods, 6, axis=-1
@@ -618,32 +681,34 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
         attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
         attn_interpret=attn_interpret, attn_shard=attn_shard,
         act_sharding=act_sharding, attn_kernel=attn_kernel,
+        fuse_proj=fuse_proj,
     )
     h = (1 + postscale) * rms_norm(x, p["postnorm"]["scale"]) + postshift
     x = x + postgate * swiglu_forward(
         h, p["mlp"], lora=_lget(lora, "mlp"), lora_scale=lora_scale,
-        act_sharding=act_sharding,
+        act_sharding=act_sharding, fuse_proj=fuse_proj,
     )
     return x
 
 
 def text_fusion_block(x, p, heads, kvheads, keymask=None, lora=None,
-                      lora_scale=1.0, act_sharding=None):
+                      lora_scale=1.0, act_sharding=None, fuse_proj="off"):
     x = x + attention_forward(
         rms_norm(x, p["prenorm"]["scale"]), p["attn"], heads, kvheads,
         keymask=keymask, lora=_lget(lora, "attn"), lora_scale=lora_scale,
-        act_sharding=act_sharding,
+        act_sharding=act_sharding, fuse_proj=fuse_proj,
     )
     x = x + swiglu_forward(
         rms_norm(x, p["postnorm"]["scale"]), p["mlp"],
         lora=_lget(lora, "mlp"), lora_scale=lora_scale,
-        act_sharding=act_sharding,
+        act_sharding=act_sharding, fuse_proj=fuse_proj,
     )
     return x
 
 
 def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
-                        lora=None, lora_scale=1.0, act_sharding=None):
+                        lora=None, lora_scale=1.0, act_sharding=None,
+                        fuse_proj="off"):
     """TextFusionTransformer: fuse per-layer encoder states then refine.
 
     context: (B, L, txtlayers, txtdim) -> (B, L, txtdim)
@@ -656,6 +721,7 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
             x, blk, cfg.txtheads, cfg.txtkvheads,
             lora=_lindex(_lget(lora, "layerwise_blocks"), i),
             lora_scale=lora_scale, act_sharding=act_sharding,
+            fuse_proj=fuse_proj,
         )
     x = x.reshape(B, L, N, D).transpose(0, 1, 3, 2)  # (B, L, D, N)
     x = linear(x, p["projector"], _lget(lora, "projector"), lora_scale,
@@ -666,23 +732,25 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
             x, blk, cfg.txtheads, cfg.txtkvheads, keymask=keymask,
             lora=_lindex(_lget(lora, "refiner_blocks"), i),
             lora_scale=lora_scale, act_sharding=act_sharding,
+            fuse_proj=fuse_proj,
         )
     return x
 
 
 def text_tokens_forward(params, cfg: Krea2Config, context, keymask=None,
-                        lora=None, lora_scale=1.0, act_sharding=None):
+                        lora=None, lora_scale=1.0, act_sharding=None,
+                        fuse_proj="off"):
     """Text branch of the DiT: text fusion + txtmlp -> (B, L, features).
 
     Independent of the timestep and the image, so it can be computed once
     per prompt and reused across sampling steps (`dit_forward(txt_tokens=)`).
-    act_sharding: as in `dit_forward` (applied to every linear output).
+    act_sharding, fuse_proj: as in `dit_forward`.
     """
     sh = act_sharding
     txt = text_fusion_forward(
         context, params["txtfusion"], cfg, keymask=keymask,
         lora=_lget(lora, "txtfusion"), lora_scale=lora_scale,
-        act_sharding=sh,
+        act_sharding=sh, fuse_proj=fuse_proj,
     )
     txt = rms_norm(txt, params["txtmlp"]["0"]["scale"])
     txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"),
@@ -733,6 +801,7 @@ def dit_forward(
     attn_kernel=None,    # aiter only: flash_attn_varlen-compatible callable
     txt_tokens=None,     # precomputed text_tokens_forward(...); skips context
     layer_loop="scan",   # "scan" (lax.scan over stacked blocks) or "unroll"
+    fuse_proj="off",     # "off", "concat" or "concat-attn"; see below
 ):
     """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels).
 
@@ -767,6 +836,19 @@ def dit_forward(
     layer, numerically identical) but its gradient is still assembled into
     the stacked layout, so only the list form removes the copies.
 
+    fuse_proj: "concat" runs each attention's wq/wk/wv/gate (and each
+    SwiGLU's gate/up) as ONE linear over weights concatenated along the out
+    axis inside the traced function, then splits the output (same math,
+    fewer and larger GEMMs). Attention/MLP dicts already holding the fused
+    "wqkvg" / "wgu" weights (`checkpoint.fuse_projection_params`) take the
+    fused path whatever this says. "off" with unfused params is the
+    original four + two linears. "concat-attn" concatenates only the
+    attention projections and keeps gate/up as two linears: wq/wk/wv/gate
+    are FSDP-sharded on the input axis, so their row concat needs no
+    collectives, while the gate/up concat (row-sharded) adds all-to-all +
+    collective-permute resharding. Fused paths refuse LoRA on the fused
+    targets. Blocks and text-fusion blocks alike.
+
     attn_impl="aiter": tokens are reordered per sample (after the padding to
     a multiple of 256) so valid tokens form a prefix — stable, so text then
     image order is kept — as the varlen kernel needs; positions and mask are
@@ -786,6 +868,9 @@ def dit_forward(
     if layer_loop not in ("scan", "unroll"):
         raise ValueError(f"unknown layer_loop: {layer_loop!r} "
                          "(expected 'scan' or 'unroll')")
+    if fuse_proj not in FUSE_PROJ_MODES:
+        raise ValueError(f"unknown fuse_proj: {fuse_proj!r} "
+                         f"(expected one of {FUSE_PROJ_MODES})")
     if layer_loop == "scan" and isinstance(params["blocks"], (list, tuple)):
         raise TypeError("layer_loop='scan' needs stacked blocks; use "
                         "layer_loop='unroll' or stack_blocks()")
@@ -811,7 +896,7 @@ def dit_forward(
     if txt_tokens is None:
         txt = text_tokens_forward(
             params, cfg, context, mask[:, :Ltxt], lora=lora,
-            lora_scale=lora_scale, act_sharding=sh,
+            lora_scale=lora_scale, act_sharding=sh, fuse_proj=fuse_proj,
         )
     else:
         txt = _constrain(txt_tokens.astype(x.dtype), sh)
@@ -843,7 +928,7 @@ def dit_forward(
         single_stream_block, cfg=cfg, lora_scale=lora_scale, qchunk=qchunk,
         attn_impl=attn_impl, attn_mesh=attn_mesh, attn_block=attn_block,
         attn_interpret=attn_interpret, attn_shard=attn_shard,
-        act_sharding=sh, attn_kernel=attn_kernel,
+        act_sharding=sh, attn_kernel=attn_kernel, fuse_proj=fuse_proj,
     )
 
     # one predicate for the body choice and (unrolled) the per-layer
