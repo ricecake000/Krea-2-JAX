@@ -23,11 +23,38 @@ derived per sample from its image-token count (or --timestep-mu for all).
 --resume-new-dataset continues a checkpoint's train state on a new dataset
 version, whose data order starts at its own epoch 0 (data_step_offset).
 
+Two-phase curriculum (--phase2-start S): steps 1..S train phase 1
+(--data-dir, --batch-size, --img-tokens, --lr), steps S+1..--steps phase 2
+(--phase2-data-dir, --phase2-batch-size, --phase2-img-tokens, --phase2-lr);
+the phase is a pure function of the global step and phase 2's data order
+starts at its own epoch 0 at step S (data step = step - S). Params, AdamW
+state, EMA and the one LR schedule over the global step carry across the
+boundary. After step S the train state is saved (and waited for), phase 1's
+loader and compiled step are dropped, and phase 2 is built and compiled
+(`NOTE phase 2 from step S: ...`); a resume of a step >= S starts directly
+in phase 2. Both data dirs are read (headers) and fingerprinted at every
+start; --verify-latents re-hashes phase 1's cache only while phase 1 still
+has steps to run, phase 2's always. Text settings (--text-rows,
+--caption-probs, --artist-prob) are shared.
+LR schedule: linear warmup 0 -> --lr over --warmup-steps, constant --lr,
+--phase2-lr from step S+1, and with --decay-start D a linear decay from the
+LR in force at D (--phase2-lr when two-phase, D >= S) to --min-lr, reached
+at update count --steps (like --cosine-decay, the last step's LR is one
+decay increment above --min-lr).
+--snapshot-steps a,b,...: after those steps' updates, the raw fp32 params
+are written (official keys, F32) to OUT/snapshots/ for post-hoc averaging
+(scripts/average_snapshots.py); each completed file is announced as
+`snapshot <abs path> <bytes>`. Snapshot steps must be < --steps (the final
+params are in the final checkpoint / export).
+
 Outputs under --output-dir:
     ckpt/<step>/                   orbax train state (params, opt_state, ema)
     model_stepNNNNNN.safetensors   bf16 official-layout export (--export-every,
                                    --export-steps)
     model.safetensors              final bf16 export (EMA weights when enabled)
+    snapshots/model_stepNNNNNN_f32.safetensors
+                                   fp32 raw params (--snapshot-steps; never
+                                   rotated by --keep)
 The exports are plain Krea 2 checkpoints (same keys as raw.safetensors):
 usable with scripts/sample.py --base-ckpt, the official code and ComfyUI.
 
@@ -37,14 +64,25 @@ Usage:
         --data-dir /scratch/krea2-data \
         --text-encoder Qwen/Qwen3-VL-4B-Instruct \
         --output-dir ./full_out --steps 20000 --batch-size 32 --lr 1e-5
+
+    # 512 -> 1024 curriculum with a WSD tail and fp32 snapshots
+    python scripts/train_full.py ... --data-dir /scratch/latents_512 \
+        --batch-size 256 --img-tokens 1024 --lr 2e-5 --warmup-steps 150 \
+        --steps 9192 --phase2-start 3064 \
+        --phase2-data-dir /scratch/latents_1024 --phase2-batch-size 64 \
+        --phase2-img-tokens 4096 --phase2-lr 1e-5 \
+        --decay-start 7354 --min-lr 0 --weight-decay 0 \
+        --snapshot-steps 7700,8000,8300,8600,8900
 """
 
 import argparse
 import dataclasses
+import gc
 import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -180,14 +218,18 @@ RESUME_HARD_KEYS = (
     "artist_prob", "n_samples", "dataset_fingerprint", "lat_channels",
     "base_ckpt", "model_config", "text_model_config", "position_mode",
     "timestep_mu", "logit_mean", "logit_std", "text_encoder_id",
-    "layer_loop",
+    "layer_loop", "phase2",
 )
-# Value of a hard key in checkpoints written before the key existed (every
-# such checkpoint used it): compared instead of reporting it unrecorded.
+# Value of a key in checkpoints written before the key existed (every such
+# checkpoint used it): compared instead of reporting it unrecorded.
 # layer_loop: "scan" stacks the blocks, "unroll" keeps them as a per-layer
 # list, so params / opt_state / ema trees differ and cannot be restored
-# into the other mode.
-_RESUME_KEY_DEFAULTS = {"layer_loop": "scan"}
+# into the other mode. phase2 (two-phase spec: start, batch_size,
+# img_tokens, dataset_fingerprint, n_samples of phase 2), phase2_lr and
+# decay_start: None = single phase, no decay start (run1/run2 checkpoints
+# compare equal to a run without the flags).
+_RESUME_KEY_DEFAULTS = {"layer_loop": "scan", "phase2": None,
+                        "phase2_lr": None, "decay_start": None}
 # Changing these is legitimate (e.g. extending a run) but changes the
 # optimizer / LR schedule from the resumed step on: warning.
 # text_encoder is only the --text-encoder name (a local dir's basename or
@@ -198,7 +240,7 @@ _RESUME_KEY_DEFAULTS = {"layer_loop": "scan"}
 RESUME_SOFT_KEYS = (
     "steps", "lr", "warmup_steps", "cosine_decay", "min_lr", "weight_decay",
     "beta1", "beta2", "eps", "grad_clip", "ema_decay", "act_sharding", "attn",
-    "text_encoder",
+    "text_encoder", "phase2_lr", "decay_start",
 )
 # Soft keys that do not touch the optimizer or LR schedule (same math up to
 # kernel rounding, or a name only).
@@ -222,7 +264,8 @@ def check_resume_config(saved, current, step, new_dataset=False):
     """
     if saved is None:
         hard = [f"  {k}: checkpoint {v!r}, now {current[k]!r}"
-                for k, v in _RESUME_KEY_DEFAULTS.items() if current[k] != v]
+                for k, v in _RESUME_KEY_DEFAULTS.items()
+                if k in RESUME_HARD_KEYS and current[k] != v]
         if hard:
             raise SystemExit(
                 f"--resume: checkpoint step {step} was saved with a different "
@@ -355,7 +398,30 @@ def resume_data_position(saved, current, step, new_dataset):
 
 
 def make_schedule(args):
-    """Linear warmup from 0 to --lr, then constant or cosine to --min-lr."""
+    """Linear warmup from 0 to --lr, then constant or cosine to --min-lr.
+
+    With --phase2-start S and/or --decay-start D (validate_phase_args):
+    one schedule over the optax update count c (step s uses c = s - 1):
+    warmup 0 -> lr over c < warmup_steps, lr, phase2_lr for c >= S, and for
+    c >= D a linear ramp from the LR in force at D to min_lr at c = steps.
+    Never rebuilt per phase, so the optimizer count stays valid across the
+    phase boundary and on resume."""
+    phase2_start = getattr(args, "phase2_start", None)
+    decay_start = getattr(args, "decay_start", None)
+    if phase2_start is not None or decay_start is not None:
+        scheds = [optax.linear_schedule(0.0, args.lr, max(args.warmup_steps, 1)),
+                  optax.constant_schedule(args.lr)]
+        bounds = [args.warmup_steps]
+        peak = args.lr
+        if phase2_start is not None:
+            peak = args.phase2_lr
+            scheds.append(optax.constant_schedule(peak))
+            bounds.append(phase2_start)
+        if decay_start is not None:
+            scheds.append(optax.linear_schedule(
+                peak, args.min_lr, args.steps - decay_start))
+            bounds.append(decay_start)
+        return optax.join_schedules(scheds, bounds)
     if args.cosine_decay:
         return optax.warmup_cosine_decay_schedule(
             0.0, args.lr, args.warmup_steps, max(args.steps, args.warmup_steps + 1),
@@ -635,7 +701,79 @@ def parse_args(argv=None):
                     help="JSON object of Krea2Config field overrides (tests / "
                          "debugging with tiny models; default: the real "
                          "12.9B config)")
+    ph = ap.add_argument_group(
+        "two-phase curriculum / WSD decay / fp32 snapshots")
+    ph.add_argument("--phase2-start", type=int, default=None,
+                    help="absolute step S: steps 1..S train phase 1 (the "
+                         "flags above), S+1..--steps phase 2 (needs every "
+                         "--phase2-* flag); 0 < S < --steps")
+    ph.add_argument("--phase2-data-dir", default=None,
+                    help="phase-2 krea2-latents-v1 dataset dir")
+    ph.add_argument("--phase2-batch-size", type=int, default=None,
+                    help="phase-2 global batch")
+    ph.add_argument("--phase2-img-tokens", type=int, default=None,
+                    help="phase-2 static image-token rows per sample")
+    ph.add_argument("--phase2-lr", type=float, default=None,
+                    help="LR from step S+1 on (until --decay-start)")
+    ph.add_argument("--decay-start", type=int, default=None,
+                    help="linear decay from the LR in force at this step to "
+                         "--min-lr at --steps (WSD); not with --cosine-decay; "
+                         "--warmup-steps <= D < --steps, and D >= "
+                         "--phase2-start when two-phase")
+    ph.add_argument("--snapshot-steps", default="",
+                    help="comma-separated steps (< --steps; the final "
+                         "params are in the final checkpoint/export) after "
+                         "which the "
+                         "raw fp32 params are written to "
+                         "OUT/snapshots/model_stepNNNNNN_f32.safetensors")
     return ap.parse_args(argv)
+
+
+PHASE2_FLAGS = ("phase2_data_dir", "phase2_batch_size", "phase2_img_tokens",
+                "phase2_lr")
+
+
+def validate_phase_args(args):
+    """Check the two-phase / decay / snapshot flags; returns the frozenset of
+    snapshot steps. Raises SystemExit on an invalid combination."""
+    flag = lambda k: "--" + k.replace("_", "-")
+    S, D = args.phase2_start, args.decay_start
+    if S is None:
+        given = [flag(k) for k in PHASE2_FLAGS if getattr(args, k) is not None]
+        if given:
+            raise SystemExit(f"{', '.join(given)} need --phase2-start")
+    else:
+        missing = [flag(k) for k in PHASE2_FLAGS if getattr(args, k) is None]
+        if missing:
+            raise SystemExit(f"--phase2-start needs {', '.join(missing)}")
+        if not 0 < S < args.steps:
+            raise SystemExit(f"--phase2-start {S} must be in (0, --steps "
+                             f"{args.steps})")
+        if S < args.warmup_steps:
+            raise SystemExit(f"--phase2-start {S} < --warmup-steps "
+                             f"{args.warmup_steps}")
+        if args.resume_new_dataset:
+            raise SystemExit("--resume-new-dataset cannot be combined with "
+                             "--phase2-start")
+        if args.cosine_decay:
+            raise SystemExit("--cosine-decay cannot be combined with "
+                             "--phase2-start (use --decay-start)")
+    if D is not None:
+        if args.cosine_decay:
+            raise SystemExit("--decay-start and --cosine-decay are mutually "
+                             "exclusive")
+        if not args.warmup_steps <= D < args.steps:
+            raise SystemExit(f"--decay-start {D} must be in [--warmup-steps "
+                             f"{args.warmup_steps}, --steps {args.steps})")
+        if S is not None and D < S:
+            raise SystemExit(f"--decay-start {D} < --phase2-start {S}: the "
+                             "decay must start in phase 2")
+    snaps = parse_save_steps(args.snapshot_steps, "--snapshot-steps")
+    if any(s >= args.steps for s in snaps):
+        raise SystemExit(f"--snapshot-steps {sorted(snaps)}: the final params "
+                         "are in the final checkpoint/export; snapshot steps "
+                         f"must be < --steps {args.steps}")
+    return snaps
 
 
 CMD_BUFFER_FLAG = "--xla_gpu_enable_command_buffer="
@@ -689,18 +827,36 @@ def parse_save_steps(text, flag="--save-steps"):
     return steps
 
 
-def resolution_metadata(config, img_tokens=None):
+def resolution_metadata(config, img_tokens=None, step=None):
     """The resolution fields of an export's metadata: bucketed runs record
     {"resolution": "bucketed", "img_tokens": N}; a run config from the older
-    fixed-resolution path keeps its "resolution"; none known -> "unknown"."""
+    fixed-resolution path keeps its "resolution"; none known -> "unknown".
+    A two-phase config's step > phase2.start records phase 2's img_tokens."""
     config = config or {}
-    if config.get("img_tokens") is not None:
+    phase2 = config.get("phase2")
+    if phase2 and step is not None and step > phase2["start"]:
+        img_tokens = phase2["img_tokens"]
+    elif config.get("img_tokens") is not None:
         img_tokens = config["img_tokens"]
     elif config.get("resolution") is not None:
         return {"resolution": str(config["resolution"])}
     if img_tokens is None:
         return {"resolution": "unknown"}
     return {"resolution": "bucketed", "img_tokens": str(int(img_tokens))}
+
+
+def export_metadata(step, base_name, resolution, source):
+    """The safetensors __metadata__ of a train_full export (bf16 exports,
+    fp32 snapshots, scripts/average_snapshots.py outputs): resolution is a
+    resolution_metadata dict, source "ema" / "params" / ...."""
+    return {"step": str(step), "base": base_name, **resolution,
+            "source": source}
+
+
+def snapshot_path(out_dir, step):
+    """Absolute path of the fp32 raw-params snapshot of `step`."""
+    return (Path(out_dir) / "snapshots"
+            / f"model_step{step:06d}_f32.safetensors").resolve()
 
 
 def _unreadable_step(step, ckpt_dir, e):
@@ -729,6 +885,7 @@ def main(argv=None):
     if args.model_config:
         cfg = dataclasses.replace(cfg, **json.loads(args.model_config))
     save_steps = parse_save_steps(args.save_steps)
+    snapshot_steps = validate_phase_args(args)
     export_steps = parse_save_steps(args.export_steps, "--export-steps")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -858,12 +1015,9 @@ def main(argv=None):
             raise _unreadable_step(resume_step, ckpt_dir, e) from e
         save_krea2_params(
             str(final), tree, dtype=jnp.bfloat16,
-            metadata={
-                "step": str(resume_step),
-                "base": base_name,
-                **resolution_metadata(config),
-                "source": source,
-            },
+            metadata=export_metadata(
+                resume_step, base_name,
+                resolution_metadata(config, step=resume_step), source),
         )
         print(f"exported {final} ({source}, bf16) "
               f"in {time.time() - t_exp:.0f}s")
@@ -874,6 +1028,9 @@ def main(argv=None):
     print(f"devices: {n_dev} ({jax.devices()[0].platform})")
     if args.batch_size % n_dev != 0:
         raise SystemExit(f"--batch-size must be divisible by {n_dev} devices")
+    if args.phase2_start is not None and args.phase2_batch_size % n_dev != 0:
+        raise SystemExit(f"--phase2-batch-size must be divisible by {n_dev} "
+                         "devices")
 
     # --- text encoder config + tokenizer (the weights load further down) ---
     te_dir = resolve_text_encoder(args.text_encoder)
@@ -903,41 +1060,62 @@ def main(argv=None):
 
     # --- data ---
     caption_probs = parse_caption_probs(args.caption_probs)
-    try:
-        dataset = BucketDataset(
-            args.data_dir, template, img_tokens=args.img_tokens,
-            patch=cfg.patch, caption_probs=caption_probs,
-            artist_prob=args.artist_prob, verify_digests=args.verify_latents,
+    S = args.phase2_start
+
+    def load_dataset(flag, data_dir, img_tokens, batch_flag, batch_size,
+                     verify, skip_why=None):
+        try:
+            ds = BucketDataset(
+                data_dir, template, img_tokens=img_tokens,
+                patch=cfg.patch, caption_probs=caption_probs,
+                artist_prob=args.artist_prob, verify_digests=verify,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            raise SystemExit(f"{flag} {data_dir}: {e}") from e
+        tag = "" if flag == "--data-dir" else " (phase 2)"
+        if verify:
+            print(f"latents verified{tag}: {ds.verified_shards} shards, "
+                  f"{ds.verified_bytes / 2**30:.2f} GiB in "
+                  f"{ds.verify_seconds:.1f} s")
+        else:
+            print(f"latents NOT verified{tag} ("
+                  + (skip_why or "--no-verify-latents") + "): trusting the "
+                  "manifest digests")
+        if ds.lat_channels != cfg.channels:
+            raise SystemExit(f"{flag} {data_dir}: dataset latents have "
+                             f"{ds.lat_channels} channels, model expects "
+                             f"{cfg.channels}")
+        if ds.n < batch_size:
+            raise SystemExit(f"{ds.n} samples < {batch_flag} {batch_size}")
+        n_img = ds.hw[:, 0].astype(np.int64) * ds.hw[:, 1]
+        if args.timestep_mu is not None:
+            mu_desc = f"mu {args.timestep_mu:.4f} (--timestep-mu, all samples)"
+        else:
+            mu_desc = (f"mu {cfg.mu_for_seq_len(int(n_img.min())):.4f}.."
+                       f"{cfg.mu_for_seq_len(int(n_img.max())):.4f} (per sample)")
+        buckets = ds.buckets()
+        top = sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        print(
+            f"dataset{tag}: {ds.n} samples in {len(buckets)} buckets (top: "
+            + ", ".join(f"{w}x{h} x{c}" for (w, h), c in top)
+            + f"); img tokens {int(n_img.min())}..{int(n_img.max())} padded to "
+            f"{img_tokens}; text_rows {args.text_rows} (prefix "
+            f"{template.prefix_len}); {mu_desc}"
         )
-    except (ValueError, FileNotFoundError) as e:
-        raise SystemExit(f"--data-dir {args.data_dir}: {e}") from e
-    if args.verify_latents:
-        print(f"latents verified: {dataset.verified_shards} shards, "
-              f"{dataset.verified_bytes / 2**30:.2f} GiB in "
-              f"{dataset.verify_seconds:.1f} s")
-    else:
-        print("latents NOT verified (--no-verify-latents): trusting the "
-              "manifest digests")
-    if dataset.lat_channels != cfg.channels:
-        raise SystemExit(f"dataset latents have {dataset.lat_channels} "
-                         f"channels, model expects {cfg.channels}")
-    if dataset.n < args.batch_size:
-        raise SystemExit(f"{dataset.n} samples < --batch-size {args.batch_size}")
-    n_img = dataset.hw[:, 0].astype(np.int64) * dataset.hw[:, 1]
-    if args.timestep_mu is not None:
-        mu_desc = f"mu {args.timestep_mu:.4f} (--timestep-mu, all samples)"
-    else:
-        mu_desc = (f"mu {cfg.mu_for_seq_len(int(n_img.min())):.4f}.."
-                   f"{cfg.mu_for_seq_len(int(n_img.max())):.4f} (per sample)")
-    buckets = dataset.buckets()
-    top = sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
-    print(
-        f"dataset: {dataset.n} samples in {len(buckets)} buckets (top: "
-        + ", ".join(f"{w}x{h} x{c}" for (w, h), c in top)
-        + f"); img tokens {int(n_img.min())}..{int(n_img.max())} padded to "
-        f"{args.img_tokens}; text_rows {args.text_rows} (prefix "
-        f"{template.prefix_len}); {mu_desc}"
-    )
+        return ds
+
+    # a resume at/after the boundary never reads phase 1's latents: they are
+    # still fingerprinted (hard resume keys) but not re-hashed
+    phase1_done = S is not None and resume_step is not None and resume_step >= S
+    dataset = load_dataset(
+        "--data-dir", args.data_dir, args.img_tokens, "--batch-size",
+        args.batch_size, args.verify_latents and not phase1_done,
+        "phase 1 is complete at the resumed step" if phase1_done else None)
+    dataset2 = None
+    if S is not None:
+        dataset2 = load_dataset(
+            "--phase2-data-dir", args.phase2_data_dir, args.phase2_img_tokens,
+            "--phase2-batch-size", args.phase2_batch_size, args.verify_latents)
 
     # --- run configuration (stored with every checkpoint, checked on resume) ---
     run_config = {
@@ -974,6 +1152,17 @@ def main(argv=None):
         "act_sharding": args.act_sharding,
         "attn": args.attn,
         "layer_loop": args.layer_loop,
+        # two-phase curriculum (None: single phase); the keys above keep
+        # meaning phase 1
+        "phase2": None if dataset2 is None else {
+            "start": int(S),
+            "batch_size": int(args.phase2_batch_size),
+            "img_tokens": int(args.phase2_img_tokens),
+            "dataset_fingerprint": dataset2.fingerprint(),
+            "n_samples": int(dataset2.n),
+        },
+        "phase2_lr": args.phase2_lr,
+        "decay_start": args.decay_start,
         # derived, not flags (never compared on resume): the loader reads
         # data step `step - data_step_offset`, and the dataset-version
         # switches (--resume-new-dataset) that led to this train state
@@ -1071,24 +1260,43 @@ def main(argv=None):
           f"{txt_cfg.position_mode}), {n_txt * 2 / 2**30:.2f} GiB/device")
 
     data_sharding = batch_sharding(mesh)
-    train_step = make_train_step(
-        cfg, args, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
-        args.img_tokens, mu_override=args.timestep_mu,
-    )
+    base_name = Path(args.base_ckpt).name
+
+    def phase_of(step):
+        """Phase (1 or 2) that trains global step `step` (1-based)."""
+        return 2 if S is not None and step > S else 1
+
+    def img_tokens_at(step):
+        return args.phase2_img_tokens if phase_of(step) == 2 else args.img_tokens
 
     last_saved = start_step if resume_step is not None else None
+    log_lock = threading.Lock()
+
+    def log(msg):
+        # best effort: a broken stdout must never skip save(last_step); one
+        # lock for the main loop and the snapshot writer thread, so their
+        # lines never interleave
+        with log_lock:
+            try:
+                print(msg, flush=True)
+            except (OSError, ValueError):
+                pass
 
     def save(step):
         nonlocal last_saved
         if last_saved == step:
             return
+        # never let a checkpoint get ahead of an unfinished snapshot: a
+        # crash would resume past it and nothing would recreate it
+        if snap["thread"] is not None and step > snap["step"]:
+            wait_snapshot()
         fullft_ckpt.save_state(
             manager, step,
             {"params": params, "opt_state": opt_state, "ema": ema, "step": step},
             config=run_config,
         )
         last_saved = step
-        print(f"saved train state {ckpt_dir}/{step} (async)")
+        log(f"saved train state {ckpt_dir}/{step} (async)")
 
     def export(step, final=False):
         name = "model.safetensors" if final else f"model_step{step:06d}.safetensors"
@@ -1096,34 +1304,87 @@ def main(argv=None):
         t_exp = time.time()
         save_krea2_params(
             str(out_dir / name), ema if use_ema else params, dtype=jnp.bfloat16,
-            metadata={
-                "step": str(step),
-                "base": Path(args.base_ckpt).name,
-                **resolution_metadata(None, args.img_tokens),
-                "source": source,
-            },
+            metadata=export_metadata(
+                step, base_name,
+                resolution_metadata(None, img_tokens_at(step)), source),
         )
-        print(f"exported {out_dir / name} ({source}, bf16) "
-              f"in {time.time() - t_exp:.0f}s")
+        log(f"exported {out_dir / name} ({source}, bf16) "
+            f"in {time.time() - t_exp:.0f}s")
+
+    # fp32 raw-param snapshots: the device->host gather blocks the loop (the
+    # next step donates params); the atomic file write (tmp + fsync +
+    # rename, save_krea2_params) runs in one background thread, joined
+    # before the next snapshot and before exit
+    snap = {"thread": None, "step": None}
+
+    def wait_snapshot():
+        th, snap["thread"] = snap["thread"], None
+        if th is not None:
+            th.join()
+
+    def snapshot(step):
+        wait_snapshot()  # at most one host copy in flight
+        path = snapshot_path(out_dir, step)
+        try:
+            host = jax.device_get(params)
+        except Exception as e:  # never stop training for a snapshot
+            log(f"WARNING: snapshot of step {step} FAILED: {e!r}")
+            return
+        meta = export_metadata(step, base_name,
+                               resolution_metadata(None, img_tokens_at(step)),
+                               "params")
+
+        def write():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                save_krea2_params(str(path), host, dtype=jnp.float32,
+                                  metadata=meta)
+                log(f"snapshot {path} {path.stat().st_size}")
+            except Exception as e:
+                log(f"WARNING: snapshot {path} FAILED: {e!r}")
+
+        snap["step"] = step
+        snap["thread"] = threading.Thread(target=write, name=f"snapshot-{step}")
+        snap["thread"].start()
+
+    # both NOTE lines report GiB (per device / device 0)
+    def memory_note(k, compiled):
+        try:
+            ma = compiled.memory_analysis()
+            sizes = [getattr(ma, f"{n}_size_in_bytes") / 2**30 for n in
+                     ("argument", "output", "alias", "temp")]
+        except Exception:  # unsupported backend / None
+            return
+        log(f"NOTE memory_analysis phase {k}: args {sizes[0]:.2f} out "
+            f"{sizes[1]:.2f} alias {sizes[2]:.2f} temp {sizes[3]:.2f} "
+            "per device")
+
+    def device_memory_note(k):
+        try:
+            st = jax.local_devices()[0].memory_stats()
+        except Exception:
+            st = None
+        if not st:
+            return
+        gib = lambda n: (f"{st[n] / 2**30:.2f}" if st.get(n) is not None
+                         else "?")
+        log(f"NOTE device memory phase {k}: peak {gib('peak_bytes_in_use')} "
+            f"in_use {gib('bytes_in_use')} limit {gib('bytes_limit')}")
 
     # --- loop ---
     # the per-step RNG (noise, timesteps) and the LR schedule follow the
     # global step; only the data order (epoch permutation, per-epoch caption
     # and artist draws) follows the data step, which restarts at 0 when
-    # --resume-new-dataset switches the dataset version
+    # --resume-new-dataset switches the dataset version, and at step S for
+    # phase 2 (its data step is step - S)
     rng = jax.random.PRNGKey(args.seed)
-    data_step = start_step - run_config["data_step_offset"]
-    loader = BucketBatchLoader(
-        dataset, args.batch_size, args.seed, start_step=data_step,
-        prefetch=args.prefetch, workers=args.loader_workers,
-    )
-    epoch, k = divmod(data_step, loader.steps_per_epoch)
-    print(f"data: step {start_step + 1} reads data step {data_step} (epoch "
-          f"{epoch}, batch {k}/{loader.steps_per_epoch}; data_step_offset "
-          f"{run_config['data_step_offset']})")
-    batches = iter(loader)
-    ema_loss, t_log, n_log = None, time.time(), 0
-    t_train, last_step = time.time(), start_step
+    # (phase, dataset, batch, img_tokens, data_step_offset, last step)
+    phases = [(1, dataset, args.batch_size, args.img_tokens,
+               run_config["data_step_offset"], S if S is not None else args.steps)]
+    if S is not None:
+        phases.append((2, dataset2, args.phase2_batch_size,
+                       args.phase2_img_tokens, S, args.steps))
+    ema_loss, t_train, last_step = None, time.time(), start_step
 
     # SIGTERM (preemption notice) / SIGINT: finish the current step, then
     # save + export + exit 0 like --max-hours; a second signal aborts hard
@@ -1140,68 +1401,125 @@ def main(argv=None):
         # loop acknowledges the signal within one step
         stop["sig"] = signal.Signals(signum).name
 
-    def log(msg):
-        # best effort: a broken stdout must never skip save(last_step)
+    def run_phase(k, ds, batch_size, img_tokens, offset, last):
+        """Train steps last_step+1..last of phase k; True if stopped early
+        (signal / --max-hours). The loader, the compiled step and the batch
+        buffers are locals: all released when this returns."""
+        nonlocal params, opt_state, ema, ema_loss, last_step
+        first = last_step
+        data_step = first - offset
+        loader = BucketBatchLoader(
+            ds, batch_size, args.seed, start_step=data_step,
+            prefetch=args.prefetch, workers=args.loader_workers,
+        )
         try:
-            print(msg, flush=True)
-        except (OSError, ValueError):
-            pass
+            epoch, kb = divmod(data_step, loader.steps_per_epoch)
+            log(f"data: step {first + 1} reads data step {data_step} (epoch "
+                f"{epoch}, batch {kb}/{loader.steps_per_epoch}; "
+                f"data_step_offset {offset})")
+            batches = iter(loader)
+            train_step = make_train_step(
+                cfg, args, mesh, tx, use_ema, pshard, opt_shard, txt_cfg,
+                img_tokens, mu_override=args.timestep_mu,
+            )
+            compiled = None
+            t_log, n_log = time.time(), 0
+            for step in range(first + 1, last + 1):
+                img_np, hw_np, ids_np, tl_np = next(batches)
+                batch = [jax.device_put(a, data_sharding)
+                         for a in (img_np, hw_np, ids_np, tl_np)]
+                key = jax.random.fold_in(rng, step)
+                if compiled is None:
+                    # AOT: the executable that runs is the one analysed
+                    compiled = train_step.lower(
+                        params, opt_state, ema, txt_params, *batch, key
+                    ).compile()
+                    memory_note(k, compiled)
+
+                params, opt_state, ema, metrics = compiled(
+                    params, opt_state, ema, txt_params, *batch, key,
+                )
+                n_log += 1
+                last_step = step
+
+                if step % args.log_every == 0 or step == first + 1:
+                    loss = float(metrics["loss"])
+                    gnorm = float(metrics["grad_norm"])
+                    ema_loss = loss if ema_loss is None else 0.9 * ema_loss + 0.1 * loss
+                    dt = time.time() - t_log
+                    log(
+                        f"step {step:6d}/{args.steps}  loss {loss:.6f}  "
+                        f"ema_loss {ema_loss:.6f}  gnorm {gnorm:.4f}  "
+                        f"lr {float(sched(step - 1)):.2e}  {dt / n_log:.2f}s/it"
+                    )
+                    t_log, n_log = time.time(), 0
+                if step == first + 3:
+                    jax.block_until_ready(metrics)
+                    device_memory_note(k)
+                # before the stop check: a stopped run never redoes this step
+                if step in snapshot_steps:
+                    snapshot(step)
+                # before the periodic save/export: the final save -> wait ->
+                # export below must run even if a periodic export would fail
+                if stop["sig"] is not None:
+                    log(f"{stop['sig']} received; stopping at step {last_step} "
+                        "(resume with --resume)")
+                    return True
+                if step < args.steps and (
+                        (args.save_every and step % args.save_every == 0)
+                        or step in save_steps):
+                    save(step)
+                if step < args.steps and (
+                        (args.export_every and step % args.export_every == 0)
+                        or step in export_steps):
+                    export(step)
+                if args.max_hours and time.time() - t_train > args.max_hours * 3600:
+                    log(f"--max-hours {args.max_hours} reached; "
+                        f"stopping at step {last_step}")
+                    return True
+            return False
+        finally:
+            loader.close()
 
     prev_handlers = {
         sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)
     }
     try:
-        for step in range(start_step + 1, args.steps + 1):
-            img_np, hw_np, ids_np, tl_np = next(batches)
-            b_img = jax.device_put(img_np, data_sharding)
-            b_hw = jax.device_put(hw_np, data_sharding)
-            b_ids = jax.device_put(ids_np, data_sharding)
-            b_tl = jax.device_put(tl_np, data_sharding)
-            key = jax.random.fold_in(rng, step)
-
-            params, opt_state, ema, metrics = train_step(
-                params, opt_state, ema, txt_params, b_img, b_hw, b_ids, b_tl,
-                key,
-            )
-            n_log += 1
-            last_step = step
-
-            if step % args.log_every == 0 or step == start_step + 1:
-                loss = float(metrics["loss"])
-                gnorm = float(metrics["grad_norm"])
-                ema_loss = loss if ema_loss is None else 0.9 * ema_loss + 0.1 * loss
-                dt = time.time() - t_log
-                log(
-                    f"step {step:6d}/{args.steps}  loss {loss:.6f}  "
-                    f"ema_loss {ema_loss:.6f}  gnorm {gnorm:.4f}  "
-                    f"lr {float(sched(step - 1)):.2e}  {dt / n_log:.2f}s/it"
-                )
-                t_log, n_log = time.time(), 0
-            # before the periodic save/export: the final save -> wait ->
-            # export below must run even if a periodic export would fail
-            if stop["sig"] is not None:
-                log(f"{stop['sig']} received; stopping at step {last_step} "
-                    "(resume with --resume)")
-                break
-            if step < args.steps and (
-                    (args.save_every and step % args.save_every == 0)
-                    or step in save_steps):
-                save(step)
-            if step < args.steps and (
-                    (args.export_every and step % args.export_every == 0)
-                    or step in export_steps):
-                export(step)
-            if args.max_hours and time.time() - t_train > args.max_hours * 3600:
-                log(f"--max-hours {args.max_hours} reached; "
-                    f"stopping at step {last_step}")
+        # a crash between the save of a snapshot step and its snapshot write:
+        # the restored state is exactly that step's params
+        if (resume_step is not None and start_step in snapshot_steps
+                and not snapshot_path(out_dir, start_step).exists()):
+            snapshot(start_step)
+        for k, ds, batch_size, img_tokens, offset, last in phases:
+            if last_step >= last:
+                continue  # resumed past this phase: never built or compiled
+            if k == 2:
+                if last_step == S:
+                    # the boundary state through the normal save path (a
+                    # no-op when already saved or when resumed at S)
+                    save(S)
+                # the boundary state is on disk before phase 2 is built;
+                # phase 1's loader / step / batches went with run_phase
+                fullft_ckpt.wait(manager)
+                gc.collect()
+                jax.clear_caches()
+                log(f"NOTE phase 2 from step {S}: data {args.phase2_data_dir}, "
+                    f"batch {batch_size}, img_tokens {img_tokens}, "
+                    f"lr {args.phase2_lr:.2e}")
+            if run_phase(k, ds, batch_size, img_tokens, offset, last):
                 break
 
         save(last_step)
         # resumable state is on disk before the export can fail (ENOSPC etc.)
         fullft_ckpt.wait(manager)
         export(last_step, final=True)
+        device_memory_note(phase_of(max(last_step, 1)))
     finally:
-        loader.close()
+        try:
+            wait_snapshot()
+        except Exception as e:  # never mask the original exception
+            print(f"WARNING: waiting for the snapshot writer failed: {e!r}",
+                  file=sys.stderr, flush=True)
         try:
             # a pending async save is dropped if the interpreter exits first
             fullft_ckpt.wait(manager)

@@ -519,6 +519,9 @@ Useful knobs:
 | `--resume-new-dataset` | off | with `--resume`/`--resume-step`: continue a checkpoint trained on another dataset version (see below); a no-op when the checkpoint already used this dataset |
 | `--verify-latents` | on | re-hash every latent shard at startup (reads the whole ~49 GB cache once) and refuse the run if any shard's bytes differ from its manifest digest; `--no-verify-latents` trusts the manifest |
 | `--prefetch` / `--loader-workers` | 4 / 4 | streaming loader queue depth / reader threads |
+| `--phase2-start S` + `--phase2-data-dir/-batch-size/-img-tokens/-lr` | – | two-phase curriculum: steps 1..S on the phase-1 flags, S+1..`--steps` on phase 2 (see below) |
+| `--decay-start D` | – | WSD: linear decay from the LR in force at D to `--min-lr` at `--steps`; not with `--cosine-decay` |
+| `--snapshot-steps` | – | comma-separated steps (< `--steps`; the final params are in the final checkpoint/export) after which the raw fp32 params go to `snapshots/model_stepNNNNNN_f32.safetensors` (for `scripts/average_snapshots.py`) |
 
 The step log prints `loss`, a smoothed `ema_loss`, the pre-clip gradient
 norm (`gnorm`), the LR and `s/it`.
@@ -641,6 +644,47 @@ python scripts/train_full.py ... --data-dir /scratch/krea2-data-Y \
   shows the position.
 - The flag needs an existing checkpoint: with `--resume` and an empty
   `ckpt/` (or without `--resume`) it refuses instead of starting fresh.
+
+#### Two-phase curriculum, WSD decay and fp32 snapshots
+
+`--phase2-start S` (with all four `--phase2-*` flags) trains steps 1..S on
+`--data-dir` / `--batch-size` / `--img-tokens` / `--lr` (e.g. 512 px
+latents) and steps S+1..`--steps` on the phase-2 dataset, batch,
+img_tokens and LR (e.g. 1024 px). The phase is a pure function of the
+global step; phase 2's data order starts at its own epoch 0 at step S
+(data step `step - S`). Params, AdamW state, EMA and one LR schedule over
+the global step (warmup -> `--lr` -> `--phase2-lr` from step S+1 ->
+optional `--decay-start` linear decay to `--min-lr`) carry across the
+boundary. After step S the train state is saved and waited for, phase 1's
+loader and compiled step are dropped (`jax.clear_caches()`), and phase 2 is
+built and compiled: `NOTE phase 2 from step S: data <dir>, batch <b>,
+img_tokens <t>, lr <lr>`. A resume of a step >= S goes straight to phase 2
+(phase 1 is never built or compiled). Both data dirs are fingerprinted at
+every start (the phase-2 spec `{start, batch_size, img_tokens,
+dataset_fingerprint, n_samples}` is the hard resume key `phase2`;
+`--phase2-lr` and `--decay-start` only warn), so both caches must be
+present; phase 1's is re-hashed only while it still has steps to run.
+`--resume-new-dataset` and `--cosine-decay` cannot be combined with it.
+
+`--snapshot-steps a,b,...` (each < `--steps`: the final params are in the
+final checkpoint/export) writes the raw fp32 params (official keys, F32)
+after those steps to `snapshots/model_stepNNNNNN_f32.safetensors` (never
+rotated by `--keep`; the device->host copy blocks one step, the atomic
+write runs in a background thread joined before exit) and prints
+`snapshot <abs path> <bytes>` once the file is complete. Average them into
+a drop-in bf16 `model.safetensors` (streamed tensor by tensor, f64
+accumulation, same writer and metadata as the trainer's export):
+
+```bash
+python scripts/average_snapshots.py run/snapshots/model_step00{7700,8000,8300}_f32.safetensors \
+  --out run/model_avg.safetensors [--weights 1,1,2]
+```
+
+After each phase's step is compiled the trainer prints `NOTE memory_analysis
+phase <k>: args A out O alias L temp T per device` (XLA's per-device sizes in
+GiB, when the backend reports them), and after the 3rd step of each phase
+and at the end `NOTE device memory phase <k>: peak P in_use U limit L`
+(device 0's `memory_stats()` in GiB, when available).
 
 ### Export and sample
 
