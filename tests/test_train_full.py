@@ -17,7 +17,8 @@ import numpy as np
 import pytest
 
 import train_full
-from helpers import REPO, STEP_RE, TINY, run_train, train_cmd
+from helpers import (REPO, STEP_RE, TINY, make_fake_latent_cache, run_train,
+                     train_cmd)
 
 REFUSED = "different run configuration"
 
@@ -156,7 +157,7 @@ def test_positions_bucketed():
 
 def _cfg(**kw):
     c = dict.fromkeys(train_full.RESUME_HARD_KEYS + train_full.RESUME_SOFT_KEYS, 0)
-    c.update(layer_loop="scan", ema_decay=0.9, dataset_fingerprint="a" * 64,
+    c.update(layer_loop="scan", ema_decay=0.9, dataset_fingerprint="a" * 64, phase2=None,
              n_samples=20)
     return {**c, **kw}
 
@@ -411,3 +412,136 @@ def test_layer_loop_unroll_matches_scan(fresh, job, tmp_path):
     assert max(abs(steps[s][0] - fresh.steps[s][0]) for s in steps) <= 1e-4
     assert tensor_shapes(out / "model.safetensors") == \
         tensor_shapes(fresh.out / "model.safetensors")
+
+
+# --- two-phase curriculum, WSD decay, fp32 snapshots ------------------------------
+
+ARGS = ["--base-ckpt", "-", "--data-dir", "-", "--text-encoder", "-", "--output-dir", "-",
+        "--steps", "100", "--warmup-steps", "10", "--lr", "2e-3"]
+P2 = ["--phase2-start", "40", "--phase2-data-dir", "-", "--phase2-batch-size", "8",
+      "--phase2-img-tokens", "16", "--phase2-lr", "1e-3"]
+
+
+@pytest.mark.parametrize("extra,lrs", [
+    ([], {1: 0.0, 10: 1.8e-3, 11: 2e-3, 100: 2e-3}),
+    (["--decay-start", "70"], {11: 2e-3, 70: 2e-3, 71: 2e-3, 100: 2e-3 / 30}),
+    (P2 + ["--decay-start", "70"], {1: 0.0, 10: 1.8e-3, 40: 2e-3, 41: 1e-3, 70: 1e-3,
+                                   71: 1e-3, 86: 0.5e-3, 100: 1e-3 / 30})])
+def test_phase_schedule(extra, lrs):
+    a = train_full.parse_args(ARGS + extra)
+    train_full.validate_phase_args(a)
+    sched = train_full.make_schedule(a)  # step s trains with sched(s - 1)
+    np.testing.assert_allclose([float(sched(s - 1)) for s in lrs], list(lrs.values()),
+                               rtol=1e-5, atol=1e-12)
+
+
+@pytest.mark.parametrize("extra,msg", [
+    (P2[:2], "--phase2-start needs --phase2-data-dir"),
+    (P2[2:], "need --phase2-start"),
+    (["--phase2-start", "100"] + P2[2:], "must be in"),
+    (P2 + ["--resume-new-dataset"], "--resume-new-dataset"),
+    (P2 + ["--cosine-decay"], "--cosine-decay"),
+    (["--decay-start", "5"], "--decay-start 5 must be in"),
+    (["--decay-start", "50", "--cosine-decay"], "mutually exclusive"),
+    (P2 + ["--decay-start", "30"], "decay must start in phase 2"),
+    (["--snapshot-steps", "50,101"], "<= --steps")])
+def test_phase_args_refused(extra, msg):
+    with pytest.raises(SystemExit, match=re.escape(msg)):
+        train_full.validate_phase_args(train_full.parse_args(ARGS + extra))
+
+
+def test_check_resume_config_phase2():
+    check = train_full.check_resume_config
+    spec = {"start": 6, "batch_size": 16, "img_tokens": 32,
+            "dataset_fingerprint": "c" * 64, "n_samples": 16}
+    old = {k: v for k, v in _cfg().items() if k not in ("phase2", "phase2_lr", "decay_start")}
+    single = _cfg(phase2_lr=None, decay_start=None)
+    assert check(old, single, 6) == []  # run1/run2 checkpoints resume silently
+    two = _cfg(phase2=spec, phase2_lr=1e-3, decay_start=9)
+    for saved, cur in ((old, two), (None, two), (two, single),
+                       (two, {**two, "phase2": {**spec, "img_tokens": 16}})):
+        with pytest.raises(SystemExit, match="phase2: checkpoint"):
+            check(saved, cur, 7)
+    assert any("decay_start: checkpoint 9, now 10" in w
+               for w in check(two, {**two, "decay_start": 10}, 7))
+
+
+@pytest.fixture(scope="module")
+def two_phase(job, tmp_path_factory):
+    d = tmp_path_factory.mktemp("p2")
+    make_fake_latent_cache(d / "data2", [
+        {"id": i, "bucket_w": (64, 96)[i % 2], "bucket_h": 64,
+         "tar": f"data/train-{i % 2:04d}.tar"} for i in range(100, 116)],
+        lat_channels=TINY["channels"])
+    args = ("--phase2-start", "6", "--phase2-data-dir", str(d / "data2"),
+            "--phase2-batch-size", "16", "--phase2-img-tokens", "32", "--phase2-lr", "5e-4",
+            "--decay-start", "9", "--snapshot-steps", "8,10", "--save-steps", "8")
+    steps, stdout, _ = run_train(*job, d / "run", extra=args)
+    return SimpleNamespace(steps=steps, stdout=stdout, out=d / "run", args=args,
+                           data2=d / "data2")
+
+
+def snap(out, step):
+    return (out / "snapshots" / f"model_step{step:06d}_f32.safetensors").resolve()
+
+
+def tensors(path):
+    from safetensors import safe_open
+    with safe_open(str(path), framework="numpy") as f:
+        return {k: f.get_tensor(k).tobytes() for k in f.keys()}, f.metadata()
+
+
+def test_two_phase_run(two_phase):
+    out, lines = two_phase.out, two_phase.stdout.splitlines()
+    assert sorted(two_phase.steps) == list(range(1, 13))
+    assert np.isfinite([v for s in two_phase.steps.values() for v in s]).all()
+    note = (f"NOTE phase 2 from step 6: data {two_phase.data2}, batch 16, img_tokens 32, "
+            "lr 5.00e-04")
+    assert lines.count(note) == 1
+    assert lines.index(note) > lines.index(f"saved train state {out / 'ckpt'}/6 (async)")
+    assert re.search(r"^step\s+7/12 .* lr 5\.00e-04 ", two_phase.stdout, re.M)
+    snaps = re.findall(r"^snapshot (\S+) (\d+)$", two_phase.stdout, re.M)
+    assert snaps == [(str(snap(out, s)), str(snap(out, s).stat().st_size)) for s in (8, 10)]
+    for name, tok in (("model_step000006.safetensors", "16"), ("model.safetensors", "32")):
+        assert tensors(out / name)[1]["img_tokens"] == tok
+
+
+def test_snapshot_average_matches_export(two_phase, tmp_path):
+    import average_snapshots
+    ref = tmp_path / "ref.safetensors"
+    subprocess.run([sys.executable, str(REPO / "scripts" / "export_full.py"),
+                    "--ckpt-dir", str(two_phase.out / "ckpt"), "--step", "8",
+                    "--output", str(ref), "--source", "params"],
+                   check=True, capture_output=True)
+    s8, s10 = str(snap(two_phase.out, 8)), str(snap(two_phase.out, 10))
+    for name, inputs in (("one", [s8]), ("two", [s8, s8]), ("mix", [s8, s10])):
+        average_snapshots.main([*inputs, "--out", str(tmp_path / name)])
+    want = tensors(ref)[0]
+    (one, one_meta), (two, two_meta) = tensors(tmp_path / "one"), tensors(tmp_path / "two")
+    assert one == want and two == want and tensors(tmp_path / "mix")[0] != want
+    assert one_meta == {"step": "8", "base": "base.safetensors", "resolution": "bucketed",
+                        "img_tokens": "32", "source": "params"}
+    assert two_meta["source"] == "params-avg" and two_meta["avg_steps"] == "8,8"
+    with pytest.raises(SystemExit, match="not an fp32 snapshot"):
+        average_snapshots.main([s8, str(ref), "--out", str(tmp_path / "bad")])
+    assert not (tmp_path / "bad").exists()
+
+
+@pytest.mark.parametrize("extra", [(), ("--phase2-batch-size", "8")])
+def test_resume_in_phase2(two_phase, job, tmp_path, extra):
+    d = tmp_path / "run"
+    shutil.copytree(two_phase.out / "ckpt" / "8", d / "ckpt" / "8")
+    steps, out, err = run_train(*job, d, extra=two_phase.args + ("--resume",) + extra,
+                                ok=not extra)
+    if extra:
+        assert REFUSED in err and "phase2: checkpoint" in err
+        assert "resumed train state" not in out
+        return
+    # straight into phase 2 (phase 1 never built): data step 8 - 6 = 2
+    assert [ln for ln in out.splitlines() if ln.startswith("data: ")] == [
+        "data: step 9 reads data step 2 (epoch 2, batch 0/1; data_step_offset 6)"]
+    assert "memory_analysis phase 1" not in out and "latents NOT verified (phase 1" in out
+    assert "NOTE phase 2 from step 6" in out and sorted(steps) == list(range(9, 13))
+    assert max(abs(steps[s][0] - two_phase.steps[s][0]) for s in steps) <= 1e-5
+    # the missing snapshot of the resumed step is rewritten from the restored state
+    assert snap(d, 8).read_bytes() == snap(two_phase.out, 8).read_bytes()
