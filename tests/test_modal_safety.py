@@ -146,6 +146,14 @@ def test_finalize_refuses_before_publishing(tmp_path, role, private, auth_ok, er
 
 
 
+@pytest.mark.parametrize("flags", [{"bench": True}, {"build": True}, {"stage_only": True}, {"finalize_only": True},
+                                   {"cache_name": "v3"}, {"src_drive": "p"}, {"dest_r2": "x"}, {"reset_upload_cache": True}])
+def test_profile_refused_with_other_mode_or_cache_flag(flags):
+    assert mcl.resolve_mode(profile=True) == "profile"
+    with pytest.raises(SystemExit):   # main calls resolve_mode before any Modal call
+        mcl.resolve_mode(profile=True, **flags)
+
+
 @pytest.mark.parametrize("name,src,dest,mode", [
     ("", "selection_v3/package", "", "build"), ("", "", "latents_v3", "finalize"), ("v3", "", "latents_v3", "build"),
     ("v3", "selection_v3/package", "", "build"), ("v3", "a/../b", "latents_v3", "build"), ("../x", "p", "y", "stage")])

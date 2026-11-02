@@ -10,6 +10,7 @@ Drive and upload it to Cloudflare R2 (the node kit's DATA_SOURCE=r2).
         --containers 4 --batch 16 --cpu 12 --worker-timeout-h 4 --vae-impl 2d
     modal run scripts/modal_cache_latents.py --finalize-only          # manifest + upload again
     modal run scripts/modal_cache_latents.py --finalize-only --reset-upload-cache
+    modal run scripts/modal_cache_latents.py --profile [--gpu B200]   # mode 4
 
 Mode 1 (--bench): `prep` (CPU) puts metadata.parquet + data/train-0000.tar of
 ricecake/danbooru-curated-v2 into /vol/bench and the Qwen-Image VAE into
@@ -29,7 +30,8 @@ bf16 D2H, 1 CPU thread), each >= max(64 images, 3 batches) and >= 10 s after
 one warmup call, stopping at the first OOM. A GPU type that is unavailable
 or fails becomes an error row; the others still report. Locally: cost per
 image for every (GPU, impl) (GPU + the CPU cores needed to keep it fed + 32
-GiB, Modal prices of PRICES_DATE), the selection (lowest $/img; anything
+GiB of memory, billed by use and modelled as 32 GiB: no function reserves
+memory=; Modal prices of PRICES_DATE), the selection (lowest $/img; anything
 within 5% of it is a tie, broken by higher img/s) and the exact build
 command (incl. --vae-impl). torch.compile artifacts live in /vol/inductor,
 so the build workers reuse the bench's compile.
@@ -115,12 +117,33 @@ finalize_r2 containers (cents to well under $1) and R2 storage (~100 GB,
 itself says 3). The training node downloads the cache with DATA_SOURCE=r2
 DATA_R2_PREFIX=latents_v3 (krea2-ops/node).
 
+Mode 4 (--profile): where the encoder's GPU time goes (scripts/vae_profile.py)
+on one --gpu container (default B200, 8 cores, no memory reservation; hard
+Modal timeout PROFILE_TIMEOUT_S = 20 min, so the cost cap printed before the
+spawn is 20 min x that container's $/h with memory modelled as 32 GiB used:
+B200 $2.29 at PRICES_DATE prices, plus
+cents for `prep`). `prep` (VAE only) first, then `profile_gpu`: seeded
+random images at the bench bucket (1216x832), batch 4, bf16: FLOPs per
+stage, eager per-stage CUDA-event timing, parity (check_impls) of
+2d-compile / 2d-compile-cl (channels_last) / 2d, torch.profiler of the
+2d-compile production step (kernel categories, top kernels, GPU idle,
+gzip chrome trace), the SDPA backends at the mid attention's shape, the
+variants' run_ladder at batch 4 (sections bounded by PROFILE_BUDGET_S = 10
+min), then, only with PROFILE_MAT_RESERVE_S of the timeout left, the same
+for torch.compile mode="max-autotune-no-cudagraphs" (2d-compile-mat). The
+report so far is saved to /vol/profile/<ts>/ after every section and
+fetched from there if the container times out. Refused with any other mode or with
+--cache-name / --src-drive / --dest-r2 / --reset-upload-cache. Output:
+/home/mj/krea2-ops/mi350x/results/modal/vae_profile_<ts>/{report.md,
+profile.json,trace.json.gz} (also kept in /vol/profile/<ts>/).
+
 Volume `krea2-latents` (Volumes v2, created on first use):
     /vol/hf       HF_HOME (VAE weights downloaded once)
     /vol/bench    metadata.parquet, data/train-0000.tar (bench input)
     /vol/krea2    latents/train-XXXX.safetensors, then metadata.parquet +
                   latents/manifest.json (the v2 cache; uploaded as the repo
                   root)
+    /vol/profile/TS     --profile results
     /vol/src/NAME       staged image package of a named cache + stage.json
     /vol/krea2-NAME     a named cache (same layout as /vol/krea2) +
                         .input_generation.json (never uploaded)
@@ -204,6 +227,16 @@ BF16_SLACK = 1.5
 BF16_ABS = 1e-3
 CHECK_SEED = 1234
 CHECK_IMAGES = 2
+# --profile (scripts/vae_profile.py): one container, bench bucket, batch 4
+PROFILE_GPU = "B200"
+PROFILE_TIMEOUT_S = 20 * 60   # hard Modal timeout = the cost cap
+PROFILE_BUDGET_S = 10 * 60    # GPU sections after the VAE load
+PROFILE_BATCH = 4             # the v3 build's --batch
+# the max-autotune variant (two compiles: fp32 parity + bf16) starts only
+# with this much of PROFILE_TIMEOUT_S left (the report so far is on the
+# volume after every section)
+PROFILE_MAT_RESERVE_S = 8 * 60
+VOL_PROFILE = f"{VOL}/profile"
 DEFAULT_GPUS = ("L4,A10,L40S,A100-40GB,A100-80GB,RTX-PRO-6000,H100!,H200,"
                 "B200,B300")
 TIE_FRAC = 0.05
@@ -224,8 +257,9 @@ GPU_PRICE_USD_H = {
 }
 CPU_CORE_USD_H = 0.0472   # per physical core (Modal `cpu=` counts physical)
 MEM_GIB_USD_H = 0.00799
+# no Modal function sets memory= (user rule: cpu= only): memory is billed by
+# actual use, without a reservation; the cost model assumes MEM_GIB in use
 MEM_GIB = 32
-MEM_MB = MEM_GIB * 1024
 
 # image pins: torch cu132 (CUDA 13.2 >= the 13.1 B300 needs; Blackwell
 # sm_100/sm_103/sm_120 kernels; runs on Modal's 13.0 host driver through
@@ -504,7 +538,8 @@ def render_bench_report(results, rows, choice, prep=None,
            "",
            f"Bucket {BENCH_BUCKET[0]}x{BENCH_BUCKET[1]}, {n_images} images, "
            f"prices of {PRICES_DATE} (cpu ${CPU_CORE_USD_H}/core-h, memory "
-           f"{MEM_GIB} GiB at ${MEM_GIB_USD_H}/GiB-h), {overhead_min:g} min "
+           f"{MEM_GIB} GiB at ${MEM_GIB_USD_H}/GiB-h: billed by use, no "
+           f"reservation, modelled as {MEM_GIB} GiB), {overhead_min:g} min "
            "startup + VAE load per container. cores = max(4, ceil(1.5 * "
            "img/s / decode img/s/thread) + 1). fp32/bf16 err = max |impl - "
            "ref fp32| / max |ref fp32| of the posterior mean on "
@@ -976,7 +1011,8 @@ def gate_check(c, tol=CHECK_TOL, slack=BF16_SLACK, abs_tol=BF16_ABS):
     return not reasons, reasons
 
 
-def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
+def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print,
+                factory=None):
     """Correctness of each impl against the diffusers reference on images x
     (N, 3, H, W), gated by gate_check:
       fp32 (VAE cast to fp32, TF32 off so cuDNN/cuBLAS really compute fp32):
@@ -987,7 +1023,9 @@ def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
     -> (checks {impl: {fp32_*_max_rel, bf16_*_max_rel, ref_bf16_*_max_rel,
     first_call_s, ok, fail_reasons[, error]}}, encoders {impl: FastEncoder
     at the production dtype} for the impls that passed). first_call_s is the
-    first production-dtype call (2d-compile: its compile time)."""
+    first production-dtype call (2d-compile: its compile time). factory
+    {name: fn(vae) -> encoder} builds the named impls (variants of the
+    profile, scripts/vae_profile.py); the others are vae_fast.make_encoder."""
     import torch
     import vae_fast
 
@@ -998,6 +1036,11 @@ def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
     def seeded(enc):
         torch.manual_seed(CHECK_SEED)
         return enc(x)
+
+    def make(impl):
+        if impl in (factory or {}):
+            return factory[impl](vae)
+        return vae_fast.make_encoder(vae, impl)
 
     checks = {i: {} for i in impls}
     dtype0 = vae.dtype
@@ -1017,7 +1060,7 @@ def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
                          fp32_sample_max_rel=0.0)
                 continue
             try:
-                enc = vae_fast.make_encoder(vae, impl)
+                enc = make(impl)
                 m, s = enc.dist(x)
                 c.update(fp32_mean_max_rel=max_rel(m, m_ref),
                          fp32_std_max_rel=max_rel(s, s_ref),
@@ -1039,7 +1082,7 @@ def check_impls(vae, impls, x, tol=CHECK_TOL, cuda=None, log=print):
         c.update(ref_err)
         if "error" not in c:
             try:
-                enc = vae_fast.make_encoder(vae, impl)
+                enc = make(impl)
                 sync()
                 t0 = time.perf_counter()
                 m, s = enc.dist(x)
@@ -1372,6 +1415,124 @@ def finalize_impl(vol, api=None, out_dir=VOL_OUT, runner=subprocess.run,
 
 
 # ------------------------------------------- named caches: Drive in, R2 out
+def resolve_mode(bench=False, build=False, finalize_only=False,
+                 stage_only=False, profile=False, reset_upload_cache=False,
+                 cache_name="", src_drive="", dest_r2=""):
+    """CLI mode flags -> bench | build | finalize | stage | profile
+    (SystemExit on misuse, before any Modal call). --profile takes only
+    --gpu: no cache, Drive, R2 or upload flags."""
+    modes = [m for m, on in (("--bench", bench), ("--build", build),
+                             ("--finalize-only", finalize_only),
+                             ("--stage-only", stage_only),
+                             ("--profile", profile)) if on]
+    if len(modes) != 1:
+        raise SystemExit("choose exactly one of --bench, --build, "
+                         "--finalize-only, --stage-only, --profile (got "
+                         f"{modes or 'none'})")
+    if profile:
+        extra = [f for f, v in (("--cache-name", cache_name),
+                                ("--src-drive", src_drive),
+                                ("--dest-r2", dest_r2),
+                                ("--reset-upload-cache", reset_upload_cache))
+                 if v]
+        if extra:
+            raise SystemExit(f"--profile takes no {', '.join(extra)}")
+        return "profile"
+    if (bench or stage_only) and reset_upload_cache:
+        raise SystemExit("--reset-upload-cache goes with --build or "
+                         "--finalize-only")
+    return ("bench" if bench else "build" if build else
+            "stage" if stage_only else "finalize")
+
+
+def profile_cost_cap(gpu, cores=BENCH_CPU, timeout_s=PROFILE_TIMEOUT_S):
+    """-> (usd cap, line): the profile container's hard timeout x its $/h
+    (GPU + cores + memory)."""
+    h = hourly_usd(gpu, cores)
+    cap = h * timeout_s / 3600
+    return cap, (f"cost cap: {timeout_s / 60:g} min timeout x ${h:.2f}/h "
+                 f"({gpu_key(gpu)} ${GPU_PRICE_USD_H[gpu_key(gpu)]:.2f} + "
+                 f"{cores} cores + {MEM_GIB} GiB memory modelled (billed by "
+                 f"use, no reservation), prices of {PRICES_DATE}) "
+                 f"= ${cap:.2f}, plus cents for the CPU prep container")
+
+
+def write_profile_results(r, root):
+    """profile_gpu result {json, report_md, trace_gz} -> files in root
+    (report.md, profile.json, trace.json.gz when present) -> root."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "report.md").write_text((r.get("report_md") or "") + "\n")
+    (root / "profile.json").write_text(r.get("json") or "{}")
+    if r.get("trace_gz"):
+        (root / "trace.json.gz").write_bytes(r["trace_gz"])
+    return root
+
+
+def profile_gpu_impl(gpu_requested, ts, out_root=VOL_PROFILE,
+                     budget_s=PROFILE_BUDGET_S, commit=None, log=print):
+    """Runs in the profile container: VAE (bf16, from the volume's HF cache)
+    -> vae_profile.profile_impl at the bench bucket, batch PROFILE_BATCH ->
+    {json (plain, serialized here so a torch type fails in the container,
+    not on the laptop), report_md, trace_gz (bytes), vol_dir}; the same
+    files go to out_root/<ts>/ on the volume, also after every section
+    (checkpoint, then commit()), so a container killed by the timeout
+    leaves the report so far; the max-autotune variant starts only with
+    PROFILE_MAT_RESERVE_S of PROFILE_TIMEOUT_S left. Never raises."""
+    t_start = time.monotonic()
+    d = Path(out_root) / ts
+    res = {"gpu_requested": gpu_requested}
+    md = None
+
+    def pack(r, md):
+        tp = d / "trace.json.gz"
+        return {"json": json.dumps(to_plain(r), indent=1), "report_md": md,
+                "trace_gz": tp.read_bytes() if tp.exists() else None,
+                "vol_dir": str(d)}
+
+    def checkpoint(r):
+        md = vae_profile.render_markdown(
+            r, title=f"VAE encoder profile, {gpu_requested} (partial: "
+            f"{', '.join(r.get('sections') or {})})")
+        write_profile_results(pack({**res, **r}, md), d)
+        if commit:
+            commit()
+
+    try:
+        import torch
+
+        import_cache_latents()   # /repo/scripts on sys.path
+        import vae_profile
+        from cache_dataset import VaeEncoder
+
+        d.mkdir(parents=True, exist_ok=True)
+        t0 = time.perf_counter()
+        vae = VaeEncoder(VAE_REPO, "cuda", torch.bfloat16)
+        res["vae_load_s"] = time.perf_counter() - t0
+        w, h = BENCH_BUCKET
+        res.update(vae_profile.profile_impl(
+            vae, "cuda", h=h, w=w, batch=PROFILE_BATCH, budget_s=budget_s,
+            min_images=MIN_IMAGES, min_seconds=MIN_SECONDS,
+            trace_path=str(d / "trace.json.gz"), check_impls=check_impls,
+            run_ladder=run_ladder, checkpoint=checkpoint,
+            mat_start_by=t_start + PROFILE_TIMEOUT_S - PROFILE_MAT_RESERVE_S,
+            log=log))
+        md = vae_profile.render_markdown(
+            res, title=f"VAE encoder profile, {gpu_requested}")
+    except Exception:  # noqa: BLE001
+        res["error"] = traceback.format_exc()[-4000:]
+        log(res["error"])
+    if md is None:
+        md = (f"# VAE encoder profile, {gpu_requested}: FAILED\n\n```\n"
+              f"{res.get('error')}\n```")
+    out = pack(res, md)
+    try:
+        write_profile_results(out, d)
+    except Exception as e:  # noqa: BLE001 - the return still carries it
+        log(f"volume copy failed: {type(e).__name__}: {e}")
+    return out
+
+
 def resolve_job(cache_name="", src_drive="", dest_r2="", mode="build"):
     """CLI flags -> {name, out, src, src_remote, dest} (validated; SystemExit
     on misuse). mode: bench | build | finalize | stage | worker (paths only).
@@ -1469,7 +1630,8 @@ def render_estimate(n_images, gpu, cpu, containers, vae_impl, batch):
     return (f"estimate: {n_images} images on {containers} x {gpu} at "
             f"{v['img_s']:.1f} img/s each (v2 build): ${e['usd']:.2f} GPU "
             f"containers (${e['usd_h']:.2f}/h each, {e['gpu_h']:.2f} h + "
-            f"{containers} x {DEFAULT_OVERHEAD_MIN:g} min startup), wall "
+            f"{containers} x {DEFAULT_OVERHEAD_MIN:g} min startup; memory "
+            f"billed by use, modelled as {MEM_GIB} GiB), wall "
             f"{e['wall_h'] * 60:.0f} min; cost model's worker timeout "
             f"{e['worker_timeout_h']} h")
 
@@ -1917,29 +2079,36 @@ if modal is not None:
     app = modal.App("krea2-cache-latents", image=image)
     mounts = {"volumes": {VOL: vol}, "secrets": [hf_secret]}
 
-    @app.function(cpu=2.0, memory=8192, timeout=30 * 60, **mounts)
+    @app.function(cpu=2.0, timeout=30 * 60, **mounts)
     def prep(bench_files: bool = True) -> dict:
         out = prep_impl(bench_files)
         vol.commit()   # the bench/build containers start from this state
         return out
 
     # gpu is always overridden per call with .with_options(gpu=...)
-    @app.function(gpu="L4", cpu=float(BENCH_CPU), memory=MEM_MB,
+    @app.function(gpu="L4", cpu=float(BENCH_CPU),
                   timeout=BENCH_TIMEOUT_S, **mounts)
     def bench_gpu(gpu_requested: str, n_decode: int, impls: list) -> dict:
         res = bench_gpu_impl(gpu_requested, n_decode, impls)
         commit_volume(vol)   # the compile cache (/vol/inductor) for workers
         return res
 
+    # gpu is set per call with .with_options; the timeout is the cost cap
+    @app.function(gpu=PROFILE_GPU, cpu=float(BENCH_CPU),
+                  timeout=PROFILE_TIMEOUT_S, **mounts)
+    def profile_gpu(gpu_requested: str, ts: str) -> dict:
+        return profile_gpu_impl(gpu_requested, ts,
+                                commit=lambda: commit_volume(vol))
+
     # gpu, cpu and timeout are always overridden per build with .with_options
-    @app.function(gpu="L4", cpu=8.0, memory=MEM_MB,
+    @app.function(gpu="L4", cpu=8.0,
                   timeout=DEFAULT_WORKER_TIMEOUT_H * 3600, **mounts)
     def build_worker(i: int, n: int, batch: int, decode_threads: int,
                      vae_impl: str = "ref", cache_name: str = "") -> dict:
         return build_worker_impl(i, n, batch, decode_threads, vol, vae_impl,
                                  cache_name)
 
-    @app.function(cpu=4.0, memory=16384, timeout=2 * 3600, **mounts)
+    @app.function(cpu=4.0, timeout=2 * 3600, **mounts)
     def finalize(reset_upload_cache: bool = False) -> dict:
         return finalize_impl(vol, reset_upload_cache=reset_upload_cache)
 
@@ -1971,8 +2140,7 @@ if modal is not None:
         calls = []
         for g in gl:
             try:
-                fn = bench_gpu.with_options(gpu=g, cpu=float(BENCH_CPU),
-                                            memory=MEM_MB)
+                fn = bench_gpu.with_options(gpu=g, cpu=float(BENCH_CPU))
                 calls.append((g, fn.spawn(g, n_decode, il)))
             except Exception as e:  # noqa: BLE001
                 calls.append((g, e))
@@ -2008,6 +2176,39 @@ if modal is not None:
         print("\n" + "=" * 72 + "\n" + md)
         d = write_bench_results(results, rows, choice, md, prep=p)
         print(f"\nwrote {d}/report.md and bench.json")
+
+    def profile_local(gpu):
+        gpu = (gpu or PROFILE_GPU).strip().upper()
+        cap, line = profile_cost_cap(gpu)
+        print(f"--profile on {gpu}: {line}")
+        p = prep.remote(False)   # VAE onto the volume (no bench files)
+        _print_prep(p)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        d = LOCAL_RESULTS / f"vae_profile_{ts}"
+        fn = profile_gpu.with_options(gpu=gpu, cpu=float(BENCH_CPU),
+                                      timeout=PROFILE_TIMEOUT_S)
+        try:
+            r = fn.remote(gpu, ts)
+        except Exception as e:  # noqa: BLE001 - e.g. the hard timeout
+            print(f"profile_gpu failed: {type(e).__name__}: {e}; fetching "
+                  f"the latest checkpoint (saved after every section) from "
+                  f"the volume")
+            r = {}
+            for k, f in (("report_md", "report.md"), ("json", "profile.json"),
+                         ("trace_gz", "trace.json.gz")):
+                try:
+                    b = b"".join(vol.read_file(
+                        f"{VOL_PROFILE[len(VOL) + 1:]}/{ts}/{f}"))
+                    r[k] = b if k == "trace_gz" else b.decode()
+                except Exception as e2:  # noqa: BLE001
+                    print(f"  {f}: {type(e2).__name__}: {e2}")
+            if not r:
+                raise SystemExit("profile FAILED and no checkpoint on the "
+                                 "volume") from e
+        write_profile_results(r, d)
+        print("\n" + "=" * 72 + "\n" + (r.get("report_md") or ""))
+        print(f"\nwrote {d}/ (report.md, profile.json"
+              + (", trace.json.gz" if r.get("trace_gz") else "") + ")")
 
     def _write_build_log(params, p, workers, fin):
         md = render_build_log(params, p, workers, fin)
@@ -2072,8 +2273,7 @@ if modal is not None:
             raise SystemExit("aborting before any GPU starts: "
                              + WRITE_HELP.format(reason=p["write_reason"]))
         fn = build_worker.with_options(
-            gpu=gpu, cpu=float(cpu), memory=MEM_MB,
-            timeout=int(worker_timeout_h * 3600))
+            gpu=gpu, cpu=float(cpu), timeout=int(worker_timeout_h * 3600))
         calls = [fn.spawn(i, containers, batch, threads, vae_impl,
                           job["name"])
                  for i in range(containers)]
@@ -2104,25 +2304,19 @@ if modal is not None:
              n_decode: int = 128,
              overhead_min: float = DEFAULT_OVERHEAD_MIN,
              build: bool = False, finalize_only: bool = False,
-             stage_only: bool = False,
+             stage_only: bool = False, profile: bool = False,
              gpu: str = "", containers: int = DEFAULT_CONTAINERS,
              batch: int = 8, cpu: int = 8, decode_threads: int = 0,
              worker_timeout_h: float = DEFAULT_WORKER_TIMEOUT_H,
              reset_upload_cache: bool = False,
              impls: str = DEFAULT_IMPLS, vae_impl: str = "ref",
              cache_name: str = "", src_drive: str = "", dest_r2: str = ""):
-        modes = [m for m, on in (("--bench", bench), ("--build", build),
-                                 ("--finalize-only", finalize_only),
-                                 ("--stage-only", stage_only)) if on]
-        if len(modes) != 1:
-            raise SystemExit("choose exactly one of --bench, --build, "
-                             "--finalize-only, --stage-only (got "
-                             f"{modes or 'none'})")
-        if (bench or stage_only) and reset_upload_cache:
-            raise SystemExit("--reset-upload-cache goes with --build or "
-                             "--finalize-only")
-        mode = ("bench" if bench else "build" if build else
-                "stage" if stage_only else "finalize")
+        mode = resolve_mode(bench, build, finalize_only, stage_only,
+                            profile, reset_upload_cache, cache_name,
+                            src_drive, dest_r2)
+        if mode == "profile":
+            profile_local(gpu)
+            return
         job = resolve_job(cache_name, src_drive, dest_r2, mode)
         if job["name"] and reset_upload_cache:
             raise SystemExit("--reset-upload-cache is for the HF upload of "
