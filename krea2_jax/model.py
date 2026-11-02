@@ -490,13 +490,21 @@ def aiter_attention(q, k, v, keymask=None, mesh=None, kernel=None):
     the "fsdp" batch axis (per-device local cu_seqlens), like
     `splash_attention`. kernel: callable with the `flash_attn_varlen`
     signature (e.g. `varlen_reference_kernel`); None imports jax-aiter.
+    Single device (mesh=None, kernel=None): runs exactly the node-verified
+    path, i.e. the raw kernel under shard_map over a 1-device mesh of the
+    default device (the public `flash_attn_varlen` entry point was never
+    validated here).
     """
     from jax.sharding import PartitionSpec as P
 
     B, Hq, L, D = q.shape
     Hk = k.shape[1]
     if kernel is None:
-        kernel = _load_aiter_kernel(sharded=mesh is not None)
+        if mesh is None:
+            from jax.sharding import Mesh
+
+            mesh = Mesh(np.array(jax.devices()[:1]), axis_names=("fsdp",))
+        kernel = _load_aiter_kernel(sharded=True)
     if keymask is None:
         keymask = jnp.ones((B, L), dtype=bool)
     scale = 1.0 / math.sqrt(D)
@@ -670,7 +678,9 @@ def single_stream_block(x, p, tvec6, freqs, keymask, cfg: Krea2Config,
                         attn_interpret=False, attn_shard="batch",
                         act_sharding=None, attn_kernel=None,
                         fuse_proj="off"):
-    mods = tvec6 + p["mod"]["lin"]  # (B, 1, 6*features)
+    # (B, 1, 6*features); a F32 table adds in F32, the result is cast to
+    # the activation dtype (no-op when tvec6, table and x share a dtype)
+    mods = (tvec6 + p["mod"]["lin"]).astype(x.dtype)
     prescale, preshift, pregate, postscale, postshift, postgate = jnp.split(
         mods, 6, axis=-1
     )
@@ -708,7 +718,7 @@ def text_fusion_block(x, p, heads, kvheads, keymask=None, lora=None,
 
 def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
                         lora=None, lora_scale=1.0, act_sharding=None,
-                        fuse_proj="off"):
+                        fuse_proj="off", act_dtype=None):
     """TextFusionTransformer: fuse per-layer encoder states then refine.
 
     context: (B, L, txtlayers, txtdim) -> (B, L, txtdim)
@@ -726,6 +736,8 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
     x = x.reshape(B, L, N, D).transpose(0, 1, 3, 2)  # (B, L, D, N)
     x = linear(x, p["projector"], _lget(lora, "projector"), lora_scale,
                act_sharding=act_sharding)[..., 0]
+    if act_dtype is not None:
+        x = x.astype(act_dtype)
     for i in range(2):  # refiner blocks attend across the L text tokens
         blk = _layer(p["refiner_blocks"], i)
         x = text_fusion_block(
@@ -739,32 +751,35 @@ def text_fusion_forward(context, p, cfg: Krea2Config, keymask=None,
 
 def text_tokens_forward(params, cfg: Krea2Config, context, keymask=None,
                         lora=None, lora_scale=1.0, act_sharding=None,
-                        fuse_proj="off"):
+                        fuse_proj="off", act_dtype=None):
     """Text branch of the DiT: text fusion + txtmlp -> (B, L, features).
 
     Independent of the timestep and the image, so it can be computed once
     per prompt and reused across sampling steps (`dit_forward(txt_tokens=)`).
-    act_sharding, fuse_proj: as in `dit_forward`.
+    act_sharding, fuse_proj, act_dtype: as in `dit_forward`.
     """
     sh = act_sharding
+    if act_dtype is not None:
+        context = context.astype(act_dtype)
     txt = text_fusion_forward(
         context, params["txtfusion"], cfg, keymask=keymask,
         lora=_lget(lora, "txtfusion"), lora_scale=lora_scale,
-        act_sharding=sh, fuse_proj=fuse_proj,
+        act_sharding=sh, fuse_proj=fuse_proj, act_dtype=act_dtype,
     )
     txt = rms_norm(txt, params["txtmlp"]["0"]["scale"])
     txt = linear(txt, params["txtmlp"]["1"], _lget(lora, "txtmlp", "1"),
                  lora_scale, act_sharding=sh)
-    return linear(
+    txt = linear(
         gelu_tanh(txt), params["txtmlp"]["3"], _lget(lora, "txtmlp", "3"),
         lora_scale, act_sharding=sh,
     )
+    return txt if act_dtype is None else txt.astype(act_dtype)
 
 
 def last_layer_forward(x, p, tvec, lora=None, lora_scale=1.0,
                        act_sharding=None):
     """Modulated RMSNorm + projection back to patch pixels."""
-    mods = tvec + p["modulation"]["lin"][None]  # (B, 2, features)
+    mods = (tvec + p["modulation"]["lin"][None]).astype(x.dtype)  # (B, 2, F)
     scale, shift = mods[:, 0:1], mods[:, 1:2]
     x = (1 + scale) * rms_norm(x, p["norm"]["scale"]) + shift
     return linear(x, p["linear"], _lget(lora, "linear"), lora_scale,
@@ -802,6 +817,7 @@ def dit_forward(
     txt_tokens=None,     # precomputed text_tokens_forward(...); skips context
     layer_loop="scan",   # "scan" (lax.scan over stacked blocks) or "unroll"
     fuse_proj="off",     # "off", "concat" or "concat-attn"; see below
+    act_dtype=None,      # mixed-precision trees: activation dtype, see below
 ):
     """Velocity prediction for the flow ODE. Returns (B, Limg, patch²·channels).
 
@@ -864,6 +880,16 @@ def dit_forward(
     "xla" implementation with identical semantics. Under attn_mesh it
     constrains the batch to the "fsdp" axis when the batch divides it and
     otherwise leaves sharding to the partitioner (no shard_map).
+
+    act_dtype: for a tree whose leaves keep different stored dtypes (e.g.
+    bf16 matmul weights + the 174 F32 norm/modulation/projection tensors of
+    the official files). The F32 linears (first, tmlp, tproj, txtmlp,
+    projector, last.linear) compute in F32 and their outputs are cast to
+    act_dtype; modulation tables add in F32 (the timestep path stays in the
+    tmlp/tproj dtype) and are then cast to the activation dtype, as
+    maxdiffusion does; RMSNorm scales are always applied in F32. The residual
+    stream, attention and the bf16 GEMMs stay in act_dtype, and the output
+    is act_dtype. None (default): plain dtype promotion, unchanged.
     """
     if layer_loop not in ("scan", "unroll"):
         raise ValueError(f"unknown layer_loop: {layer_loop!r} "
@@ -878,10 +904,12 @@ def dit_forward(
     Ltxt = (txt_tokens if txt_tokens is not None else context).shape[1]
     sh = act_sharding
 
-    x = linear(img, params["first"], _lget(lora, "first"), lora_scale,
-               act_sharding=sh)
+    cast = (lambda a: a) if act_dtype is None else (lambda a: a.astype(act_dtype))
+    x = cast(linear(cast(img), params["first"], _lget(lora, "first"),
+                    lora_scale, act_sharding=sh))
 
-    tv = timestep_embedding(t, cfg.tdim, dtype=x.dtype)
+    tv = timestep_embedding(t, cfg.tdim, dtype=(
+        x.dtype if act_dtype is None else params["tmlp"]["0"]["weight"].dtype))
     tv = linear(tv, params["tmlp"]["0"], _lget(lora, "tmlp", "0"), lora_scale,
                 act_sharding=sh)
     tv = linear(
@@ -897,6 +925,7 @@ def dit_forward(
         txt = text_tokens_forward(
             params, cfg, context, mask[:, :Ltxt], lora=lora,
             lora_scale=lora_scale, act_sharding=sh, fuse_proj=fuse_proj,
+            act_dtype=act_dtype,
         )
     else:
         txt = _constrain(txt_tokens.astype(x.dtype), sh)
@@ -989,10 +1018,10 @@ def dit_forward(
     if inv_perm is not None:
         combined = jnp.take_along_axis(combined, inv_perm[..., None], axis=1)
 
-    out = last_layer_forward(
+    out = cast(last_layer_forward(
         combined, params["last"], tv, lora=_lget(lora, "last"),
         lora_scale=lora_scale, act_sharding=sh,
-    )
+    ))
     return out[:, Ltxt : Ltxt + Limg]
 
 

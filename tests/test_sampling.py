@@ -10,7 +10,8 @@ import krea2_jax.sampling as smp
 from helpers import TINY
 from krea2_jax.checkpoint import abstract_krea2_params
 from krea2_jax.config import Krea2Config
-from krea2_jax.model import build_positions_and_mask, dit_forward, patchify, text_tokens_forward
+from krea2_jax.model import (build_positions_and_mask, dit_forward, patchify, text_tokens_forward,
+                              varlen_reference_kernel)
 
 CFG = Krea2Config(**TINY)
 B, LTXT, LAT = 2, 128, 16
@@ -50,10 +51,11 @@ def sample(params, nb, cfg_batch, attn="ref", un=(UNTXT, UNMASK), mask=MASK, com
     return np.asarray(smp.sample_latents(
         params, CFG, jnp.asarray(TXT[:nb]), jnp.asarray(mask[:nb]), untxt=jnp.asarray(un[0][:nb]),
         untxt_mask=jnp.asarray(un[1][:nb]), height=LAT * 8, width=LAT * 8, steps=steps, guidance=4.5,
-        seed=0, compact=compact, attn_impl=attn, cfg_batch=cfg_batch).astype(jnp.float32))
+        seed=0, compact=compact, attn_impl=attn, cfg_batch=cfg_batch,
+        attn_kernel=varlen_reference_kernel if attn == "aiter" else None).astype(jnp.float32))
 
 
-@pytest.mark.parametrize("attn", ["ref", "cudnn"])
+@pytest.mark.parametrize("attn", ["ref", "cudnn", "aiter"])
 @pytest.mark.parametrize("nb", [1, 2])
 def test_cfg_batch_matches_two_calls(params, attn, nb):
     two, one = sample(params, nb, False, attn), sample(params, nb, True, attn)

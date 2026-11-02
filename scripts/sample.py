@@ -73,12 +73,16 @@ def main():
     ap.add_argument("--num-images", type=int, default=1)
     ap.add_argument("--qchunk", type=int, default=512)
     ap.add_argument(
-        "--attn", choices=["ref", "splash", "cudnn"], default="splash",
+        "--attn", choices=["ref", "splash", "cudnn", "aiter"],
+        default="splash",
         help="attention kernel: 'splash' = fused Pallas TPU kernel (logits "
              "stay in VMEM; heads split across devices), 'ref' = exact "
              "query-chunked float32 softmax (materializes logits in HBM), "
              "'cudnn' = cuDNN flash attention via jax.nn.dot_product_attention "
-             "(NVIDIA GPU; its unchunked 'xla' path on other backends)",
+             "(NVIDIA GPU; its unchunked 'xla' path on other backends), "
+             "'aiter' = jax-aiter varlen flash attention (ROCm gfx950; one "
+             "device or batch-sharded; run with "
+             "XLA_FLAGS=--xla_gpu_enable_command_buffer=)",
     )
     ap.add_argument(
         "--no-compact-text", action="store_true",
