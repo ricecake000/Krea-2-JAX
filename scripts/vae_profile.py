@@ -24,7 +24,8 @@ still run; a deadline skips sections once `budget_s` is used up):
   throughput run_ladder at `batch` for every variant that passed parity
   max_autotune  parity + ladder of 2d-compile under torch.compile mode=
              "max-autotune-no-cudagraphs" (2d-compile-mat): last, only when
-             it can start before `mat_start_by` (after `checkpoint(res)`)
+             it can start before `mat_start_by`
+`checkpoint(res)` runs after every section (but the last).
 On CPU every section but flops records "skipped: no CUDA" unless cpu_ok
 (smoke tests of the code paths; the numbers mean nothing there).
 
@@ -230,14 +231,20 @@ def _sdpa_flops(shapes):
 
 
 def sec_flops(c):
-    """Per-stage FlopCounterMode on one image. A stage whose counter has no
-    SDPA op although it calls SDPA (e.g. the CPU flash kernel has no FLOP
-    formula) gets the analytic SDPA FLOPs added (sdpa_added)."""
+    """Per-stage FlopCounterMode on one image. Each SDPA call is measured by
+    the counter's growth across the call: an SDPA rule (fused kernels) or
+    the math path's decomposed bmm both count there (sdpa_ops). Only a call
+    that added 0 FLOPs (e.g. the CPU flash kernel has no formula) gets the
+    analytic 4*N^2*D added (sdpa_added)."""
     from torch.utils.flop_counter import FlopCounterMode
 
     torch = c.torch
     F = torch.nn.functional
-    counters, sdpa = {}, {}
+    counters, sdpa, counted, sdpa_ops, added, extra = {}, {}, {}, {}, [], {}
+
+    def snapshot(fc):
+        return {str(op): v for d in fc.get_flop_counts().values()
+                for op, v in d.items()}
 
     class Spy(torch.overrides.TorchFunctionMode):
         def __init__(self, name):
@@ -245,10 +252,22 @@ def sec_flops(c):
             self.name = name
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
-            if func is F.scaled_dot_product_attention:
-                sdpa[self.name] = sdpa.get(self.name, 0) + _sdpa_flops(
-                    [a.shape for a in args[:3]])
-            return func(*args, **(kwargs or {}))
+            if func is not F.scaled_dot_product_attention:
+                return func(*args, **(kwargs or {}))
+            n, fc = self.name, counters[self.name]
+            ana = _sdpa_flops([a.shape for a in args[:3]])
+            sdpa[n] = sdpa.get(n, 0) + ana
+            f0, ops0 = fc.get_total_flops(), snapshot(fc)
+            out = func(*args, **(kwargs or {}))
+            got = fc.get_total_flops() - f0
+            counted[n] = counted.get(n, 0) + got
+            sdpa_ops.setdefault(n, set()).update(
+                op for op, v in snapshot(fc).items() if v != ops0.get(op, 0))
+            if got == 0:   # no counter formula for this kernel: analytic
+                extra[n] = extra.get(n, 0) + ana
+                counted[n] += ana
+                added.append(n)
+            return out
 
     @contextlib.contextmanager
     def wrap(name):
@@ -257,21 +276,18 @@ def sec_flops(c):
             yield
 
     run_stages(c.net, c.x[:1], wrap)
-    per, added = [], []
-    for n, fc in counters.items():
-        f = fc.get_total_flops()
-        ops = {str(op) for d in fc.get_flop_counts().values() for op in d}
-        if sdpa.get(n) and not any("scaled_dot_product" in o for o in ops):
-            f += sdpa[n]
-            added.append(n)
-        per.append((n, f))
+    per = [(n, fc.get_total_flops() + extra.get(n, 0))
+           for n, fc in counters.items()]
     total = sum(f for _, f in per)
     hand = HAND_TFLOP_PER_IMG * 1e12 * c.h * c.w / HAND_PIXELS
     c.stage_flops = dict(per)
     c.flops_img = total
     return {"per_image_flops": total, "hand_flops_scaled": hand,
             "ratio_vs_hand": total / hand if hand else None,
-            "sdpa_flops": sum(sdpa.values()), "sdpa_added": added,
+            "sdpa_flops": sum(sdpa.values()),
+            "sdpa_counted_flops": sum(counted.values()),
+            "sdpa_ops": sorted({o for v in sdpa_ops.values() for o in v}),
+            "sdpa_added": sorted(set(added)),
             "per_stage": [{"stage": n, "flops": f,
                            "pct": 100 * f / total if total else None}
                           for n, f in per]}
@@ -543,8 +559,9 @@ def profile_impl(vae, device="cuda", *, h=1216, w=832, batch=4,
     helpers of scripts/modal_cache_latents.py (injected; check_impls must take
     factory=). budget_s bounds the sections up to throughput; the
     max_autotune section ignores it and starts only while time.monotonic()
-    <= mat_start_by (None = never), after checkpoint(res) (e.g. save the
-    report so far: its compile may outlive the caller's timeout). -> plain
+    <= mat_start_by (None = never). checkpoint(res) runs after every
+    section but the last (save the report so far: a long compile may
+    outlive the caller's timeout). -> plain
     result dict (render_markdown). Never raises."""
     t0 = time.monotonic()
     c = _Ctx()
@@ -600,12 +617,6 @@ def profile_impl(vae, device="cuda", *, h=1216, w=832, batch=4,
             continue
         used = time.monotonic() - t0
         if name == "max_autotune":
-            res["seconds"] = used
-            if checkpoint:
-                try:
-                    checkpoint(res)
-                except Exception as e:  # noqa: BLE001
-                    log(f"checkpoint failed: {type(e).__name__}: {e}")
             if mat_start_by is None or time.monotonic() > mat_start_by:
                 res["sections"][name] = {"skipped": (
                     "not requested" if mat_start_by is None else
@@ -627,6 +638,12 @@ def profile_impl(vae, device="cuda", *, h=1216, w=832, batch=4,
         res["sections"][name] = out
         if c.cuda:
             torch.cuda.empty_cache()
+        res["seconds"] = time.monotonic() - t0
+        if checkpoint and name != SECTIONS[-1][0]:
+            try:   # a later section may run into the caller's timeout
+                checkpoint(res)
+            except Exception as e:  # noqa: BLE001
+                log(f"checkpoint failed: {type(e).__name__}: {e}")
     res["seconds"] = time.monotonic() - t0
     return res
 
@@ -708,11 +725,14 @@ def render_markdown(res, title="VAE encoder profile"):
         "", f"Total {fl['per_image_flops'] / 1e12:.3f} TFLOP/img; the user's "
         f"hand count {HAND_TFLOP_PER_IMG} TFLOP at 832x1216 scales to "
         f"{fl['hand_flops_scaled'] / 1e12:.3f}. Convs/matmuls/SDPA only "
-        "(elementwise ops are not counted); SDPA (analytic 4*N^2*D) "
-        f"{fl['sdpa_flops'] / 1e9:.1f} GFLOP/img"
-        + (f", added by hand to {', '.join(fl['sdpa_added'])} (no counter "
-           "formula for that kernel)" if fl.get("sdpa_added") else
-           ", counted by FlopCounterMode") + ".", ""]
+        "(elementwise ops are not counted). SDPA: analytic 4*N^2*D "
+        f"{fl['sdpa_flops'] / 1e9:.3f} GFLOP/img; in the total "
+        f"{fl['sdpa_counted_flops'] / 1e9:.3f} GFLOP/img, "
+        + (f"analytic, added for {', '.join(fl['sdpa_added'])} (the counter "
+           "has no formula for that kernel)" if fl.get("sdpa_added") else
+           "counted by FlopCounterMode inside the SDPA call(s) via "
+           + (", ".join(f"`{o}`" for o in fl.get("sdpa_ops") or []) or "-"))
+        + ".", ""]
     out += ["## b. Stage timing (eager 2d, CUDA events, device-resident "
             "input)", ""]
     out += status("stages") or _table(

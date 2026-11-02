@@ -130,9 +130,9 @@ stage, eager per-stage CUDA-event timing, parity (check_impls) of
 gzip chrome trace), the SDPA backends at the mid attention's shape, the
 variants' run_ladder at batch 4 (sections bounded by PROFILE_BUDGET_S = 10
 min), then, only with PROFILE_MAT_RESERVE_S of the timeout left, the same
-for torch.compile mode="max-autotune-no-cudagraphs" (2d-compile-mat; the
-report so far is saved to /vol/profile/<ts>/ before it and fetched from
-there if the container times out). Refused with any other mode or with
+for torch.compile mode="max-autotune-no-cudagraphs" (2d-compile-mat). The
+report so far is saved to /vol/profile/<ts>/ after every section and
+fetched from there if the container times out. Refused with any other mode or with
 --cache-name / --src-drive / --dest-r2 / --reset-upload-cache. Output:
 /home/mj/krea2-ops/mi350x/results/modal/vae_profile_<ts>/{report.md,
 profile.json,trace.json.gz} (also kept in /vol/profile/<ts>/).
@@ -233,8 +233,8 @@ PROFILE_TIMEOUT_S = 20 * 60   # hard Modal timeout = the cost cap
 PROFILE_BUDGET_S = 10 * 60    # GPU sections after the VAE load
 PROFILE_BATCH = 4             # the v3 build's --batch
 # the max-autotune variant (two compiles: fp32 parity + bf16) starts only
-# with this much of PROFILE_TIMEOUT_S left; the report so far is saved to
-# the volume first
+# with this much of PROFILE_TIMEOUT_S left (the report so far is on the
+# volume after every section)
 PROFILE_MAT_RESERVE_S = 8 * 60
 VOL_PROFILE = f"{VOL}/profile"
 DEFAULT_GPUS = ("L4,A10,L40S,A100-40GB,A100-80GB,RTX-PRO-6000,H100!,H200,"
@@ -1475,9 +1475,10 @@ def profile_gpu_impl(gpu_requested, ts, out_root=VOL_PROFILE,
     -> vae_profile.profile_impl at the bench bucket, batch PROFILE_BATCH ->
     {json (plain, serialized here so a torch type fails in the container,
     not on the laptop), report_md, trace_gz (bytes), vol_dir}; the same
-    files go to out_root/<ts>/ on the volume, also before the max-autotune
-    variant (then commit()), which starts only with PROFILE_MAT_RESERVE_S
-    of PROFILE_TIMEOUT_S left. Never raises."""
+    files go to out_root/<ts>/ on the volume, also after every section
+    (checkpoint, then commit()), so a container killed by the timeout
+    leaves the report so far; the max-autotune variant starts only with
+    PROFILE_MAT_RESERVE_S of PROFILE_TIMEOUT_S left. Never raises."""
     t_start = time.monotonic()
     d = Path(out_root) / ts
     res = {"gpu_requested": gpu_requested}
@@ -1491,8 +1492,8 @@ def profile_gpu_impl(gpu_requested, ts, out_root=VOL_PROFILE,
 
     def checkpoint(r):
         md = vae_profile.render_markdown(
-            r, title=f"VAE encoder profile, {gpu_requested} (before "
-            "max-autotune)")
+            r, title=f"VAE encoder profile, {gpu_requested} (partial: "
+            f"{', '.join(r.get('sections') or {})})")
         write_profile_results(pack({**res, **r}, md), d)
         if commit:
             commit()
@@ -2190,7 +2191,8 @@ if modal is not None:
             r = fn.remote(gpu, ts)
         except Exception as e:  # noqa: BLE001 - e.g. the hard timeout
             print(f"profile_gpu failed: {type(e).__name__}: {e}; fetching "
-                  f"the checkpoint saved before max-autotune from the volume")
+                  f"the latest checkpoint (saved after every section) from "
+                  f"the volume")
             r = {}
             for k, f in (("report_md", "report.md"), ("json", "profile.json"),
                          ("trace_gz", "trace.json.gz")):
