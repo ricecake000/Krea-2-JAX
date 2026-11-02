@@ -905,7 +905,9 @@ def run_ladder(encode, imgs, batches, want_chw, cuda=None,
     per batch size: 1 warmup batch (shape + finiteness checked), then a
     timed loop of >= max(min_images, 3 batches) images and >= min_seconds,
     cycling over imgs. Each batch is stacked on the CPU and the latents come
-    back as bf16 CPU tensors (as in cache_latents.encode_samples). `cuda` =
+    back as bf16 CPU tensors, synchronously per batch (cache_latents.
+    encode_samples overlaps collate / H2D / D2H of consecutive batches and
+    of shards; the measured rate is that of the synchronous loop). `cuda` =
     torch.cuda (peak memory + synchronize) or None. Stops at the first
     failure; an OOM is recorded as error "OOM". Runs with `intra_threads`
     torch CPU threads (restored afterwards; None = unchanged): 1 matches the

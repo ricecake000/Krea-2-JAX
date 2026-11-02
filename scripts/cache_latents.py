@@ -21,6 +21,17 @@ Output (<out>):
     latents/train-XXXX.safetensors      one per source tar; "<id>" -> (16, bucket_h/8, bucket_w/8)
                                         bf16; metadata {format, vae, source, count[, vae_impl]}
 
+Pipelined (main()): a prefetch thread fetches + reads the next tar, the
+decode pool decodes --decode-lookahead batches ahead (collated by a helper
+thread into pinned memory on CUDA), the GPU gets batch j+1 before batch j's
+latents are checked and copied out (encode_samples), and one writer thread
+saves the previous shard while the next is encoded. Output (tensors, order,
+RNG draws, metadata) is that of the synchronous loop (process_shard); the
+per-shard progress line is printed only once that shard's save finished and
+reports where the main thread was blocked (tar / decode / gpu / save).
+Host memory: <= 2 tars of samples, lookahead + 1 collated batches, the shard
+being encoded + 1 pending save.
+
 Shard files are written atomically (tmp + os.replace); a shard whose output
 already opens with the right format/vae/source/count is skipped, so any run
 can simply be restarted. Downloaded tars are deleted once their shard is
@@ -107,8 +118,11 @@ class StubEncoder:
 # ---------------------------------------------------------------------------
 # shard processing
 # ---------------------------------------------------------------------------
-# process_shard's time breakdown keys, in pipeline order
-TIMING_KEYS = ("read_tar", "decode_wait", "encode", "save")
+# seconds the main thread is blocked per shard, in pipeline order: next tar
+# (fetch + read_tar), decode + collate, GPU results, the previous save
+TIMING_KEYS = ("tar_wait", "decode_wait", "gpu_wait", "save_wait")
+DECODE_LOOKAHEAD = 8   # batches decoded ahead of the encoder
+RESOLVE_DEPTH = 2      # batches enqueued on the GPU before one is resolved
 
 
 def shard_name(tar):
@@ -207,72 +221,160 @@ def decode(sample):
     return img[0], size != (sample["w"], sample["h"])
 
 
-def encode_samples(samples, encoder, batch, pool, lookahead=2, log=print,
-                   tag="", timing=None):
+def encoder_device(encoder):
+    """The torch.device an encoder computes on (FastEncoder / VaeEncoder-
+    like: .vae.device; anything else, e.g. StubEncoder: cpu)."""
+    dev = getattr(getattr(encoder, "vae", None), "device", None)
+    return torch.device(dev if dev is not None else "cpu")
+
+
+def _collate(futures, pin):
+    """Decode futures of one batch -> ((N, 3, h, w) float32, [resized?]);
+    into pinned host memory when `pin` (async H2D)."""
+    decoded = [f.result() for f in futures]
+    imgs = [d[0] for d in decoded]
+    if pin:
+        out = torch.empty((len(imgs),) + tuple(imgs[0].shape),
+                          dtype=imgs[0].dtype, pin_memory=True)
+        torch.stack(imgs, out=out)
+    else:
+        out = torch.stack(imgs)
+    return out, [d[1] for d in decoded]
+
+
+def encode_samples(samples, encoder, batch, pool, lookahead=DECODE_LOOKAHEAD,
+                   log=print, tag="", timing=None):
     """Encode samples grouped by bucket, `batch` at a time, decoding up to
-    `lookahead` batches ahead on `pool`. -> ({str(id): (16, h/8, w/8) bf16
-    CPU tensor}, number of resized images). `timing` (a dict, optional)
-    accumulates seconds "decode_wait" (blocked on decode futures) and
-    "encode" (stack + H2D + encoder + checks + D2H + clone)."""
+    `lookahead` batches ahead on `pool` (collated into one tensor per batch
+    by a helper thread). -> ({str(id): (16, h/8, w/8) bf16 CPU tensor},
+    number of resized images).
+
+    On CUDA the main thread never waits for the GPU per batch: the batch is
+    collated into pinned memory, copied H2D non_blocking, encoded, and its
+    bf16 latents + per-sample isfinite flags are copied D2H non_blocking
+    into pinned buffers behind a CUDA event; batch j is resolved (event
+    wait, non-finite check, per-sample contiguous clone) only once batch
+    j + RESOLVE_DEPTH has been enqueued, and all are drained before return.
+    Batch order, bucket chunking, the encoder's RNG draw order, the stored
+    tensors and the errors (same messages, raised before anything is saved)
+    are those of the synchronous loop; on CPU nothing is pinned or deferred
+    to an event. `timing` (dict, optional) accumulates the seconds the
+    calling thread was blocked: "decode_wait" (decode + collate of the next
+    batch) and "gpu_wait" (latents of a batch not back yet)."""
     if timing is None:
         timing = {}
     timing.setdefault("decode_wait", 0.0)
-    timing.setdefault("encode", 0.0)
+    timing.setdefault("gpu_wait", 0.0)
+    device = encoder_device(encoder)
+    cuda = device.type == "cuda"
     groups = defaultdict(list)
     for s in samples:
         groups[(s["w"], s["h"])].append(s)
     chunks = [g[i:i + batch] for key in sorted(groups)
               for g in (groups[key],) for i in range(0, len(g), batch)]
-    pending, nxt = deque(), 0
     out, resized = {}, 0
-    for j in range(len(chunks)):
-        while nxt < len(chunks) and nxt <= j + lookahead:
-            pending.append([pool.submit(decode, s) for s in chunks[nxt]])
-            nxt += 1
+
+    def resolve(chunk, lat, fin, event):
         t = time.perf_counter()
-        decoded = [f.result() for f in pending.popleft()]
-        timing["decode_wait"] += time.perf_counter() - t
-        chunk = chunks[j]
-        for s, (_, was_resized) in zip(chunk, decoded):
-            if was_resized:
-                resized += 1
-                log(f"WARNING {tag}: id {s['id']} is not {s['w']}x{s['h']}; "
-                    "cover-resized + center-cropped")
-        t = time.perf_counter()
-        imgs = torch.stack([d[0] for d in decoded])
-        lat = encoder(imgs)
-        w, h = chunk[0]["w"], chunk[0]["h"]
-        want = (len(chunk), LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE)
-        if tuple(lat.shape) != want:
-            raise ValueError(f"{tag}: encoder returned {tuple(lat.shape)}, "
-                             f"expected {want}")
-        if not torch.isfinite(lat).all():
-            bad = [s["id"] for k, s in enumerate(chunk)
-                   if not torch.isfinite(lat[k]).all()]
+        if event is not None:
+            event.synchronize()    # lat / fin are the pinned D2H targets
+        else:
+            lat, fin = lat.cpu(), fin.cpu()
+        timing["gpu_wait"] += time.perf_counter() - t
+        if not fin.all():
+            bad = [s["id"] for k, s in enumerate(chunk) if not fin[k]]
             raise ValueError(f"{tag}: non-finite latents for ids {bad}")
-        lat = lat.detach().to(torch.bfloat16).cpu()
         for k, s in enumerate(chunk):
             # own, contiguous storage: safetensors refuses strided tensors
             # (e.g. channels_last latents from cudnn.benchmark / inductor)
             out[str(s["id"])] = lat[k].clone(
                 memory_format=torch.contiguous_format)
-        timing["encode"] += time.perf_counter() - t
+
+    pending, inflight, nxt = deque(), deque(), 0
+    with ThreadPoolExecutor(1, thread_name_prefix="cache_latents_collate"
+                            ) as collator:
+        for j in range(len(chunks)):
+            while nxt < len(chunks) and nxt <= j + lookahead:
+                futs = [pool.submit(decode, s) for s in chunks[nxt]]
+                pending.append(collator.submit(_collate, futs, cuda))
+                nxt += 1
+            t = time.perf_counter()
+            imgs, flags = pending.popleft().result()
+            timing["decode_wait"] += time.perf_counter() - t
+            chunk = chunks[j]
+            for s, was_resized in zip(chunk, flags):
+                if was_resized:
+                    resized += 1
+                    log(f"WARNING {tag}: id {s['id']} is not "
+                        f"{s['w']}x{s['h']}; cover-resized + center-cropped")
+            if cuda:
+                imgs = imgs.to(device, non_blocking=True)
+            lat = encoder(imgs)
+            w, h = chunk[0]["w"], chunk[0]["h"]
+            want = (len(chunk), LAT_CHANNELS, h // VAE_SCALE, w // VAE_SCALE)
+            if tuple(lat.shape) != want:
+                raise ValueError(f"{tag}: encoder returned "
+                                 f"{tuple(lat.shape)}, expected {want}")
+            fin = torch.isfinite(lat).flatten(1).all(1)
+            lat = lat.detach().to(torch.bfloat16)
+            event = None
+            if lat.is_cuda:
+                lat_h = torch.empty(lat.shape, dtype=lat.dtype,
+                                    pin_memory=True)
+                fin_h = torch.empty(fin.shape, dtype=fin.dtype,
+                                    pin_memory=True)
+                lat_h.copy_(lat, non_blocking=True)
+                fin_h.copy_(fin, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(lat.device))
+                lat, fin = lat_h, fin_h
+            inflight.append((chunk, lat, fin, event))
+            while len(inflight) > RESOLVE_DEPTH:
+                resolve(*inflight.popleft())
+        while inflight:
+            resolve(*inflight.popleft())
     return out, resized
+
+
+def read_samples(tar_path, expected_count=None):
+    """read_tar + the parquet's sample count for this tar (if given)."""
+    samples = read_tar(tar_path)
+    if expected_count is not None and len(samples) != expected_count:
+        raise ValueError(f"{tar_path}: {len(samples)} samples, metadata "
+                         f"expects {expected_count}")
+    return samples
+
+
+def write_shard(tensors, out_path, *, vae_id, source, vae_impl=None):
+    """Atomic shard write (<out_path>.tmp, then os.replace) -> seconds."""
+    t = time.perf_counter()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    meta = {"format": FORMAT, "vae": vae_id, "source": source,
+            "count": str(len(tensors))}
+    if vae_impl is not None:
+        meta["vae_impl"] = vae_impl
+    save_file(tensors, str(tmp), metadata=meta)
+    os.replace(tmp, out_path)
+    return time.perf_counter() - t
 
 
 def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
                   expected_count=None, decode_threads=4, log=print, tag=None,
-                  vae_impl=None):
-    """Encode one dataset tar into one `krea2-latents-v1` shard file.
+                  vae_impl=None, lookahead=DECODE_LOOKAHEAD):
+    """Encode one dataset tar into one `krea2-latents-v1` shard file
+    (synchronously at the shard level: main() overlaps read / encode / save
+    of consecutive shards with the same functions).
 
     `encoder(imgs (N, 3, H, W) float32 in [-1, 1]) -> (N, 16, H/8, W/8)`.
     Skips the work when `out_path` is already complete for this job (with
     `expected_count` given this check needs no tar). Writes
     `<out_path>.tmp` then os.replace. `vae_impl` (if given) is stored as
     extra metadata; it is not part of shard_done. Returns stats
-    {skipped, n, resized, seconds} (+ when encoded, the time breakdown in s:
-    read_tar, decode_wait, encode (encode_samples), save = save_file +
-    os.replace).
+    {skipped, n, resized, seconds} (+ when encoded, the seconds blocked on
+    TIMING_KEYS: tar_wait = read_tar, decode_wait / gpu_wait
+    (encode_samples), save_wait = write_shard).
     """
     out_path = Path(out_path)
     tag = tag or out_path.stem
@@ -282,11 +384,8 @@ def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
                 "seconds": 0.0}
     t0 = time.time()
     t = time.perf_counter()
-    samples = read_tar(tar_path)
-    timing = {"read_tar": time.perf_counter() - t}
-    if expected_count is not None and len(samples) != expected_count:
-        raise ValueError(f"{tar_path}: {len(samples)} samples, metadata "
-                         f"expects {expected_count}")
+    samples = read_samples(tar_path, expected_count)
+    timing = {"tar_wait": time.perf_counter() - t}
     if expected_count is None and shard_done(out_path, vae_id, source,
                                              len(samples)):
         return {"skipped": True, "n": len(samples), "resized": 0,
@@ -294,27 +393,20 @@ def process_shard(tar_path, out_path, encoder, batch=8, *, vae_id, source,
     with ThreadPoolExecutor(decode_threads,
                             thread_name_prefix="cache_latents_decode") as pool:
         tensors, resized = encode_samples(samples, encoder, batch, pool,
-                                          log=log, tag=tag, timing=timing)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_name(out_path.name + ".tmp")
-    meta = {"format": FORMAT, "vae": vae_id, "source": source,
-            "count": str(len(tensors))}
-    if vae_impl is not None:
-        meta["vae_impl"] = vae_impl
-    t = time.perf_counter()
-    save_file(tensors, str(tmp), metadata=meta)
-    os.replace(tmp, out_path)
-    timing["save"] = time.perf_counter() - t
+                                          lookahead=lookahead, log=log,
+                                          tag=tag, timing=timing)
+    timing["save_wait"] = write_shard(tensors, out_path, vae_id=vae_id,
+                                      source=source, vae_impl=vae_impl)
     return {"skipped": False, "n": len(tensors), "resized": resized,
             "seconds": time.time() - t0, **timing}
 
 
 def shard_breakdown(stats):
-    """', read_tar 1.2s decode_wait 0.3s encode 15.0s save 0.8s' from
-    process_shard's stats ('' for a skipped shard)."""
+    """', blocked tar 0.0s decode 0.3s gpu 15.0s save 0.0s' from a shard's
+    stats ('' for a skipped shard)."""
     keys = [k for k in TIMING_KEYS if k in stats]
-    return (", " + " ".join(f"{k} {stats[k]:.1f}s" for k in keys)
-            if keys else "")
+    return (", blocked " + " ".join(f"{k[:-5]} {stats[k]:.1f}s"
+                                    for k in keys) if keys else "")
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +695,8 @@ def build_parser():
                          "stored as shard metadata vae_impl")
     ap.add_argument("--decode-threads", type=int, default=6,
                     help="CPU threads decoding WebP ahead of the VAE")
+    ap.add_argument("--decode-lookahead", type=int, default=DECODE_LOOKAHEAD,
+                    help="batches decoded (and collated) ahead of the VAE")
     ap.add_argument("--download-dir", default=None,
                     help="where --repo tars are downloaded; None = "
                          "<out>/_download/w<worker-index>, removed at the end "
@@ -631,8 +725,8 @@ def main(argv=None):
     lat_dir = out_dir / "latents"
     if not 0 <= args.worker_index < args.num_workers:
         raise SystemExit("--worker-index must be in [0, --num-workers)")
-    if args.batch < 1:
-        raise SystemExit("--batch must be >= 1")
+    if args.batch < 1 or args.decode_lookahead < 0:
+        raise SystemExit("--batch must be >= 1, --decode-lookahead >= 0")
     remote = args.tar_dir is None
     tag = f"[w{args.worker_index}/{args.num_workers}]"
     if args.download_dir is not None:
@@ -694,44 +788,89 @@ def main(argv=None):
         encoder = make_encoder(vae, args.vae_impl)
         vae_impl = args.vae_impl
 
-    def get_tar(t):
+    def load_tar(t):
+        """Prefetch thread: fetch + read_tar (+ count check) of tar t; a
+        downloaded tar is deleted once read (its samples are in RAM)."""
         t0 = time.time()
         path = (fetch_file(args.repo, t, dl_dir) if remote
                 else local_tar(args.tar_dir, t))
-        return path, time.time() - t0
+        t_fetch = time.time() - t0
+        samples = read_samples(path, counts[t])
+        if remote and not args.keep_tars:
+            path.unlink(missing_ok=True)
+        return samples, t_fetch, time.time() - t0 - t_fetch
 
     t_start, done_imgs = time.time(), 0
-    # The next tar downloads while the current one is encoded.
-    with ThreadPoolExecutor(1, thread_name_prefix="cache_latents_fetch") as dl:
-        nxt = dl.submit(get_tar, todo[0])
-        for k, t in enumerate(todo):
-            t_wait = time.time()
-            path, t_fetch = nxt.result()
-            t_wait = time.time() - t_wait
-            if k + 1 < len(todo):
-                nxt = dl.submit(get_tar, todo[k + 1])
-            stats = process_shard(
-                path, lat_dir / shard_name(t), encoder, args.batch,
-                vae_id=vae_id, source=t, expected_count=counts[t],
-                decode_threads=args.decode_threads,
-                tag=f"{tag} {Path(t).stem}", vae_impl=vae_impl)
-            if remote and not args.keep_tars:
-                path.unlink(missing_ok=True)
-            done_imgs += stats["n"]
-            elapsed = time.time() - t_start
-            rate = done_imgs / max(elapsed, 1e-9)
-            eta = (n_todo - done_imgs) / max(rate, 1e-9)
-            print(f"{tag} {k + 1}/{len(todo)} {Path(t).stem}: {stats['n']} "
-                  f"imgs in {stats['seconds']:.1f}s "
-                  f"({stats['n'] / max(stats['seconds'], 1e-9):.2f} img/s), "
-                  f"resized {stats['resized']}, fetch {t_fetch:.1f}s "
-                  f"(waited {t_wait:.1f}s){shard_breakdown(stats)} | total "
-                  f"{rate:.2f} img/s, ETA {eta / 60:.1f} min", flush=True)
+
+    def report(k, t, stats, save_s):
+        """The per-shard progress line, printed only once the shard's
+        save finished (modal_cache_latents commits the volume on it)."""
+        nonlocal done_imgs
+        done_imgs += stats["n"]
+        rate = done_imgs / max(time.time() - t_start, 1e-9)
+        eta = (n_todo - done_imgs) / max(rate, 1e-9)
+        print(f"{tag} {k + 1}/{len(todo)} {Path(t).stem}: {stats['n']} "
+              f"imgs in {stats['seconds']:.1f}s "
+              f"({stats['n'] / max(stats['seconds'], 1e-9):.2f} img/s), "
+              f"resized {stats['resized']}, fetch {stats['fetch']:.1f}s "
+              f"read {stats['read']:.1f}s{shard_breakdown(stats)}, saved "
+              f"in {save_s:.1f}s | total {rate:.2f} img/s, ETA "
+              f"{eta / 60:.1f} min", flush=True)
+
+    # Overlapped per shard: the next tar is fetched + read by `dl` while
+    # this one is encoded; its save runs on `saver` (at most one in flight)
+    # while the next one is encoded. Shard k's stats: main-thread wall time
+    # from waiting for its samples to handing it to the saver, and the
+    # seconds blocked within it (TIMING_KEYS).
+    with (ThreadPoolExecutor(1, thread_name_prefix="cache_latents_fetch")
+          as dl,
+          ThreadPoolExecutor(1, thread_name_prefix="cache_latents_save")
+          as saver,
+          ThreadPoolExecutor(args.decode_threads,
+                             thread_name_prefix="cache_latents_decode")
+          as pool):
+        nxt, saving = dl.submit(load_tar, todo[0]), None
+        try:
+            for k, t in enumerate(todo):
+                t0 = time.perf_counter()
+                samples, t_fetch, t_read = nxt.result()
+                timing = {"tar_wait": time.perf_counter() - t0}
+                if k + 1 < len(todo):
+                    nxt = dl.submit(load_tar, todo[k + 1])
+                tensors, resized = encode_samples(
+                    samples, encoder, args.batch, pool,
+                    lookahead=args.decode_lookahead,
+                    tag=f"{tag} {Path(t).stem}", timing=timing)
+                del samples
+                t1 = time.perf_counter()
+                if saving is not None:
+                    prev, saving = saving, None
+                    save_s = prev[0].result()   # a failed save raises here
+                    timing["save_wait"] = time.perf_counter() - t1
+                    report(*prev[1:], save_s)
+                else:
+                    timing["save_wait"] = 0.0
+                stats = {"n": len(tensors), "resized": resized,
+                         "fetch": t_fetch, "read": t_read, **timing,
+                         "seconds": time.perf_counter() - t0}
+                saving = (saver.submit(write_shard, tensors,
+                                       lat_dir / shard_name(t), vae_id=vae_id,
+                                       source=t, vae_impl=vae_impl),
+                          k, t, stats)
+                del tensors
+            if saving is not None:
+                prev, saving = saving, None
+                report(*prev[1:], prev[0].result())
+        finally:
+            if saving is not None:   # failing elsewhere: report a save that
+                try:                 # still completed, then re-raise
+                    report(*saving[1:], saving[0].result())
+                except Exception:  # noqa: BLE001 - the original error wins
+                    pass
     if remote and args.download_dir is None and not args.keep_tars:
         shutil.rmtree(dl_dir, ignore_errors=True)
     print(f"{tag} done: {done_imgs} images in "
           f"{(time.time() - t_start) / 60:.1f} min", flush=True)
-
 
 if __name__ == "__main__":
     main()

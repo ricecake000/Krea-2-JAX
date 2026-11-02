@@ -267,9 +267,14 @@ class FastEncoder:
                 self.forward = lambda x: compiled(
                     x.contiguous(memory_format=cl))
 
+    def _input(self, imgs):
+        # H2D first (non_blocking: async from a pinned source, no sync),
+        # then the dtype cast on the device
+        return imgs.to(self.vae.device, non_blocking=True).to(self.vae.dtype)
+
     @torch.no_grad()
     def dist(self, imgs):
-        x = imgs.to(self.vae.device, self.vae.dtype)
+        x = self._input(imgs)
         if self.net is None:
             d = self.vae.vae.encode(x.unsqueeze(2)).latent_dist
             return d.mean[:, :, 0], d.std[:, :, 0]
@@ -278,7 +283,7 @@ class FastEncoder:
     @torch.no_grad()
     def __call__(self, imgs):
         if self.net is None:   # == cache_latents.vae_encode_batch (tested)
-            x = imgs.to(self.vae.device, self.vae.dtype).unsqueeze(2)
+            x = self._input(imgs).unsqueeze(2)
             z = self.vae.vae.encode(x).latent_dist.sample()
             return ((z - self.vae.mean) / self.vae.std)[:, :, 0]
         mean, std = self.dist(imgs)

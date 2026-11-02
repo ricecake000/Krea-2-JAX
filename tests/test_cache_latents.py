@@ -168,3 +168,18 @@ def test_check_digests_rejects_malformed(bad):
     for old, new in (({"a": bad}, {"a": GOOD}), ({"a": GOOD}, {"a": bad})):
         with pytest.raises(SystemExit, match="1 malformed digests"):
             cl.check_digests(old, new)
+
+
+def test_pipelined_encode_matches_sync_reference(src, tmp_path):
+    """Deferred-resolve batch pipeline == one synchronous encode per bucket batch: same RNG draws, bf16 bits."""
+    vae_fast, tiny = pytest.importorskip("vae_fast"), pytest.importorskip("test_vae_fast").tiny_encoder
+    enc, samples, ref = vae_fast.make_encoder(tiny(), "2d"), cl.read_tar(src[0] / TAR0), {}
+    shard0(src, tmp_path / "a.safetensors", enc, batch=2) if torch.manual_seed(0) else None
+    torch.manual_seed(0)
+    for key in sorted({(s["w"], s["h"]) for s in samples}):
+        g = [s for s in samples if (s["w"], s["h"]) == key]
+        for i in range(0, len(g), 2):
+            lat = enc(torch.stack([cl.decode(s)[0] for s in g[i:i + 2]])).to(torch.bfloat16)
+            ref.update({str(s["id"]): lat[k].view(torch.int16).numpy() for k, s in enumerate(g[i:i + 2])})
+    assert set(got := read_shard(tmp_path / "a.safetensors")[1]) == set(ref) and all(
+        np.array_equal(got[k].view(np.int16), ref[k]) for k in ref)
