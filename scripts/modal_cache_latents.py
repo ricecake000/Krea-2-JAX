@@ -102,16 +102,17 @@ images / 200 tars; no bench needed again: the v2 build's B200 setup):
         --src-drive selection_v3/package           # optional: CPU only, early
     modal run --detach scripts/modal_cache_latents.py --build --cache-name v3 \
         --src-drive selection_v3/package --dest-r2 latents_v3/ --gpu B200 \
-        --containers 2 --batch 4 --cpu 8 --worker-timeout-h 4 \
+        --containers 1 --batch 4 --cpu 8 --worker-timeout-h 4 \
         --vae-impl 2d-compile
     modal run scripts/modal_cache_latents.py --finalize-only --cache-name v3 \
         --dest-r2 latents_v3/                      # after a laptop disconnect
 Estimate (build_estimate, prices of PRICES_DATE, v2 rate 41.0 img/s per
-B200 container): 2 x B200 = $9.84 for the GPU containers (1.33 GPU-h + 2 x 3
-min startup at $6.88/h), ~43 min wall; plus the CPU stage + finalize_r2
-containers (cents to well under $1) and R2 storage (~100 GB, ~$1.5/month).
---worker-timeout-h 4 is ~2x v2's 2 h for ~2x the images (the cost model
-itself says 2). The training node downloads the cache with DATA_SOURCE=r2
+B200 container): 1 x B200 = $9.50 for the GPU container (1.33 GPU-h + 3
+min startup at $6.88/h), ~83 min wall (user 11/02: one container, wall time
+does not matter; 2 x B200 = $9.84 / ~43 min); plus the CPU stage +
+finalize_r2 containers (cents to well under $1) and R2 storage (~100 GB,
+~$1.5/month). --worker-timeout-h 4 is ~2.9x the ~1.4 h wall (the cost model
+itself says 3). The training node downloads the cache with DATA_SOURCE=r2
 DATA_R2_PREFIX=latents_v3 (krea2-ops/node).
 
 Volume `krea2-latents` (Volumes v2, created on first use):
