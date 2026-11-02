@@ -33,8 +33,41 @@ Outputs (OUTDIR)
                      `RENDER_SUMMARY images=.. wall_s=.. img_per_h=.. avg_bytes=..`
   tmp/               latent hand-off files (deleted once decoded)
 Resume: ids in manifest.jsonl whose .avif exists are skipped; just rerun the
-same command. Exit 0 when every (limited) prompt is done, 3 after a clean
-SIGTERM/SIGINT stop (pipeline drained, manifest consistent), 1 on errors.
+same command. A manifest record counts only when newline-terminated: a torn
+last record (even complete JSON) is cut at startup BEFORE the done set is
+computed, so its image renders again. Exit 0 when every (limited) prompt is
+done, 3 after a clean SIGTERM/SIGINT stop (pipeline drained, manifest
+consistent), 1 on errors.
+
+Clean stop (SIGTERM/SIGINT): no new batch is admitted from that moment. The
+DiT batch being sampled is aborted at its next sampler-step boundary (steps
+are synchronised for this; a batch whose first step is still compiling ends
+after that compile + step) and dropped, as is a finished batch still waiting
+for room in the decode queue; everything already handed to the decoder is
+decoded, encoded and recorded, then the process exits 3. Worst case after
+the signal, with Q = --queue-depth, W = --encode-workers, MP = megapixels of
+the largest pending prompt:
+    images to decode  (Q + 1) * B            (decode queue + the job in hand)
+    images to encode  (2Q + 2) * B + 2W      (+ decode_out queue, the result
+                                              the collector holds, the pool)
+    DRAIN_BUDGET_S = ceil(1.5 * MP * (B * step_s + (Q + 1) * B * dec_s
+                          + ceil(((2Q + 2) * B + 2W) / W) * enc_s) + 10)
+with per-megapixel seconds step_s (one sampler step, one sample;
+--est-step-s-per-mp 0.5, a conservative estimate, not measured on the node),
+dec_s (one image; --est-decode-s-per-mp, 3.0 on gpu = conservative estimate,
+60 on cpu = 58 s measured per 1k image) and enc_s (one image, one thread;
+--est-encode-s-per-mp 1.0, measured 0.7-0.8 at q70 s6). Printed once at
+startup as the verbatim line `DRAIN_BUDGET_S=<n>`: send TERM at least that
+long before the deadline (lower it with a smaller --queue-depth or --batch).
+
+Children: the decode worker and the AVIF pool processes ignore SIGINT/SIGTERM
+(the main process drains) and each runs a watchdog thread that hard-exits
+(os._exit) within ~1 s once the main process is gone (kill -9 included), and
+every blocking queue put/get in the decoder is a timeout loop. Shutdown is
+bounded on every path: the decoder gets its sentinel when it can still take
+it, is joined with a timeout and then SIGKILLed; the pool is waited for (up
+to DRAIN_BUDGET_S on a clean path, 5 s after an error), shut down, and every
+worker still alive is SIGKILLed, so no child outlives the main process.
 
 Pipeline
   main process (JAX only, never imports torch): text tower + DiT resident on
@@ -153,6 +186,14 @@ def parse_args(argv=None):
                     default=max(1, min(8, (os.cpu_count() or 2) // 2)))
     ap.add_argument("--queue-depth", type=int, default=2,
                     help="latent batches waiting for the decoder")
+    ap.add_argument("--est-step-s-per-mp", type=float, default=0.5,
+                    help="DRAIN_BUDGET_S: sampler step seconds per sample "
+                         "per megapixel")
+    ap.add_argument("--est-decode-s-per-mp", type=float, default=None,
+                    help="DRAIN_BUDGET_S: VAE decode seconds per megapixel "
+                         "(default 3.0 on gpu, 60 on cpu)")
+    ap.add_argument("--est-encode-s-per-mp", type=float, default=1.0,
+                    help="DRAIN_BUDGET_S: AVIF encode seconds per megapixel")
     ap.add_argument("--profile-dir", default=None)
     ap.add_argument("--profile-steps", type=int, default=2)
     ap.add_argument("--model-config", default=None,
@@ -185,18 +226,34 @@ def load_prompts(path, limit=None):
     return prompts
 
 
-def read_manifest(out):
-    """{id: row} of the parseable manifest lines (a torn last line from a
-    killed run is ignored)."""
-    rows = {}
+def _manifest_bytes(out):
+    """(bytes, cut): the manifest and the length of its complete part (a
+    record counts only when newline-terminated)."""
     path = Path(out) / MANIFEST
-    if path.exists():
-        for line in path.read_text().splitlines():
-            try:
-                row = json.loads(line)
-                rows[str(row["id"])] = row
-            except (ValueError, KeyError, TypeError):
-                continue
+    data = path.read_bytes() if path.exists() else b""
+    return data, data.rfind(b"\n") + 1
+
+
+def repair_manifest(out):
+    """Cut a torn last record (killed mid-write), complete JSON or not."""
+    data, cut = _manifest_bytes(out)
+    if cut != len(data):
+        with open(Path(out) / MANIFEST, "r+b") as f:
+            f.truncate(cut)
+            os.fsync(f.fileno())
+    return len(data) - cut
+
+
+def read_manifest(out):
+    """{id: row} of the parseable, newline-terminated manifest records."""
+    rows = {}
+    data, cut = _manifest_bytes(out)
+    for line in data[:cut].decode().splitlines():
+        try:
+            row = json.loads(line)
+            rows[str(row["id"])] = row
+        except (ValueError, KeyError, TypeError):
+            continue
     return rows
 
 
@@ -214,6 +271,19 @@ def plan_batches(prompts, batch):
         groups.setdefault((p["width"], p["height"]), []).append(p)
     return [(w, h, ps[i:i + batch]) for (w, h), ps in groups.items()
             for i in range(0, len(ps), batch)]
+
+
+def drain_budget_s(args, todo):
+    """Worst-case seconds from SIGTERM to exit (see the module docstring)."""
+    B, Q, W = args.batch, max(1, args.queue_depth), args.encode_workers
+    mp_ = max((p["width"] * p["height"] for p in todo), default=0) / 1e6
+    dec = args.est_decode_s_per_mp
+    if dec is None:
+        dec = 3.0 if args.decode_device == "gpu" else 60.0
+    t = mp_ * (B * args.est_step_s_per_mp + (Q + 1) * B * dec
+               + math.ceil(((2 * Q + 2) * B + 2 * W) / W)
+               * args.est_encode_s_per_mp)
+    return math.ceil(1.5 * t + 10)
 
 
 def fmt_hms(s):
@@ -237,18 +307,44 @@ def encode_avif(img, path, quality, speed, subsampling):
     return os.path.getsize(path), time.time() - t0
 
 
-def ignore_signals():
-    """Children leave SIGINT/SIGTERM to the main process, which drains."""
+def watch_parent(parent, period=1.0):
+    """Daemon thread: hard-exit this process once `parent` is gone (no
+    finalizers, so a queue feeder blocked on a dead reader cannot hold it)."""
+    def run():
+        while os.getppid() == parent:
+            time.sleep(period)
+        os._exit(1)
+    threading.Thread(target=run, daemon=True, name="parent-watchdog").start()
+
+
+def child_init(parent):
+    """Children leave SIGINT/SIGTERM to the main process, which drains, and
+    die with it."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    watch_parent(parent)
 
 
 def decode_worker(in_q, out_q, vae_id, device, dtype, parent):
     """Torch process: latent files from in_q -> uint8 images to out_q.
     Messages out: ("ready", load_s), ("result", job, images, decode_s list),
     ("error", text), ("done",). Exits on its own when the main process is
-    gone (no orphan holding GPU memory after a kill -9 of the main)."""
-    ignore_signals()
+    gone (watchdog thread + liveness re-checks in every put/get loop: no
+    orphan holding GPU memory after a kill -9 of the main)."""
+    child_init(parent)
+
+    def alive():
+        if os.getppid() != parent:
+            os._exit(1)
+
+    def put(msg):
+        while True:
+            try:
+                out_q.put(msg, timeout=2)
+                return
+            except queue.Full:
+                alive()
+
     try:
         import numpy as np
         import torch
@@ -264,16 +360,15 @@ def decode_worker(in_q, out_q, vae_id, device, dtype, parent):
                             device=dev).view(1, -1, 1, 1, 1)
         std = torch.tensor(vae.config.latents_std, dtype=tdt,
                            device=dev).view(1, -1, 1, 1, 1)
-        out_q.put(("ready", time.time() - t0))
+        put(("ready", time.time() - t0))
         while True:
             try:
-                job = in_q.get(timeout=10)
+                job = in_q.get(timeout=2)
             except queue.Empty:
-                if os.getppid() != parent:
-                    return
+                alive()
                 continue
             if job is None:
-                out_q.put(("done",))
+                put(("done",))
                 return
             lat = np.load(job["path"])
             images, secs = [], []
@@ -287,26 +382,34 @@ def decode_worker(in_q, out_q, vae_id, device, dtype, parent):
                 images.append(img.permute(0, 2, 3, 1).byte().cpu().numpy()[0])
                 secs.append(time.time() - t0)
             os.remove(job["path"])
-            out_q.put(("result", job, images, secs))
+            put(("result", job, images, secs))
     except BaseException:  # noqa: BLE001 - reported to the main process
-        out_q.put(("error", traceback.format_exc()))
+        put(("error", traceback.format_exc()))
 
 
 # ------------------------------------------------------------ main side
+class StopRequested(Exception):
+    """SIGTERM/SIGINT seen at a sampler-step boundary: drop this batch."""
+
+
 class Renderer:
     """Owns the decode worker, the encode pool, the manifest and the log."""
 
-    def __init__(self, args, out, total, already):
+    def __init__(self, args, out, total, already, drain_budget):
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
 
         self.args, self.out = args, out
         self.total, self.done = total, already
+        self.drain_budget = drain_budget
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.fatal = None
         self.stop = False
+        self.closing = False         # close() started: collector stops
+        self.closed = False          # manifest closed: no more records
         self.inflight = 0            # jobs sent to the decoder, not back yet
+        self.encoding = 0            # images in the AVIF pool
         self.run_imgs = 0            # images finished in this run
         self.run_bytes = 0
         self.excluded_s = 0.0        # warm-up/profile wall time
@@ -314,12 +417,8 @@ class Renderer:
         self.excluded_ids = set()
         self.t_start = None          # first batch start
         self.logf = open(out / LOG, "a", buffering=1)
-        self.manf = open(out / MANIFEST, "a+b")
-        if self.manf.tell():   # cut a torn last line (killed mid-write)
-            self.manf.seek(0)
-            data = self.manf.read()
-            self.manf.truncate(data.rfind(b"\n") + 1)
-            self.manf.seek(0, os.SEEK_END)
+        repair_manifest(out)   # main() did already; cheap, keeps the rule
+        self.manf = open(out / MANIFEST, "ab")
         ctx = mp.get_context("spawn")
         self.dec_in = ctx.Queue(maxsize=max(1, args.queue_depth))
         self.dec_out = ctx.Queue(maxsize=max(1, args.queue_depth))
@@ -330,14 +429,16 @@ class Renderer:
         self.worker.start()
         self.pool = ProcessPoolExecutor(max_workers=args.encode_workers,
                                         mp_context=ctx,
-                                        initializer=ignore_signals)
+                                        initializer=child_init,
+                                        initargs=(os.getpid(),))
         self.slots = threading.Semaphore(2 * args.encode_workers)
         self.collector = threading.Thread(target=self._collect, daemon=True)
         self.collector.start()
 
     def log(self, msg):
-        """RENDER*/PROFILE lines verbatim (machine-read), others stamped."""
-        line = msg if msg.startswith(("RENDER", "PROFILE")) else (
+        """RENDER*/PROFILE/DRAIN lines verbatim (machine-read), others
+        stamped."""
+        line = msg if msg.startswith(("RENDER", "PROFILE", "DRAIN")) else (
             f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {msg}")
         with self.lock:
             print(line, flush=True)
@@ -350,12 +451,15 @@ class Renderer:
             self.cond.notify_all()
         self.log(f"ERROR {msg}")
 
+    def _quit(self):
+        return self.closing or self.fatal is not None
+
     def _collect(self):
-        while True:
+        while not self._quit():
             try:
-                msg = self.dec_out.get(timeout=5)
+                msg = self.dec_out.get(timeout=2)
             except queue.Empty:
-                if not self.worker.is_alive():
+                if not self.worker.is_alive() and not self._quit():
                     self._fail(f"decode worker died (exit "
                                f"{self.worker.exitcode})")
                     return
@@ -377,20 +481,44 @@ class Renderer:
                          f"{', '.join(f'{s:.3f}' for s in secs)})")
             if not job.get("discard"):
                 for rec, img, ds in zip(job["recs"], images, secs):
-                    self.slots.acquire()
+                    while not self.slots.acquire(timeout=2):
+                        if self._quit():
+                            return
+                    if self._quit():
+                        self.slots.release()
+                        return
                     path = self.out / "img" / f"{rec['id']}.avif"
                     a = self.args
-                    fut = self.pool.submit(encode_avif, img, str(path),
-                                           a.avif_quality, a.avif_speed,
-                                           a.avif_subsampling)
+                    with self.cond:
+                        self.encoding += 1
+                    try:
+                        fut = self.pool.submit(encode_avif, img, str(path),
+                                               a.avif_quality, a.avif_speed,
+                                               a.avif_subsampling)
+                    except RuntimeError as e:   # pool shut down / broken
+                        self._encode_finished()
+                        if not self._quit():
+                            self._fail(f"AVIF pool: {e!r}")
+                        return
                     fut.add_done_callback(
                         lambda f, rec=rec, ds=ds: self._encoded(f, rec, ds))
             with self.cond:
                 self.inflight -= 1
                 self.cond.notify_all()
 
-    def _encoded(self, fut, rec, decode_s):
+    def _encode_finished(self):
         self.slots.release()
+        with self.cond:
+            self.encoding -= 1
+            self.cond.notify_all()
+
+    def _encoded(self, fut, rec, decode_s):
+        try:
+            self._record(fut, rec, decode_s)
+        finally:
+            self._encode_finished()
+
+    def _record(self, fut, rec, decode_s):
         try:
             nbytes, enc_s = fut.result()
         except BaseException as e:  # noqa: BLE001
@@ -400,6 +528,8 @@ class Renderer:
                    bytes=nbytes,
                    utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         with self.lock:
+            if self.closed:   # gave up waiting; the image renders on resume
+                return
             self.manf.write((json.dumps(row) + "\n").encode())
             self.manf.flush()
             os.fsync(self.manf.fileno())
@@ -431,17 +561,33 @@ class Renderer:
         if self.fatal is not None:
             raise RuntimeError(self.fatal)
 
+    def step_ctx(self, _i):
+        """Per sampler step (the sampler syncs each step when given one):
+        abort the batch on an error or a stop request."""
+        import contextlib
+
+        self.check()
+        if self.stop:
+            raise StopRequested
+        return contextlib.nullcontext()
+
     def submit(self, job):
         """Hand a latent file to the decoder (blocks while the queue is
-        full, i.e. backpressure)."""
-        with self.cond:
-            self.inflight += 1
+        full, i.e. backpressure). False (job dropped, latent file deleted)
+        when a stop request arrives first."""
         while True:
             self.check()
+            if self.stop:
+                Path(job["path"]).unlink(missing_ok=True)
+                return False
             try:
-                self.dec_in.put(job, timeout=5)
-                return
+                with self.cond:
+                    self.inflight += 1
+                self.dec_in.put(job, timeout=1)
+                return True
             except queue.Full:
+                with self.cond:
+                    self.inflight -= 1
                 if not self.worker.is_alive():
                     self._fail("decode worker died")
 
@@ -453,16 +599,43 @@ class Renderer:
         self.check()
 
     def close(self):
-        """Stop the worker, wait for every encode, close the files."""
-        if self.worker.is_alive() and self.fatal is None:
-            self.submit(None)
-            self.collector.join()
-        self.pool.shutdown(wait=True)
+        """Bounded on every path: stop the decoder (sentinel when it can
+        still take it, join with a timeout, then SIGKILL), wait for the
+        encodes (up to the drain budget; 5 s after an error), shut the pool
+        down and SIGKILL any worker left, close the manifest."""
+        if self.fatal is None and self.worker.is_alive():
+            try:
+                self.dec_in.put(None, timeout=5)
+            except queue.Full:
+                pass
+            else:   # the collector returns on "done" after the last result
+                self.collector.join(timeout=self.drain_budget)
+        self.closing = True
+        self.collector.join(timeout=5)
+        self.worker.join(timeout=5 if self.fatal is None else 1)
         if self.worker.is_alive():
-            self.worker.join(timeout=60)
-            if self.worker.is_alive():
-                self.worker.terminate()
-        self.manf.close()
+            self.log("killing the decode worker")
+            self.worker.kill()
+            self.worker.join(timeout=10)
+        self.dec_in.cancel_join_thread()   # no exit-time feeder join
+        deadline = time.time() + (self.drain_budget if self.fatal is None
+                                  else 5)
+        with self.cond:
+            while self.encoding > 0 and time.time() < deadline:
+                self.cond.wait(timeout=1)
+            left = self.encoding
+        if left:   # log() takes the lock: never call it under self.cond
+            self.log(f"giving up on {left} AVIF encodes")
+        procs = list((self.pool._processes or {}).values())
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=10)
+        with self.lock:
+            self.closed = True
+            self.manf.close()
 
 
 def check_text_fit(txt_cfg, template, cfg):
@@ -501,6 +674,7 @@ def main(argv=None):
     for f in (out / "tmp").glob("*"):
         f.unlink()
     prompts = load_prompts(args.prompts, args.limit)
+    torn = repair_manifest(out)   # BEFORE the done set (record = full line)
     done = done_ids(out)
     todo = [p for p in prompts if str(p["id"]) not in done]
     already = len(prompts) - len(todo)
@@ -521,7 +695,8 @@ def main(argv=None):
             f.write(msg + "\n")
         return 0
 
-    r = Renderer(args, out, len(prompts), already)
+    budget = drain_budget_s(args, todo)
+    r = Renderer(args, out, len(prompts), already, budget)
     stop_sig = []
 
     def on_signal(signum, _frame):
@@ -535,10 +710,15 @@ def main(argv=None):
           f"steps {args.steps}, cfg {args.cfg}, mu {args.mu}, AVIF q"
           f"{args.avif_quality} s{args.avif_speed} {args.avif_subsampling}; "
           f"XLA_PYTHON_CLIENT_MEM_FRACTION="
-          f"{os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION', 'unset')}")
+          f"{os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION', 'unset')}"
+          + (f"; cut a torn manifest record ({torn} bytes)" if torn else ""))
+    r.log(f"DRAIN_BUDGET_S={budget}")
     rc = 1
     try:
         rc = render(args, cfg, r, todo)
+    except StopRequested:   # during the profile phase; close() drains
+        r.log("stop requested during profiling: draining")
+        rc = 0
     except BaseException as e:  # noqa: BLE001
         if r.fatal is None:
             r.log(f"ERROR {e!r}\n{traceback.format_exc()}")
@@ -612,7 +792,7 @@ def render(args, cfg, r, todo):
 
     un = text([args.negative_prompt] * B) if use_cfg else (None, None)
 
-    def run_batch(w, h, batch, step_ctx=None):
+    def run_batch(w, h, batch, step_ctx=r.step_ctx):
         """Sample one batch -> (f32 latents of the real rows, seconds)."""
         t0 = time.time()
         pad = batch + [batch[-1]] * (B - len(batch))
@@ -639,8 +819,11 @@ def render(args, cfg, r, todo):
                  "steps": args.steps, "mu": args.mu, "cfg": args.cfg,
                  "batch": B, "attn": args.attn,
                  "sample_s": round(secs / len(batch), 3)} for p in batch]
-        r.submit({"n": njob[0], "path": str(path), "recs": recs, **flags})
         njob[0] += 1
+        if not r.submit({"n": njob[0] - 1, "path": str(path), "recs": recs,
+                         **flags}):
+            r.log(f"stop requested: dropped the finished batch "
+                  f"{[p['id'] for p in batch]} (renders on resume)")
 
     batches = plan_batches(todo, B)
     r.t_start = time.time()
@@ -662,6 +845,7 @@ def render(args, cfg, r, todo):
         from contextlib import ExitStack
 
         def step_ctx(i):
+            r.step_ctx(i)   # stop/error check at every step
             if i >= K:
                 return contextlib.nullcontext()
             st = ExitStack()
@@ -689,13 +873,19 @@ def render(args, cfg, r, todo):
     for w, h, batch in batches[first:]:
         r.check()
         if r.stop:
-            r.log("stop requested: finishing the pipeline")
             break
-        arr, secs = run_batch(w, h, batch)
+        try:
+            arr, secs = run_batch(w, h, batch)
+        except StopRequested:
+            r.log(f"stop requested: aborted the batch "
+                  f"{[p['id'] for p in batch]} (renders on resume)")
+            break
         if (w, h) not in shapes_seen:
             shapes_seen.add((w, h))
             r.log(f"first batch at {w}x{h} (incl. compile) {secs:.1f} s")
         hand_off(w, h, batch, arr, secs)
+    if r.stop:
+        r.log("stop requested: draining the decoder and the AVIF pool")
     r.drain_decoder()
     return 0
 
