@@ -1286,6 +1286,10 @@ def main(argv=None):
         nonlocal last_saved
         if last_saved == step:
             return
+        # never let a checkpoint get ahead of an unfinished snapshot: a
+        # crash would resume past it and nothing would recreate it
+        if snap["thread"] is not None and step > snap["step"]:
+            wait_snapshot()
         fullft_ckpt.save_state(
             manager, step,
             {"params": params, "opt_state": opt_state, "ema": ema, "step": step},
@@ -1311,7 +1315,7 @@ def main(argv=None):
     # next step donates params); the atomic file write (tmp + fsync +
     # rename, save_krea2_params) runs in one background thread, joined
     # before the next snapshot and before exit
-    snap = {"thread": None}
+    snap = {"thread": None, "step": None}
 
     def wait_snapshot():
         th, snap["thread"] = snap["thread"], None
@@ -1339,6 +1343,7 @@ def main(argv=None):
             except Exception as e:
                 log(f"WARNING: snapshot {path} FAILED: {e!r}")
 
+        snap["step"] = step
         snap["thread"] = threading.Thread(target=write, name=f"snapshot-{step}")
         snap["thread"].start()
 
