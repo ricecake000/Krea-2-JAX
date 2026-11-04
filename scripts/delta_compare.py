@@ -73,12 +73,29 @@ def parse_delta(text):
     return label, path
 
 
+ROUNDOFF_REL = 1e-9     # |x| below this x scale is float64 roundoff
+
+
 def _sqrt(x):
     return math.sqrt(x) if x is not None and x >= 0 else None
 
 
 def _div(a, b):
-    return a / b if b else None
+    return a / b if a is not None and b else None
+
+
+def _sq_norm(x, scale, where, notes):
+    """sqrt of a squared norm built from a difference (d2_a + d2_b +- 2 dot):
+    a negative x within ROUNDOFF_REL * scale is float64 roundoff (e.g. two
+    deltas one ULP apart) and gives 0; a larger negative one is recorded in
+    `notes` and gives None (never raises)."""
+    if x >= 0:
+        return math.sqrt(x)
+    if x >= -ROUNDOFF_REL * scale:
+        return 0.0
+    notes.append(f"{where}: squared norm {x:.3e} < 0 beyond roundoff "
+                 f"(scale {scale:.3e}); reported as null")
+    return None
 
 
 def _quantile(vals, q):
@@ -133,8 +150,10 @@ def _tensor_sums(base_sl, delta_sls, shape, chunk):
     return b2, d2, dot, finite
 
 
-def tensor_row(key, numel, dtype, dtypes, labels, b2, d2, dot):
-    """One per-tensor row: raw sums plus rel / cos / sum and diff norms."""
+def tensor_row(key, numel, dtype, dtypes, labels, b2, d2, dot, notes=None):
+    """One per-tensor row: raw sums plus rel / cos / sum and diff norms
+    (notes: list collecting non-roundoff negative squared norms)."""
+    notes = [] if notes is None else notes
     row = {"key": key, "kind": tensor_kind(key), "group": tensor_group(key),
            "dtype": dtype, "dtypes": dtypes, "numel": numel, "b2": b2,
            "d2": dict(zip(labels, d2)), "dot": {}, "rel": {}, "cos": {},
@@ -145,13 +164,17 @@ def tensor_row(key, numel, dtype, dtypes, labels, b2, d2, dot):
         p = pair_name(labels[i], labels[j])
         row["dot"][p] = v
         row["cos"][p] = _div(v, math.sqrt(d2[i] * d2[j]))
-        row["sum_norm"][p] = _sqrt(d2[i] + d2[j] + 2 * v)
-        row["diff_norm"][p] = _sqrt(d2[i] + d2[j] - 2 * v)
+        scale = d2[i] + d2[j]
+        row["sum_norm"][p] = _sq_norm(scale + 2 * v, scale,
+                                      f"{key} {p} sum", notes)
+        row["diff_norm"][p] = _sq_norm(scale - 2 * v, scale,
+                                       f"{key} {p} diff", notes)
     return row
 
 
-def aggregate(rows, labels):
+def aggregate(rows, labels, notes=None, name="ALL"):
     """Energy-weighted global ratios over rows (see the module docstring)."""
+    notes = [] if notes is None else notes
     numel = sum(r["numel"] for r in rows)
     b2 = sum(r["b2"] for r in rows)
     d2 = {a: sum(r["d2"][a] for r in rows) for a in labels}
@@ -171,10 +194,12 @@ def aggregate(rows, labels):
                 "cos2": None if cos is None else cos * cos,
                 "proj_on_first": _div(dot, d2[a]),    # Δb ≈ c · Δa
                 "proj_on_second": _div(dot, d2[b]),   # Δa ≈ c · Δb
-                "sum_rel": _div(_sqrt(d2[a] + d2[b] + 2 * dot),
-                                math.sqrt(b2)),
-                "diff_rel": _div(_sqrt(d2[a] + d2[b] - 2 * dot),
-                                 math.sqrt(b2)),
+                "sum_rel": _div(_sq_norm(d2[a] + d2[b] + 2 * dot,
+                                         d2[a] + d2[b], f"{name} {p} sum",
+                                         notes), math.sqrt(b2)),
+                "diff_rel": _div(_sq_norm(d2[a] + d2[b] - 2 * dot,
+                                          d2[a] + d2[b], f"{name} {p} diff",
+                                          notes), math.sqrt(b2)),
                 "cos_median": _quantile(per, 0.5),
                 "cos_p10": _quantile(per, 0.1),
                 "cos_p90": _quantile(per, 0.9),
@@ -182,23 +207,52 @@ def aggregate(rows, labels):
     return out
 
 
-def aggregates(rows, labels):
+def aggregates(rows, labels, notes=None):
     """{"all", "by_kind", "by_group", "by_dtype"} of aggregate()."""
     def by(field, order=None):
         sets = {}
         for r in rows:
             sets.setdefault(r[field], []).append(r)
         names = [n for n in order if n in sets] if order else sorted(sets)
-        return {n: aggregate(sets[n], labels) for n in names}
+        return {n: aggregate(sets[n], labels, notes, n) for n in names}
 
-    return {"all": aggregate(rows, labels), "by_kind": by("kind", KINDS),
+    return {"all": aggregate(rows, labels, notes), "by_kind": by("kind", KINDS),
             "by_group": by("group"), "by_dtype": by("dtype")}
 
 
+def _save_partial(path, state, err, log):
+    """On a late error: the rows computed so far -> path (JSON)."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(
+            {"partial": True, "error": repr(err), **state}, indent=1,
+            default=lambda o: sorted(o) if isinstance(o, set) else str(o)))
+        log(f"delta: error {err!r}; {len(state.get('tensors', []))} "
+            f"computed rows saved to {path}")
+    except Exception as e:   # noqa: BLE001 - keep the original error
+        log(f"delta: could not save partial rows to {path}: {e!r}")
+
+
 def delta_compare(base_path, deltas, chunk=CHUNK, log=print,
-                  log_every=LOG_EVERY_S):
+                  log_every=LOG_EVERY_S, partial_path=None):
     """deltas: [(label, path)] (>= 2; the first is the reference axis).
+    partial_path: on any error after the files are opened, the rows
+    computed so far are written there before the error propagates.
     -> report dict (module docstring)."""
+    labels = [a for a, _ in deltas]
+    if len(labels) < 2 or len(set(labels)) != len(labels):
+        raise ValueError(f"need >= 2 distinct delta labels, got {labels}")
+    state = {"base": str(base_path), "labels": labels, "tensors": []}
+    try:
+        return _delta_compare(base_path, deltas, labels, chunk, log,
+                              log_every, state)
+    except BaseException as e:
+        if partial_path:
+            _save_partial(partial_path, state, e, log)
+        raise
+
+
+def _delta_compare(base_path, deltas, labels, chunk, log, log_every, state):
     import importlib
     from contextlib import ExitStack
 
@@ -206,10 +260,8 @@ def delta_compare(base_path, deltas, chunk=CHUNK, log=print,
 
     importlib.import_module("ml_dtypes")   # numpy 'bfloat16' for safe_open
 
-    labels = [a for a, _ in deltas]
-    if len(labels) < 2 or len(set(labels)) != len(labels):
-        raise ValueError(f"need >= 2 distinct delta labels, got {labels}")
     t0 = last = time.time()
+    notes = []
     with ExitStack() as stack:
         base = stack.enter_context(safe_open(str(base_path), framework="numpy"))
         hs = [stack.enter_context(safe_open(str(p), framework="numpy"))
@@ -218,7 +270,8 @@ def delta_compare(base_path, deltas, chunk=CHUNK, log=print,
         files = [{"label": a, "path": str(p), "keys": set(h.keys()),
                   "shape_mismatch": [], "dtype_mismatch": [],
                   "nonfinite": []} for (a, p), h in zip(deltas, hs)]
-        rows, skipped, base_nonfinite, elems = [], [], [], 0
+        rows, skipped, base_nonfinite, elems = state["tensors"], [], [], 0
+        state.update(files=files, skipped=skipped, notes=notes)
         for n, key in enumerate(base_keys):
             bsl = base.get_slice(key)
             shape, dtype = tuple(bsl.get_shape()), bsl.get_dtype()
@@ -251,13 +304,12 @@ def delta_compare(base_path, deltas, chunk=CHUNK, log=print,
                 skipped.append(key)
             else:
                 rows.append(tensor_row(key, numel, dtype, dtypes, labels,
-                                       b2, d2, dot))
+                                       b2, d2, dot, notes))
             if time.time() - last >= log_every:
                 last = time.time()
                 log(f"delta: {n + 1}/{len(base_keys)} tensors, "
                     f"{elems / 1e9:.2f} G elements per file, "
                     f"{last - t0:.0f} s")
-    notes = []
     for f in files:
         f["n_tensors"] = len(rows)
         f["missing"] = sorted(set(base_keys) - f["keys"])
@@ -285,9 +337,8 @@ def delta_compare(base_path, deltas, chunk=CHUNK, log=print,
                       for b in labels[i + 1:]],
             "files": files, "n_base_tensors": len(base_keys),
             "skipped": skipped, "base_nonfinite": base_nonfinite,
-            "notes": notes,
-            "aggregates": aggregates(rows, labels), "tensors": rows,
-            "seconds": time.time() - t0}
+            "aggregates": aggregates(rows, labels, notes), "tensors": rows,
+            "notes": notes, "seconds": time.time() - t0}
 
 
 # ------------------------------------------------------------------ tables
@@ -330,7 +381,8 @@ def format_tables(report):
         out = [head]
         for name, a in sets.items():
             out.append(f"{name:<12}{a['n_tensors']:>8}"
-                       f"{a['noise_floor']:>9.1e}"
+                       + (f"{a['noise_floor']:>9.1e}" if a["noise_floor"]
+                          else f"{'-':>9}")
                        + "".join(f"{_pct(a['rel'][x]):>12}" for x in labels)
                        + "".join(f"{_cos(a['pairs'][p]['cos']):>16}"
                                  for p in pairs))
@@ -378,8 +430,9 @@ def main(argv=None):
     for p in [args.base] + [p for _, p in deltas]:
         if not os.path.isfile(p):
             ap.error(f"not a file: {p}")
-    report = delta_compare(args.base, deltas)
     out = Path(args.out)
+    report = delta_compare(args.base, deltas,
+                           partial_path=out.with_name(out.name + ".partial"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=1))
     print(format_tables(report))

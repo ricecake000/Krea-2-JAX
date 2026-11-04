@@ -327,3 +327,5 @@ def test_delta_compare_cos_and_energy_weighted_aggregates(tmp_path):
     assert p["proj_on_first"] == pytest.approx(0.5 / 4.25) and p["cos2"] == pytest.approx(0.25 / 8.5)
     assert agg["noise_floor"] == pytest.approx(1 / np.sqrt(20)) and set(rep["aggregates"]["by_dtype"]) == {"F32"}
     assert rep["aggregates"]["by_kind"]["attn_q"]["pairs"]["a|b"]["cos"] == pytest.approx(1)
+    notes = []   # roundoff-sized negative squared norm -> 0; a real negative one -> None + note, never an error
+    assert dc._sq_norm(-4.5e-13, 1.0, "x", notes) == 0.0 and dc._sq_norm(-1e-3, 1.0, "y", notes) is None and len(notes) == 1

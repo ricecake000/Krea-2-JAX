@@ -35,7 +35,8 @@ with the `huggingface` secret:
      energy-weighted aggregates (ALL, per kind, per block group, per base
      storage dtype BF16 / F32), cos^2, projection coefficients, noise floor;
      progress logged every ~30 s. Saved to /vol/delta/<name>.json (with the
-     inputs' identities), returned, printed as tables and written locally.
+     inputs' identities; on a late error the rows computed so far go to
+     /vol/delta/<name>.json.partial), returned, written locally, printed.
 
 Importable without the Modal SDK and without numpy (the local entrypoint
 runs in the Modal CLI's Python): scripts/modal_export_full.py and
@@ -199,14 +200,20 @@ def delta_impl(run, step, source, extras, name, vol=VOL, env=None,
         raise RuntimeError(f"delta labels must be distinct, got {labels}")
     turbo, turbo_marker = ensure_turbo(vol, env, commit, log)
     deltas = [("turbo", turbo), (run, exp)] + extras
-    report = dc.delta_compare(base, deltas, log=log)
+    out = Path(vol) / DELTA_DIR / f"{name}.json"
+    try:   # a late error keeps the computed rows in <name>.json.partial
+        report = dc.delta_compare(
+            base, deltas, log=log,
+            partial_path=out.with_name(out.name + ".partial"))
+    except BaseException:
+        commit()
+        raise
     report["name"] = name
     report["inputs"] = {
         "base": mef.hf_base_identity(str(base.parent)),
         "turbo": turbo_marker,
         run: mxf._read_json(mxf.export_source_path(exp)),
     }
-    out = Path(vol) / DELTA_DIR / f"{name}.json"
     mxf._write_json(out, report)
     commit()
     log(dc.format_tables(report))
@@ -311,9 +318,10 @@ if modal is not None:
         rep = delta_remote.remote(args.run, args.step, args.source,
                                   args.extra, args.name)
         print(f"remote: {(time.time() - t0) / 60:.1f} min")
+        local = write_local(rep, args.out)   # before any formatting
         print(dc.format_tables(rep))
         print(f"\nvolume: {rep['report_path']}")
-        print(f"wrote {write_local(rep, args.out)}")
+        print(f"wrote {local}")
 
 
 def local_main(argv=None):
