@@ -680,6 +680,24 @@ python scripts/average_snapshots.py run/snapshots/model_step00{7700,8000,8300}_f
   --out run/model_avg.safetensors [--weights 1,1,2]
 ```
 
+For snapshots on R2 (`<prefix>/<run>/snapshots/`), `scripts/modal_average_full.py`
+runs the same averaging in a Modal CPU container (8 cores, no memory or
+disk reservation) and streams the inputs with ranged GETs pinned to each
+object's ETag (no download; the next tensors are prefetched within 4 GiB),
+writes the bf16 output to the container's `/tmp`, uploads it to
+`<prefix>/<run>/averages/<name>.safetensors` with user metadata
+`inputs-fingerprint` (sha256 of the inputs' key/size/ETag and normalized
+weights, in input order), `avg-steps`, `avg-weights`, and prints the
+`--models <name>=<key>` item for `scripts/modal_eval_full.py`. An existing
+output of the same inputs is skipped, one of other inputs is refused
+(`--force` replaces either); `--dry-run` reads only the headers and prints
+the plan:
+
+```bash
+modal run scripts/modal_average_full.py --run run3 --steps 7354,7814,8273,8733 \
+  --name avg_decay4 [--weights 1,1,2,2] [--dry-run]
+```
+
 After each phase's step is compiled the trainer prints `NOTE memory_analysis
 phase <k>: args A out O alias L temp T per device` (XLA's per-device sizes in
 GiB, when the backend reports them), and after the 3rd step of each phase

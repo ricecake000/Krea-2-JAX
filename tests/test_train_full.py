@@ -528,6 +528,40 @@ def test_snapshot_average_matches_export(two_phase, tmp_path):
     assert not (tmp_path / "bad").exists()
 
 
+def test_r2_average_matches_local(two_phase, tmp_path, monkeypatch):
+    import io
+    from concurrent.futures import ThreadPoolExecutor
+
+    import average_snapshots
+    from krea2_jax.r2 import R2Fetch, R2Safetensors
+
+    class Fake:  # boto3-style client: head_object, ranged get_object pinned by IfMatch
+        objs = {str(p): [p.read_bytes(), '"e1"'] for p in (snap(two_phase.out, 8), snap(two_phase.out, 10))}
+
+        def head_object(self, Bucket, Key):
+            return {"ContentLength": len(self.objs[Key][0]), "ETag": self.objs[Key][1]}
+
+        def get_object(self, Bucket, Key, Range, IfMatch):
+            data, etag = self.objs[Key]
+            if IfMatch != etag:
+                raise type("PF", (Exception,), {"response": {"Error": {"Code": "PreconditionFailed"}}})()
+            a, b = map(int, Range.removeprefix("bytes=").split("-"))
+            return {"Body": io.BytesIO(data[a:b + 1])}
+
+    keys, w = list(Fake.objs), [1.0, 2.5]
+    average_snapshots.main([*keys, "--weights", "1,2.5", "--out", str(tmp_path / "local")])
+    monkeypatch.setattr(average_snapshots, "PAR_ELEMS", 0)  # chunked accumulate on the pool
+    monkeypatch.setattr(average_snapshots, "CHUNK_ELEMS", 1000)
+    with ThreadPoolExecutor(8) as ex:
+        readers = [R2Safetensors(Fake(), "b", k, executor=ex, chunk=4096) for k in keys]
+        average_snapshots.average(readers, keys, tmp_path / "r2", w, threads=2,
+                                  fetch=R2Fetch(readers, budget=1 << 14))
+        assert (tmp_path / "r2").read_bytes() == (tmp_path / "local").read_bytes()
+        Fake.objs[keys[1]][1] = '"e2"'  # replaced object: every later GET fails
+        with pytest.raises(RuntimeError, match="object changed"):
+            readers[1].get_tensor(readers[1].keys()[0])
+
+
 @pytest.mark.parametrize("extra", [(), ("--phase2-batch-size", "8")])
 def test_resume_in_phase2(two_phase, job, tmp_path, extra):
     d = tmp_path / "run"
