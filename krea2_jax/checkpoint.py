@@ -685,7 +685,8 @@ def official_key_shapes(params):
     return {name: shape for name, _, _, shape in entries}
 
 
-def save_krea2_params(path, params, dtype=jnp.bfloat16, metadata=None):
+def save_krea2_params(path, params, dtype=jnp.bfloat16, metadata=None,
+                      key_dtypes=None):
     """Write a params tree as an official-layout Krea 2 safetensors file.
 
     Inverse of `load_krea2_params`: stacked subtrees (STACKED_PREFIXES) are
@@ -701,6 +702,10 @@ def save_krea2_params(path, params, dtype=jnp.bfloat16, metadata=None):
     always gives identical bytes. The write is atomic: data goes to a sibling
     temp file that is fsynced and then renamed onto `path`; on any error the
     temp file is removed and an existing `path` is left untouched.
+
+    key_dtypes: optional {official key: dtype} overriding `dtype` for those
+    keys (mixed-dtype files such as the HF Raw/Turbo layout: BF16 + F32).
+    All per-layer keys of one stacked leaf must share a dtype.
     """
     import json
     import os
@@ -709,21 +714,32 @@ def save_krea2_params(path, params, dtype=jnp.bfloat16, metadata=None):
 
     if sys.byteorder != "little":  # safetensors data is little-endian
         raise NotImplementedError("save_krea2_params needs a little-endian host")
-    out_dtype = np.dtype(dtype)
-    if out_dtype not in _ST_DTYPES:
-        raise ValueError(f"unsupported safetensors dtype: {out_dtype}")
-    itemsize = out_dtype.itemsize
+    key_dtypes = {str(k): np.dtype(v) for k, v in (key_dtypes or {}).items()}
+    default_dtype = np.dtype(dtype)
+    for d in {default_dtype, *key_dtypes.values()}:
+        if d not in _ST_DTYPES:
+            raise ValueError(f"unsupported safetensors dtype: {d}")
 
     # (official key, leaf index, layer index or None, per-tensor shape);
     # shared with official_key_shapes so the two cannot drift
     entries, leaves = _official_entries(params)
+    unknown = sorted(set(key_dtypes) - {e[0] for e in entries})
+    if unknown:
+        raise ValueError(f"key_dtypes names keys not in params: {unknown[:3]}")
+    leaf_dtype = {}   # leaf index -> its output dtype
+    for name, li, _, _ in entries:
+        d = key_dtypes.get(name, default_dtype)
+        if leaf_dtype.setdefault(li, d) != d:
+            raise ValueError(f"{name}: key_dtypes differ within one stacked "
+                             "leaf")
 
     header = {}
     if metadata:
         header["__metadata__"] = {str(k): str(v) for k, v in metadata.items()}
     offset = 0
-    for name, _, _, shape in entries:
-        nbytes = int(np.prod(shape, dtype=np.int64)) * itemsize
+    for name, li, _, shape in entries:
+        out_dtype = leaf_dtype[li]
+        nbytes = int(np.prod(shape, dtype=np.int64)) * out_dtype.itemsize
         header[name] = {
             "dtype": _ST_DTYPES[out_dtype],
             "shape": list(shape),
@@ -748,6 +764,7 @@ def save_krea2_params(path, params, dtype=jnp.bfloat16, metadata=None):
             f.truncate(data_start + offset)
             for li in sorted(by_leaf):
                 leaf = leaves[li]
+                out_dtype = leaf_dtype[li]
                 if isinstance(leaf, jax.Array):
                     # Fetch from a short-lived cast copy: np.asarray caches
                     # the gathered host value on the array it reads, so

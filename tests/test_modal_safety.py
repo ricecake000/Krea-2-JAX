@@ -307,6 +307,26 @@ def test_prompts_file_table_refusals_and_r2_deleted_fallback(tmp_path, monkeypat
                 mef.r2_deleted_identity(key, log=lambda *_: None)
 
 
+def test_mu_offset_in_table_and_keys_and_turbo_refusals(tmp_path):
+    f = tmp_path / "p.json"
+    f.write_text(json.dumps({"format": 1, "prompts": [{"caption": "a", "width": 1344, "height": 768}]}))
+    steps, cfg, off = mef.resolve_sampler_args(None, None, None, True)
+    assert (steps, cfg, round(off, 6)) == (8, 0.0, 0.246818)
+    table = mef.resolve_prompt_args(str(f), None, None, 0, off)[2]
+    assert table[0]["mu"] == mef.resolved_mu(1344, 768) + off and str(off)[:8] in mef.prompt_table(table, mu_offset=off)
+    # offset 0 / no --turbo: the cache key of an existing entry, pinned from before --mu-offset existed
+    steps, cfg, off = mef.resolve_sampler_args(None, None, None, False)
+    p = mef.finalize_prompts([{"source": "ood", "row_id": None, "variant": None, "artist": "",
+                               "caption": "a", "width": 1024, "height": 1024}], 0, off)[0]
+    assert mef.entry_hash(mef.entry_key(mef.sampler_settings(steps, cfg), p, {"key": "x"})) == \
+        "1e6f1fc8cfd878bb33838496d2b0da0d"
+    for kw in ({"steps": 8}, {"cfg": 0.0}, {"mu_offset": 0.25}):
+        with pytest.raises(ValueError, match="--turbo sets"):
+            mef.resolve_sampler_args(**{"steps": None, "cfg": None, "mu_offset": None, **kw}, turbo=True)
+    for bad in (float("nan"), 2.5):
+        with pytest.raises(ValueError, match="--mu-offset"):
+            mef.resolve_sampler_args(None, None, bad, False)
+
 def test_delta_compare_cos_and_energy_weighted_aggregates(tmp_path):
     """Parallel deltas give cos 1, orthogonal ones 0; aggregates are energy-weighted (not a mean of cosines)."""
     import numpy as np
@@ -329,3 +349,29 @@ def test_delta_compare_cos_and_energy_weighted_aggregates(tmp_path):
     assert rep["aggregates"]["by_kind"]["attn_q"]["pairs"]["a|b"]["cos"] == pytest.approx(1)
     notes = []   # roundoff-sized negative squared norm -> 0; a real negative one -> None + note, never an error
     assert dc._sq_norm(-4.5e-13, 1.0, "x", notes) == 0.0 and dc._sq_norm(-1e-3, 1.0, "y", notes) is None and len(notes) == 1
+
+
+def test_transplant_alpha0_bytes_alpha1_sum_and_dtypes(tmp_path):
+    """alpha 0 reproduces Turbo byte for byte (-0.0 included), alpha 1 = turbo + ft - raw rounded once to Turbo's
+    per-key dtype (BF16 stays BF16, F32 stays F32)."""
+    import ml_dtypes
+    import numpy as np
+    from safetensors import safe_open
+    from safetensors.numpy import save_file
+    import build_transplant as bt
+    rng, bf = np.random.default_rng(0), ml_dtypes.bfloat16
+    w, s = "blocks.0.attn.wq.weight", "last.norm.scale"
+    t = {w: rng.normal(size=(64, 8)).astype(bf), s: rng.normal(size=(8,)).astype(np.float32)}
+    t[w][0, 0] = -0.0
+    files = {"turbo": t, "raw": {w: rng.normal(size=(64, 8)).astype(bf), s: rng.normal(size=(8,)).astype(np.float32)},
+             "ft": {w: rng.normal(size=(64, 8)).astype(np.float32), s: rng.normal(size=(8,)).astype(np.float32)}}
+    p = {n: str(tmp_path / f"{n}.safetensors") for n in files}
+    for n, d in files.items():
+        save_file(d, p[n])
+    for a in (0, 1):
+        bt.build(p["turbo"], p["raw"], p["ft"], a, tmp_path / f"a{a}.st", log=lambda *_: None)
+        with safe_open(str(tmp_path / f"a{a}.st"), "numpy") as f:
+            assert f.metadata()["alpha"] == f"{a}.0" and {k: f.get_slice(k).get_dtype() for k in f.keys()} == {w: "BF16", s: "F32"}
+            for k, tk in t.items():
+                want = tk if a == 0 else (tk.astype(np.float32) + (files["ft"][k] - files["raw"][k].astype(np.float32))).astype(tk.dtype)
+                assert f.get_tensor(k).tobytes() == want.tobytes()
