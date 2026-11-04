@@ -336,7 +336,9 @@ GENERATE_MARGIN_S = 150   # tail kept free for results + volume commit
 # sample of a resolution incl. its compile
 LOAD_ALLOWANCE_S = 300
 COLD_ALLOWANCE_S = 240
-GENERATE_MEM_GIB = 64     # host RAM: one 25.6 GB checkpoint staged at a time
+# host RAM in use (one 25.6 GB checkpoint staged at a time): cost estimate
+# only; no memory reservation (Modal bills memory by use)
+GENERATE_MEM_GIB = 64
 GENERATE_CPU = 8
 PREPARE_TIMEOUT_S = 2 * 3600
 DECODE_TIMEOUT_S = 30 * 60
@@ -2448,7 +2450,7 @@ if modal is not None:
         if REMOTE_REPO not in sys.path:
             sys.path.insert(0, REMOTE_REPO)
 
-    @app.function(image=cpu_image, cpu=4.0, memory=16 * 1024,
+    @app.function(image=cpu_image, cpu=4.0,
                   timeout=PREPARE_TIMEOUT_S, volumes={VOL: vol},
                   secrets=[hf_secret, r2_secret])
     def prepare(parquet_only: bool, n_dataset: int, n_ood: int, seed: int,
@@ -2465,7 +2467,7 @@ if modal is not None:
 
     # gpu is overridden per call with .with_options(gpu=--gpu)
     @app.function(image=gpu_image, gpu=DEFAULT_GPU, cpu=float(GENERATE_CPU),
-                  memory=GENERATE_MEM_GIB * 1024, timeout=GENERATE_TIMEOUT_S,
+                  timeout=GENERATE_TIMEOUT_S,
                   volumes={VOL: vol})
     def generate(prompts: list, jobs: list, settings: dict,
                  use_cache: bool = True) -> dict:

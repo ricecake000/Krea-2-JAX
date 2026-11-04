@@ -26,7 +26,7 @@ Options (local entrypoint, argparse):
   --out PATH        local drift JSON (default
                     /home/mj/krea2-ops/eval/drift_<run>_<step>.json)
 
-One function (`export_full_remote`, EXPORT_CPU cores, EXPORT_MEM_GIB GiB:
+One function (`export_full_remote`, EXPORT_CPU cores, no memory reservation:
 scripts/export_full.py holds the fp32 tree, ~48 GiB for the 12.9B DiT, plus
 the largest leaf's transient copies) on the Volume `krea2-eval-cache` of
 scripts/modal_eval_full.py, with the `krea2-r2` secret:
@@ -115,7 +115,6 @@ BASE_REL = "base/raw.safetensors"   # modal_eval_full prepare's HF base
 
 # --- Modal resources ---
 EXPORT_CPU = 8
-EXPORT_MEM_GIB = 98       # export_full: ~48 GiB fp32 tree + leaf copies
 EXPORT_TIMEOUT_S = 3 * 3600
 DOWNLOAD_WORKERS = 2      # objects in flight x max_concurrency 32 = the
 #                           client's 64 pooled connections
@@ -770,7 +769,7 @@ if modal is not None:
     app = modal.App("krea2-export-full")
 
     @app.function(image=image, cpu=float(EXPORT_CPU),
-                  memory=EXPORT_MEM_GIB * 1024, timeout=EXPORT_TIMEOUT_S,
+                  timeout=EXPORT_TIMEOUT_S,
                   volumes={VOL: vol}, secrets=[r2_secret])
     def export_full_remote(run: str, step: int, source: str, compares: list,
                            drift_only: bool, force: bool, prefix: str) -> dict:
