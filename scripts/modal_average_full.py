@@ -41,7 +41,8 @@ reservation, the `krea2-r2` secret):
      (tensors, GiB read, MiB/s, seconds waiting on the network / accumulating
      / writing) every ~30 s.
   5. upload (boto3 upload_file, make_transfer_config) with user metadata
-     {inputs-fingerprint, avg-steps, avg-weights}; head_object: size and
+     {inputs-fingerprint, avg-steps, avg-weights} after every input is
+     re-headed (ETag + size as pinned, else no upload); head_object: size and
      metadata must match. The temp file is deleted. Snapshot objects are
      only read.
 
@@ -279,6 +280,15 @@ def average_impl(run, steps, name, weights, prefix=R2_PREFIX, force=False,
                 f"waiting on the network {out['fetch_s']} s, accumulating "
                 f"{out['accumulate_s']} s, bf16 cast + write {out['write_s']} "
                 "s")
+            # an input whose last GET finished before it was replaced is
+            # caught only here: re-head every input before uploading
+            for r in readers:
+                h = client.head_object(Bucket=bucket, Key=r.key)
+                if (h["ETag"], int(h["ContentLength"])) != (r.etag, r.size):
+                    raise RuntimeError(f"input {r.key} changed during the run "
+                                       f"(etag {r.etag} -> {h['ETag']}, size "
+                                       f"{r.size} -> {h['ContentLength']}); "
+                                       "not uploaded")
             ident = upload_average(
                 client, bucket, key, path,
                 {"inputs-fingerprint": fp,
