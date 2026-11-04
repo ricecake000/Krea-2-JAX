@@ -55,6 +55,7 @@ imports).
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -345,10 +346,25 @@ def build_arg_parser():
     return ap
 
 
+def parse_weights(text, n):
+    """average_snapshots.parse_weights without numpy (the local Modal CLI's
+    Python has none): None -> uniform, else n finite non-negative floats with
+    a positive sum; SystemExit otherwise."""
+    if text is None:
+        return [1.0] * n
+    try:
+        w = [float(x) for x in text.split(",")]
+    except ValueError:
+        w = []
+    if len(w) != n or any(not math.isfinite(x) or x < 0 for x in w) \
+            or sum(w) <= 0:
+        raise SystemExit(f"--weights must be {n} non-negative numbers with a "
+                         f"positive sum, got {text!r}")
+    return w
+
+
 def parse_args(argv):
     """argparse + validation -> args with .steps (ints), .weights (floats)."""
-    import average_snapshots as avs
-
     ap = build_arg_parser()
     args = ap.parse_args(list(argv))
     for opt, v in (("--run", args.run), ("--name", args.name)):
@@ -364,7 +380,7 @@ def parse_args(argv):
     if any(s <= 0 for s in steps) or len(set(steps)) != len(steps):
         ap.error(f"--steps must be unique positive integers, got {steps}")
     try:
-        args.weights = avs.parse_weights(args.weights, len(steps))
+        args.weights = parse_weights(args.weights, len(steps))
     except SystemExit as e:
         ap.error(str(e))
     args.steps = steps
