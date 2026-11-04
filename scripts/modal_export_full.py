@@ -101,7 +101,7 @@ for _repo in (str(LOCAL_REPO), REMOTE_REPO):
         sys.path.insert(0, _repo)
 
 from krea2_jax.r2 import (  # noqa: E402 - needs the sys.path above
-    head_or_none, make_transfer_config, r2_client, r2_identity,
+    head_or_none, list_objects, make_transfer_config, r2_client, r2_identity,
 )
 
 LOCAL_OUT_ROOT = Path("/home/mj/krea2-ops/eval")
@@ -155,23 +155,6 @@ def local_paths(vol, run, step, source):
 
 
 # --------------------------------------------------------------- download
-def list_objects(client, bucket, prefix):
-    """Every object under prefix (list_objects_v2, paginated) ->
-    [{"key", "size", "etag"}]."""
-    out, token = [], None
-    while True:
-        kw = {"Bucket": bucket, "Prefix": prefix}
-        if token:
-            kw["ContinuationToken"] = token
-        resp = client.list_objects_v2(**kw)
-        for o in resp.get("Contents", []):
-            out.append({"key": o["Key"], "size": int(o["Size"]),
-                        "etag": str(o.get("ETag", "")).strip('"')})
-        if not resp.get("IsTruncated"):
-            return out
-        token = resp["NextContinuationToken"]
-
-
 def select_ckpt_objects(objects, prefix, tree, trees=SOURCES):
     """The objects of one orbax step dir (listed under `prefix`) needed to
     restore `tree` alone: the step's top-level files, <tree>/ and meta/.
