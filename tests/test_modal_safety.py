@@ -307,6 +307,26 @@ def test_prompts_file_table_refusals_and_r2_deleted_fallback(tmp_path, monkeypat
                 mef.r2_deleted_identity(key, log=lambda *_: None)
 
 
+def test_mu_offset_in_table_and_keys_and_turbo_refusals(tmp_path):
+    f = tmp_path / "p.json"
+    f.write_text(json.dumps({"format": 1, "prompts": [{"caption": "a", "width": 1344, "height": 768}]}))
+    steps, cfg, off = mef.resolve_sampler_args(None, None, None, True)
+    assert (steps, cfg, round(off, 6)) == (8, 0.0, 0.246818)
+    table = mef.resolve_prompt_args(str(f), None, None, 0, off)[2]
+    assert table[0]["mu"] == mef.resolved_mu(1344, 768) + off and str(off)[:8] in mef.prompt_table(table, mu_offset=off)
+    # offset 0 / no --turbo: the cache key of an existing entry, pinned from before --mu-offset existed
+    steps, cfg, off = mef.resolve_sampler_args(None, None, None, False)
+    p = mef.finalize_prompts([{"source": "ood", "row_id": None, "variant": None, "artist": "",
+                               "caption": "a", "width": 1024, "height": 1024}], 0, off)[0]
+    assert mef.entry_hash(mef.entry_key(mef.sampler_settings(steps, cfg), p, {"key": "x"})) == \
+        "1e6f1fc8cfd878bb33838496d2b0da0d"
+    for kw in ({"steps": 8}, {"cfg": 0.0}, {"mu_offset": 0.25}):
+        with pytest.raises(ValueError, match="--turbo sets"):
+            mef.resolve_sampler_args(**{"steps": None, "cfg": None, "mu_offset": None, **kw}, turbo=True)
+    for bad in (float("nan"), 2.5):
+        with pytest.raises(ValueError, match="--mu-offset"):
+            mef.resolve_sampler_args(None, None, bad, False)
+
 def test_delta_compare_cos_and_energy_weighted_aggregates(tmp_path):
     """Parallel deltas give cos 1, orthogonal ones 0; aggregates are energy-weighted (not a mean of cosines)."""
     import numpy as np
