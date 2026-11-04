@@ -276,3 +276,31 @@ def test_check_pairable_refuses_sampler_difference(s, p):
     mef.check_pairable(mef.entry_key(S, P, HF_ID), mef.entry_key(S, P, R2_ID))
     with pytest.raises(mef.UnfairPairError, match="only the model may differ"):
         mef.check_pairable(mef.entry_key(S, P, HF_ID), mef.entry_key(s, p, R2_ID))
+
+
+def test_prompts_file_table_refusals_and_r2_deleted_fallback(tmp_path, monkeypatch):
+    f, good = tmp_path / "p.json", [{"caption": "a", "width": 1024, "height": 768, "x": 1},
+                                    {"caption": "b", "width": 512, "height": 512}]
+    f.write_text(json.dumps({"format": 1, "notes": "x", "prompts": good}))
+    table, src = mef.load_prompts_file(f, seed=7)
+    assert table == mef.finalize_prompts([{"source": "file", "row_id": None, "variant": None, "artist": "",
+                                           **{k: g[k] for k in ("caption", "width", "height")}} for g in good], 7)
+    assert src["sha256"] == hashlib.sha256(f.read_bytes()).hexdigest() and src["path"] == str(f)
+    for fmt, bad in ((1, [good[0], {**good[1], "caption": "a"}]), (1, [{**good[0], "width": 1000}]), (1, []),
+                     (1, [{**good[0], "height": 0}]), (1, [{**good[0], "caption": " "}]), (2, good), (True, good)):
+        f.write_text(json.dumps({"format": fmt, "prompts": bad}))
+        with pytest.raises(ValueError):
+            mef.load_prompts_file(f, 7)
+    with pytest.raises(ValueError, match="replaces --n-ood"):
+        mef.resolve_prompt_args(str(f), None, 0, 7)
+    # an R2 object deleted from the bucket: only a volume copy marked for this key at its size is used
+    monkeypatch.setattr(mef, "VOL_FT_ROOT", str(tmp_path / "ft"))
+    key, path = "krea2-fullft/run2/model.safetensors", tmp_path / "ft/run2/model.safetensors"
+    path.parent.mkdir(parents=True), path.write_bytes(b"w" * 10)
+    for ident, ok in (({**R2_ID, "size": 10}, True), ({**R2_ID, "size": 11}, False), ({**R2_ID, "key": "x", "size": 10}, False)):
+        mef.r2_marker_path(path).write_text(json.dumps(ident))
+        if ok:
+            assert mef.r2_deleted_identity(key, log=lambda *_: None) == ident
+        else:
+            with pytest.raises(RuntimeError, match="no such object"):
+                mef.r2_deleted_identity(key, log=lambda *_: None)

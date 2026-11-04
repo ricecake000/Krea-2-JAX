@@ -21,6 +21,11 @@ dirs (A vs B) with an HTML contact sheet are assembled on the laptop.
 
     python scripts/modal_eval_full.py --only-prompts --parquet metadata.parquet \
         [--models ... --pairs ...]     # same table from a local parquet, no Modal
+    modal run scripts/modal_eval_full.py --prompts-file \
+        /home/mj/krea2-ops/eval/prompts/run3_capgen100.json --models ... --pairs ...
+                                       # the prompt set from a JSON file
+    python scripts/modal_eval_full.py --only-prompts --prompts-file FILE
+                                       # its table, no Modal
 
 Options (local entrypoint):
   --n-dataset N   in-distribution prompts from the dataset's metadata.parquet
@@ -31,7 +36,17 @@ Options (local entrypoint):
                   scripts/sample.py; mu from the resolution, negative "")
   --seed S        prompt-selection seed; prompt i samples with seed S + i
                   (identical for every model)
+  --prompts-file F  the prompt set from a JSON file instead of the parquet +
+                  OOD prompts (--n-dataset / --n-ood are then refused):
+                  {"format": 1, "prompts": [{"caption", "width", "height"},
+                  ...]} (other keys ignored); captions non-empty and unique,
+                  sizes positive multiples of 16; prompt i samples with seed
+                  S + i, mu from its resolution. Read and validated on the
+                  laptop before any remote work; the table is passed to
+                  `prepare` (no parquet needed); its path and the sha256 of
+                  its bytes go to generate.json / index.html.
   --only-prompts  run `prepare` for the parquet only, print the table, exit
+                  (with --prompts-file: just the table, no remote call)
   --limit N       first N prompts of the table (0 = all)
   --gpu G         Modal GPU of `generate`: H100 (default, 80 GB), H200, B200
                   or B300
@@ -125,8 +140,14 @@ Stages:
                                      (r2_cache_path; boto3 multipart; reused
                                      only while the sidecar <file>.r2.json ==
                                      the object's key, ETag, size,
-                                     LastModified)
-     builds the prompt table from the parquet (build_prompts), then the
+                                     LastModified). An object deleted from
+                                     R2 (head_object: no such key) is used
+                                     from the volume when its sidecar has
+                                     this key and the file's size, with the
+                                     sidecar's identity (status
+                                     cached-r2-deleted); else an error
+     builds the prompt table from the parquet (build_prompts; with
+     --prompts-file it gets the laptop's table instead), then the
      cache plan: each model's identity (R2 head_object; HF base from its
      marker), the key + cache status of every (model, prompt), and downloads
      only the checkpoints of models with a missing entry.
@@ -180,8 +201,7 @@ estimate, the local mirror, pair dirs) is stdlib-only, as `modal run`'s own
 interpreter has no numpy / PIL. Prompt selection, caption formatting, cache
 keys, the fairness rule, the planner, the generate core (generate_impl,
 generate_jobs_impl), decode (decode_tasks), pair images and the pair-dir
-writer are plain functions (tests/test_modal_eval_full.py,
-tests/test_eval_cache.py).
+writer are plain functions (tests/test_modal_safety.py).
 """
 
 import argparse
@@ -248,6 +268,8 @@ VOL_JAX_CACHE = f"{VOL}/jax_cache"   # persistent compile cache across runs
 MARKER = ".eval_done.json"           # written after a complete HF download
 
 # --- prompts ---
+DEFAULT_N_DATASET = 40
+PROMPTS_FILE_FORMAT = 1   # --prompts-file {"format": 1, "prompts": [...]}
 TOP_BUCKETS = 3
 LONG_FRAC = 0.75          # dataset prompts with the long caption (+ artist)
 OOD_SIZE = (1024, 1024)   # (width, height)
@@ -314,7 +336,9 @@ GENERATE_MARGIN_S = 150   # tail kept free for results + volume commit
 # sample of a resolution incl. its compile
 LOAD_ALLOWANCE_S = 300
 COLD_ALLOWANCE_S = 240
-GENERATE_MEM_GIB = 64     # host RAM: one 25.6 GB checkpoint staged at a time
+# host RAM in use (one 25.6 GB checkpoint staged at a time): cost estimate
+# only; no memory reservation (Modal bills memory by use)
+GENERATE_MEM_GIB = 64
 GENERATE_CPU = 8
 PREPARE_TIMEOUT_S = 2 * 3600
 DECODE_TIMEOUT_S = 30 * 60
@@ -498,6 +522,74 @@ def build_prompts(parquet, n_dataset, n_ood, seed):
     ds = (select_dataset_prompts(read_parquet_rows(parquet), n_dataset, seed)
           if n_dataset > 0 else [])
     return finalize_prompts(ds + ood_prompts(n_ood), seed)
+
+
+def _plain_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def load_prompts_file(path, seed):
+    """--prompts-file -> (finalize_prompts table of its {caption, width,
+    height} entries (seed + i, mu from the resolution), {"path", "sha256"
+    (of the bytes parsed), "format", "n"}). ValueError unless format is 1,
+    the list is non-empty, captions are non-empty unique strings and every
+    width / height is a positive multiple of 16. Stdlib only."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError as e:
+        raise ValueError(f"--prompts-file: {e}") from e
+    try:
+        doc = json.loads(data)
+    except ValueError as e:
+        raise ValueError(f"{path}: not JSON ({e})") from e
+    fmt = doc.get("format") if isinstance(doc, dict) else None
+    if not (_plain_int(fmt) and fmt == PROMPTS_FILE_FORMAT):
+        raise ValueError(f"{path}: need a JSON object with \"format\": "
+                         f"{PROMPTS_FILE_FORMAT}, got {fmt!r}")
+    items = doc.get("prompts")
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"{path}: \"prompts\" must be a non-empty list")
+    entries, seen = [], set()
+    for i, it in enumerate(items):
+        cap = it.get("caption") if isinstance(it, dict) else None
+        if not isinstance(cap, str) or not cap.strip():
+            raise ValueError(f"{path}: prompt {i}: caption must be a "
+                             "non-empty string")
+        if cap in seen:
+            raise ValueError(f"{path}: prompt {i}: duplicate caption "
+                             f"{cap[:60]!r}")
+        seen.add(cap)
+        w, h = it.get("width"), it.get("height")
+        if not all(_plain_int(v) and v > 0 and v % 16 == 0 for v in (w, h)):
+            raise ValueError(f"{path}: prompt {i}: width x height {w!r} x "
+                             f"{h!r} must be positive multiples of 16")
+        entries.append({"source": "file", "row_id": None, "variant": None,
+                        "artist": "", "caption": cap, "width": w,
+                        "height": h})
+    return finalize_prompts(entries, seed), {
+        "path": str(Path(path).resolve()),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "format": fmt, "n": len(entries)}
+
+
+def resolve_prompt_args(prompts_file, n_dataset, n_ood, seed):
+    """The prompt source of the CLI: -> (n_dataset, n_ood, table, source).
+    With prompts_file: (0, 0, load_prompts_file's table + source); an
+    explicit n_dataset / n_ood (not None) is then a ValueError. Without:
+    the defaults (DEFAULT_N_DATASET, all OOD prompts) for None, validated,
+    and table = source = None (prepare builds it from the parquet)."""
+    if prompts_file:
+        given = [n for n, v in (("--n-dataset", n_dataset), ("--n-ood", n_ood))
+                 if v is not None]
+        if given:
+            raise ValueError(f"--prompts-file replaces {' and '.join(given)}")
+        return (0, 0, *load_prompts_file(prompts_file, seed))
+    n_dataset = DEFAULT_N_DATASET if n_dataset is None else n_dataset
+    n_ood = len(OOD_PROMPTS) if n_ood is None else n_ood
+    if n_dataset < 0:
+        raise ValueError(f"--n-dataset must be >= 0, got {n_dataset}")
+    ood_prompts(n_ood)   # validates --n-ood
+    return n_dataset, n_ood, None, None
 
 
 def apply_limit(prompts, limit):
@@ -1134,6 +1226,24 @@ def identity_at(path, key):
     return ident
 
 
+def r2_deleted_identity(key, log=print):
+    """For an R2 key whose head_object says "no such object": the identity
+    of its volume copy (r2_cache_path), when that copy's marker is for this
+    key and matches the file's size (identity_at); RuntimeError otherwise.
+    The identity is the marker's (key, ETag, size, LastModified), so cache
+    entries made while the object existed stay valid."""
+    path = r2_cache_path(key)
+    try:
+        ident = identity_at(path, key)
+    except RuntimeError as e:
+        raise RuntimeError(f"r2:{key}: no such object, and no complete "
+                           f"volume copy to use instead ({e})") from e
+    log(f"r2:{key}: deleted from R2; using the volume copy {path} (etag "
+        f"{ident.get('etag')}, {ident.get('size')} bytes, last modified "
+        f"{ident.get('last_modified')}): cached-r2-deleted")
+    return ident
+
+
 def weights_identity(base_dir=VOL_BASE, ft_path=f"{VOL_FT}/model.safetensors",
                      base_path=None):
     """Which weights an eval uses: {"base": {repo, revision, file, size}
@@ -1168,9 +1278,15 @@ def weights_lines(weights, labels=MODELS):
 def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
                  env=None, log=print, ft_key=R2_KEY, base_key=None,
                  models=None, settings=None, limit=0, cache_only=False,
-                 use_cache=True, gen_root=None):
+                 use_cache=True, gen_root=None, prompts=None):
     """Fill the volume, build the prompt table and (with `settings`) the
     cache plan.
+
+    prompts: a finalized prompt table (--prompts-file, built on the laptop):
+    used as the table (first `limit` rows) instead of the parquet's, which
+    is then neither fetched nor read. An R2 model whose object no longer
+    exists is taken from its volume copy (r2_deleted_identity, status
+    "cached-r2-deleted"); any other head_object error fails it.
 
     models: [(label, KEY)] (default: the legacy pair base = base_key or
     HF_BASE, ft = ft_key). parquet_only: only the parquet (and the table).
@@ -1195,14 +1311,22 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
     plan = settings is not None and not parquet_only
     fetch = not parquet_only and not cache_only
 
+    deleted = set()   # R2 keys used from the volume (object deleted)
+
     def r2_task(key):
-        return lambda: r2_fetch(r2_client(env), env["R2_BUCKET"], key,
-                                r2_cache_path(key), log=log)[0]
+        def run():
+            client = r2_client(env)
+            if head_or_none(client, env["R2_BUCKET"], key) is None:
+                r2_deleted_identity(key, log=log)
+                return "cached-r2-deleted"
+            return r2_fetch(client, env["R2_BUCKET"], key, r2_cache_path(key),
+                            log=log)[0]
+        return run
 
     def hf_base_task():
         return hf_fetch(BASE_REPO, VOL_BASE, [BASE_FILE], token, log=log)
 
-    tasks = [] if cache_only else [
+    tasks = [] if cache_only or prompts is not None else [
         ("parquet", lambda: hf_fetch(DATA_REPO, VOL_DATA, [PARQUET], token,
                                      repo_type="dataset", log=log))]
     if fetch:
@@ -1234,7 +1358,9 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
     for name, fn in tasks:
         attempt(name, fn)
     parquet = Path(VOL_DATA) / PARQUET
-    if parquet.is_file():
+    if prompts is not None:
+        out["prompts"] = apply_limit(prompts, limit)
+    elif parquet.is_file():
         out["prompts"] = apply_limit(
             build_prompts(parquet, n_dataset, n_ood, seed), limit)
     if not plan or out["prompts"] is None:
@@ -1251,7 +1377,9 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
             client.append(r2_client(env))
         head = head_or_none(client[0], env["R2_BUCKET"], key)
         if head is None:
-            raise RuntimeError(f"r2:{key}: no such object")
+            ident = r2_deleted_identity(key, log=log)
+            deleted.add(key)
+            return ident
         return r2_identity(head, key)
 
     for label, key in models:
@@ -1276,6 +1404,8 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
                           for e in entries.values()))
         if label in out["artifacts"]:
             pass   # HF base downloaded (or failed) above
+        elif key in deleted:
+            out["artifacts"][label] = "cached-r2-deleted"   # never fetched
         elif not missing:
             out["artifacts"][label] = "not needed (all entries cached)"
         elif key == HF_BASE and ident is not None:
@@ -2012,7 +2142,7 @@ def check_dirs_free(dirs):
 
 def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
                       local_root=LOCAL_CACHE_ROOT, gen=None, run_id="",
-                      title=None):
+                      title=None, prompt_source=None):
     """Write the pair dir A:B (A = "base" side, B = "ft" side) from the local
     mirror in the layout of the earlier runs (<id>_base.png, <id>_ft.png,
     <id>_pair.png, prompts.json with "labels", generate.json, index.html),
@@ -2023,7 +2153,8 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
     "prompts" (and the table) lists only the prompts with both images; the
     others go to "incomplete" ({id, caption, have: [sides]}) and are named
     in the index.html header. Refuses an existing non-empty out_dir.
-    -> written paths."""
+    prompt_source (--prompts-file: {path, sha256, ...}) is recorded in
+    generate.json ("prompts_file") and index.html. -> written paths."""
     check_dirs_free([out_dir])
     a, b = pair
     info = {m["label"]: m for m in models_info}
@@ -2068,6 +2199,8 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
     gen_doc = {"weights": weights, "env": settings, "rows": rows,
                "pair": [a, b], "run_id": run_id,
                "devices": sorted(devices), "generate": gen}
+    if prompt_source:
+        gen_doc["prompts_file"] = prompt_source
     info_lines = [f"run {run_id}" if run_id else "run (cache)"] + \
         weights_lines(weights, (a, b)) + [
         f"steps {settings['steps']}, cfg {settings['cfg']}, negative "
@@ -2086,7 +2219,9 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
         f"{n_both}/{len(prompts)} prompts with both sides; entries sampled "
         f"on {sorted(devices) or ['?']} (from the cache {LOCAL_CACHE_ROOT.name}"
         f"/{SAMPLER_VERSION})",
-    ] + (["incomplete, left out of this dir: "
+    ] + ([f"prompts from {prompt_source['path']} (sha256 "
+          f"{prompt_source['sha256']})"] if prompt_source else []) + (
+        ["incomplete, left out of this dir: "
           + ", ".join(f"{x['id']} (has {x['have'] or 'nothing'})"
                       for x in incomplete)] if incomplete else []) + [
         f"NOTE: {n}" for n in (gen or {}).get("notes", [])]
@@ -2145,18 +2280,23 @@ def decode_plan(prompts, pairs, models_info, local_root, decode,
     return pack_groups(groups)
 
 
-def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
+def run_eval(*, prepare, generate, decode_map, models, pairs,
+             n_dataset=DEFAULT_N_DATASET,
              n_ood=len(OOD_PROMPTS), steps=DEFAULT_STEPS, cfg=DEFAULT_CFG,
              seed=0, only_prompts=False, limit=0, gpu=DEFAULT_GPU, out="",
              use_cache=True, cache_only=False, local_root=LOCAL_CACHE_ROOT,
-             out_root=LOCAL_OUT_ROOT, stamp=None, log=print):
+             out_root=LOCAL_OUT_ROOT, stamp=None, log=print, prompts=None,
+             prompt_source=None):
     """The local entrypoint's flow (stdlib only; the stages are callables:
     prepare(**kw) -> prepare_impl's dict, generate(prompts, jobs, settings,
     use_cache) -> generate_jobs_impl's dict, decode_map(chunks, decode) ->
     iterable of decode_tasks results). The pair dirs are computed (and
     duplicates / existing non-empty dirs refused) before any remote work. prepare + plan -> (unless --cache-only)
     generate the missing entries -> decode what the local mirror lacks ->
-    one pair dir per pair. -> {"prompts", "todo", "gen", "dirs"}."""
+    one pair dir per pair. prompts / prompt_source: the --prompts-file
+    table (load_prompts_file), passed to prepare instead of its parquet
+    table (--only-prompts then prints it without any remote call), and its
+    provenance for generate.json. -> {"prompts", "todo", "gen", "dirs"}."""
     stamp = stamp or utc_stamp()
     try:   # before any remote work
         dirs = pair_dirs(pairs, out, out_root, stamp)
@@ -2169,13 +2309,21 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
         log(f"{label}: {src} -> {model_path(key)}")
     log("pairs: " + ", ".join(f"{a} (base side) vs {b} (ft side)"
                               for a, b in pairs))
+    if prompt_source:
+        log(f"prompts: {prompt_source['n']} from {prompt_source['path']} "
+            f"(sha256 {prompt_source['sha256']})")
+    if prompts is not None and only_prompts:
+        prompts = apply_limit(prompts, limit)
+        log("\n" + prompt_table(prompts) + "\n")
+        return {"prompts": prompts, "todo": None, "gen": None, "dirs": []}
     settings = sampler_settings(steps, cfg)
     log(f"prepare: {'parquet only' if only_prompts else 'cache plan only' if cache_only else 'all artifacts'}"
         f" -> volume {VOLUME_NAME}")
     prep = prepare(parquet_only=only_prompts, n_dataset=n_dataset,
                    n_ood=n_ood, seed=seed, models=[list(m) for m in models],
                    settings=None if only_prompts else settings, limit=limit,
-                   cache_only=cache_only, use_cache=use_cache)
+                   cache_only=cache_only, use_cache=use_cache,
+                   **({} if prompts is None else {"prompts": prompts}))
     for name, status in prep["artifacts"].items():
         log(f"  {name}: {status}")
     for name, err in prep["errors"].items():
@@ -2271,7 +2419,8 @@ def run_eval(*, prepare, generate, decode_map, models, pairs, n_dataset=40,
     for (a, b), d in zip(pairs, dirs):
         paths = assemble_pair_dir(d, prompts, (a, b), info, settings,
                                   decode, local_root, gen=gen_summary,
-                                  run_id=f"eval_{stamp}")
+                                  run_id=f"eval_{stamp}",
+                                  prompt_source=prompt_source)
         log(f"\n{a} vs {b}: wrote {len(paths)} files to {d}")
         log(f"open {d / 'index.html'}")
         result["dirs"].append(d)
@@ -2304,22 +2453,24 @@ if modal is not None:
         if REMOTE_REPO not in sys.path:
             sys.path.insert(0, REMOTE_REPO)
 
-    @app.function(image=cpu_image, cpu=4.0, memory=16 * 1024,
+    @app.function(image=cpu_image, cpu=4.0,
                   timeout=PREPARE_TIMEOUT_S, volumes={VOL: vol},
                   secrets=[hf_secret, r2_secret])
     def prepare(parquet_only: bool, n_dataset: int, n_ood: int, seed: int,
                 models: list, settings=None, limit: int = 0,
-                cache_only: bool = False, use_cache: bool = True) -> dict:
+                cache_only: bool = False, use_cache: bool = True,
+                prompts=None) -> dict:
         _remote_path()
         return prepare_impl(parquet_only, n_dataset, n_ood, seed,
                             commit=vol.commit,
                             models=[tuple(m) for m in models],
                             settings=settings, limit=limit,
-                            cache_only=cache_only, use_cache=use_cache)
+                            cache_only=cache_only, use_cache=use_cache,
+                            prompts=prompts)
 
     # gpu is overridden per call with .with_options(gpu=--gpu)
     @app.function(image=gpu_image, gpu=DEFAULT_GPU, cpu=float(GENERATE_CPU),
-                  memory=GENERATE_MEM_GIB * 1024, timeout=GENERATE_TIMEOUT_S,
+                  timeout=GENERATE_TIMEOUT_S,
                   volumes={VOL: vol})
     def generate(prompts: list, jobs: list, settings: dict,
                  use_cache: bool = True) -> dict:
@@ -2351,18 +2502,20 @@ if modal is not None:
             vol.commit()   # decoded PNGs
 
     @app.local_entrypoint()
-    def main(n_dataset: int = 40, n_ood: int = len(OOD_PROMPTS),
+    def main(n_dataset: int | None = None, n_ood: int | None = None,
              steps: int = DEFAULT_STEPS, cfg: float = DEFAULT_CFG,
              seed: int = 0, only_prompts: bool = False, limit: int = 0,
              gpu: str = DEFAULT_GPU, out: str = "", ft_key: str = R2_KEY,
              base_key: str = "", labels: str = ",".join(MODELS),
              models: str = "", pairs: str = "", cache: bool = True,
-             cache_only: bool = False):
-        if n_dataset < 0 or steps <= 0 or cfg < 0 or limit < 0:
-            raise SystemExit("--n-dataset/--limit must be >= 0, --steps > 0, "
-                             "--cfg >= 0")
+             cache_only: bool = False, prompts_file: str = ""):
+        # n_dataset / n_ood None = not given (DEFAULT_N_DATASET / all OOD
+        # prompts; refused with --prompts-file)
+        if steps <= 0 or cfg < 0 or limit < 0:
+            raise SystemExit("--limit must be >= 0, --steps > 0, --cfg >= 0")
         try:
-            ood_prompts(n_ood)   # validates --n-ood
+            n_dataset, n_ood, table, source = resolve_prompt_args(
+                prompts_file, n_dataset, n_ood, seed)
             gpu = check_gpu(gpu)
             ms, ps = resolve_models(models, pairs, base_key, ft_key, labels)
         except ValueError as e:
@@ -2375,7 +2528,7 @@ if modal is not None:
             models=ms, pairs=ps, n_dataset=n_dataset, n_ood=n_ood,
             steps=steps, cfg=cfg, seed=seed, only_prompts=only_prompts,
             limit=limit, gpu=gpu, out=out, use_cache=cache,
-            cache_only=cache_only)
+            cache_only=cache_only, prompts=table, prompt_source=source)
 
 
 # ------------------------------------------------------------------ local CLI
@@ -2388,14 +2541,20 @@ def build_arg_parser():
                "--n-ood 10 --steps 28 --cfg 4.5 --seed 0 --only-prompts "
                "--limit N --gpu H100 --out DIR --models L=KEY,... --pairs "
                "A:B,... --no-cache --cache-only | --ft-key KEY --base-key "
-               "KEY --labels base,ft]")
-    ap.add_argument("--n-dataset", type=int, default=40)
-    ap.add_argument("--n-ood", type=int, default=len(OOD_PROMPTS))
+               "KEY --labels base,ft] [--prompts-file FILE]")
+    ap.add_argument("--n-dataset", type=int, default=None,
+                    help=f"default {DEFAULT_N_DATASET}")
+    ap.add_argument("--n-ood", type=int, default=None,
+                    help=f"default {len(OOD_PROMPTS)}")
+    ap.add_argument("--prompts-file", default="",
+                    help="JSON prompt set (format 1) instead of the parquet "
+                         "+ OOD prompts")
     ap.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     ap.add_argument("--cfg", type=float, default=DEFAULT_CFG)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--only-prompts", action="store_true",
-                    help="print the prompt table (needs --parquet) and exit")
+                    help="print the prompt table (needs --parquet or "
+                         "--prompts-file) and exit")
     ap.add_argument("--parquet", default=None,
                     help="local metadata.parquet of the dataset")
     ap.add_argument("--limit", type=int, default=0)
@@ -2419,21 +2578,30 @@ def build_arg_parser():
 
 def local_main(argv=None):
     """Local (no Modal) --only-prompts: the prompt table from a local
-    parquet, the CLI validation and the estimate with nothing cached."""
+    parquet or --prompts-file, the CLI validation and the estimate with
+    nothing cached."""
     args = build_arg_parser().parse_args(argv)
     if not args.only_prompts:
         raise SystemExit("this script runs on Modal: modal run "
                          "scripts/modal_eval_full.py ... (locally only "
-                         "--only-prompts --parquet PATH)")
-    if not args.parquet:
-        raise SystemExit("--only-prompts locally needs --parquet PATH")
+                         "--only-prompts --parquet PATH | --prompts-file "
+                         "FILE)")
     try:
+        n_dataset, n_ood, table, source = resolve_prompt_args(
+            args.prompts_file, args.n_dataset, args.n_ood, args.seed)
         ms, ps = resolve_models(args.models, args.pairs, args.base_key,
                                 args.ft_key, args.labels)
     except ValueError as e:
         raise SystemExit(str(e)) from e
-    prompts = apply_limit(build_prompts(args.parquet, args.n_dataset,
-                                        args.n_ood, args.seed), args.limit)
+    if table is None and not args.parquet:
+        raise SystemExit("--only-prompts locally needs --parquet PATH or "
+                         "--prompts-file FILE")
+    if source:
+        print(f"prompts: {source['n']} from {source['path']} (sha256 "
+              f"{source['sha256']})")
+    prompts = apply_limit(build_prompts(args.parquet, n_dataset, n_ood,
+                                        args.seed)
+                          if table is None else table, args.limit)
     print(prompt_table(prompts))
     print("models: " + ", ".join(f"{label}={key}" for label, key in ms)
           + "; pairs: " + ", ".join(f"{a}:{b}" for a, b in ps))
