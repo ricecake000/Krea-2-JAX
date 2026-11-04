@@ -182,12 +182,24 @@ def ensure_turbo(vol=VOL, env=None, commit=lambda: None, log=print,
         th.join()
     if status != "skipped":
         commit()
-    marker = json.loads((dest / mef.MARKER).read_text())
+    ident = turbo_identity(vol)
+    if ident is None:
+        raise RuntimeError(f"{dest}: download marker incomplete or does not "
+                           f"list {TURBO_FILE}")
+    return dest / TURBO_FILE, ident
+
+
+def turbo_identity(vol=VOL):
+    """{repo, revision, files} of the cached Turbo download (its marker),
+    or None unless the download is complete (marker_ok) and lists
+    TURBO_FILE. Downloads nothing."""
+    dest = Path(vol) / TURBO_DIR
+    if not mef.marker_ok(dest):
+        return None
+    marker = mxf._read_json(dest / mef.MARKER) or {}
     if TURBO_FILE not in marker.get("files", {}):
-        raise RuntimeError(f"{dest}: download marker does not list "
-                           f"{TURBO_FILE}")
-    return dest / TURBO_FILE, {k: marker.get(k)
-                               for k in ("repo", "revision", "files")}
+        return None
+    return {k: marker.get(k) for k in ("repo", "revision", "files")}
 
 
 # --------------------------------------------------------------- flow
