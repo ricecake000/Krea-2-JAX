@@ -1,19 +1,27 @@
 """Modal app (CPU only): export one tree (raw params or EMA) of a full
-fine-tuning train-state checkpoint on R2 as an official bf16 safetensors,
-upload it next to the run on R2, and report how far exported weights moved
-from the base (relative weight drift).
+fine-tuning train-state checkpoint on R2 as an official safetensors (bf16,
+or f32 with --dtype), upload it next to the run on R2, and report how far
+exported weights moved from the base (relative weight drift).
 
     modal run scripts/modal_export_full.py --run run1 --step 1513 --source params
     modal run scripts/modal_export_full.py --run run1 --step 1513 \\
         --compare /vol/ft/run1/model.safetensors      # + drift of the R2 EMA
     modal run scripts/modal_export_full.py --run run1 --step 1513 --drift-only \\
         --compare /vol/ft/run1/model.safetensors      # no download / export
+    modal run scripts/modal_export_full.py --run run3 --step 9192 \\
+        --source params --dtype f32 --no-upload       # fp32, volume only
     python scripts/modal_export_full.py --help
 
 Options (local entrypoint, argparse):
   --run NAME        run directory on R2 (default run1)
   --step N          checkpoint step (required)
   --source S        params (default) or ema: the tree to export
+  --dtype D         bf16 (default) or f32: dtype of the export. An f32 export
+                    (the fp32 master values, e.g. for scripts/
+                    modal_delta_compare.py) has its own paths: the suffix _f32
+                    on the volume export, the drift JSON, the R2 key and the
+                    local --out default
+  --no-upload       keep the export on the volume only (no R2 upload)
   --compare PATH    another safetensors on the volume (/vol/...) to include in
                     the drift report, e.g. /vol/ft/run1/model.safetensors (the
                     R2 EMA export cached by scripts/modal_eval_full.py);
@@ -49,9 +57,11 @@ scripts/modal_eval_full.py, with the `krea2-r2` secret:
   2. scripts/export_full.py --ckpt-dir /vol/ckpt/<run>/<source> --step N
      --source S --base-ckpt /vol/base/raw.safetensors (cached by
      modal_eval_full's prepare; keys/shapes checked before writing) ->
-     /vol/exports/<run>_<step>_<source>.safetensors (bf16, metadata step /
-     source), then the sidecar (identity + size + the file's sha256).
-  3. upload to <prefix>/<run>/exports/model_step<step>_<source>.safetensors
+     /vol/exports/<run>_<step>_<source>[_f32].safetensors (--dtype, metadata
+     step / source [/ dtype]), then the sidecar (identity + size + the
+     file's sha256).
+  3. (unless --no-upload) upload to
+     <prefix>/<run>/exports/model_step<step>_<source>[_f32].safetensors
      with user metadata {ckpt-fingerprint, sha256}; skipped only when the
      object has this size and exactly this metadata (unless --force), any
      other object there is overwritten; size and metadata re-checked after
@@ -103,6 +113,9 @@ for _repo in (str(LOCAL_REPO), REMOTE_REPO):
 from krea2_jax.r2 import (  # noqa: E402 - needs the sys.path above
     head_or_none, list_objects, make_transfer_config, r2_client, r2_identity,
 )
+from krea2_jax.tensor_groups import (  # noqa: E402 - also used as mxf.*
+    KINDS, tensor_group, tensor_kind,
+)
 
 LOCAL_OUT_ROOT = Path("/home/mj/krea2-ops/eval")
 R2_PREFIX = "krea2-fullft"
@@ -135,21 +148,35 @@ def step_prefix(prefix, run, step):
     return f"{prefix}/{run}/ckpt/{int(step)}/"
 
 
-def export_key(prefix, run, step, source):
-    return f"{prefix}/{run}/exports/model_step{int(step)}_{source}.safetensors"
+DTYPES = ("bf16", "f32")
 
 
-def local_paths(vol, run, step, source):
-    """Volume paths of one (run, step, source): {"ckpt_root" (orbax dir for
-    export_full --ckpt-dir), "step_dir", "marker", "export", "drift"}."""
+def dtype_suffix(dtype="bf16"):
+    """'' for the default bf16 export (its paths are unchanged), '_f32'."""
+    if dtype not in DTYPES:
+        raise ValueError(f"unknown dtype {dtype!r} (one of {DTYPES})")
+    return "" if dtype == "bf16" else f"_{dtype}"
+
+
+def export_key(prefix, run, step, source, dtype="bf16"):
+    return (f"{prefix}/{run}/exports/model_step{int(step)}_{source}"
+            f"{dtype_suffix(dtype)}.safetensors")
+
+
+def local_paths(vol, run, step, source, dtype="bf16"):
+    """Volume paths of one (run, step, source, dtype): {"ckpt_root" (orbax
+    dir for export_full --ckpt-dir), "step_dir", "marker", "export",
+    "drift"}. The checkpoint download is shared by both dtypes."""
     vol = Path(vol)
     root = vol / "ckpt" / run / source
+    sfx = dtype_suffix(dtype)
     return {
         "ckpt_root": root,
         "step_dir": root / str(int(step)),
         "marker": vol / "ckpt" / run / "markers" / f"{source}_{int(step)}.json",
-        "export": vol / "exports" / f"{run}_{int(step)}_{source}.safetensors",
-        "drift": vol / "drift" / f"{run}_{int(step)}.json",
+        "export": (vol / "exports"
+                   / f"{run}_{int(step)}_{source}{sfx}.safetensors"),
+        "drift": vol / "drift" / f"{run}_{int(step)}{sfx}.json",
     }
 
 
@@ -329,12 +356,16 @@ def export_source_path(export):
     return export.with_name(export.name + ".src.json")
 
 
-def source_identity(bucket, prefix, run, step, source, sel):
+def source_identity(bucket, prefix, run, step, source, sel, dtype="bf16"):
     """What an export is made from. The bucket name is a secret value, so
-    only its sha256 is recorded."""
-    return {"bucket_sha256": hashlib.sha256(bucket.encode()).hexdigest(),
-            "prefix": prefix, "run": run, "step": int(step),
-            "source": source, "ckpt_fingerprint": ckpt_fingerprint(sel)}
+    only its sha256 is recorded. dtype is recorded for non-bf16 exports only
+    (existing bf16 sidecars stay valid)."""
+    ident = {"bucket_sha256": hashlib.sha256(bucket.encode()).hexdigest(),
+             "prefix": prefix, "run": run, "step": int(step),
+             "source": source, "ckpt_fingerprint": ckpt_fingerprint(sel)}
+    if dtype != "bf16":
+        ident["dtype"] = dtype
+    return ident
 
 
 def export_reusable(path, ident):
@@ -346,14 +377,17 @@ def export_reusable(path, ident):
     return ({k: side.get(k) for k in ident} == ident
             and side.get("size") == Path(path).stat().st_size
             and bool(side.get("sha256"))
-            and export_matches(path, ident["step"], ident["source"]))
+            and export_matches(path, ident["step"], ident["source"],
+                               ident.get("dtype", "bf16")))
 
 
-def export_matches(path, step, source):
-    """True if path is an export_full output of this step and source."""
+def export_matches(path, step, source, dtype="bf16"):
+    """True if path is an export_full output of this step, source and dtype
+    (bf16 exports carry no dtype metadata)."""
     meta = export_metadata(path)
     return (meta is not None and meta.get("step") == str(int(step))
-            and meta.get("source") == source)
+            and meta.get("source") == source
+            and meta.get("dtype", "bf16") == dtype)
 
 
 def export_script():
@@ -367,14 +401,15 @@ def export_script():
 
 
 def run_export(ckpt_root, step, source, out_path, base_path,
-               python=sys.executable, script=None, log=print):
+               python=sys.executable, script=None, log=print, dtype="bf16"):
     """scripts/export_full.py in a subprocess (its ~48 GiB host tree is
     freed when it exits); raises on a non-zero exit. script: default
     export_script()."""
     script = script or export_script()
     cmd = [python, str(script), "--ckpt-dir", str(ckpt_root),
            "--step", str(int(step)), "--source", source,
-           "--output", str(out_path), "--base-ckpt", str(base_path)]
+           "--output", str(out_path), "--base-ckpt", str(base_path),
+           "--dtype", dtype]
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     log("+ " + " ".join(cmd))
     t0 = time.time()
@@ -418,38 +453,6 @@ def upload_export(client, bucket, key, path, metadata, force=False,
 
 
 # --------------------------------------------------------------- drift
-ATTN_KINDS = {"wq": "attn_q", "wk": "attn_k", "wv": "attn_v", "wo": "attn_o",
-              "gate": "attn_gate", "qknorm": "norm"}
-KINDS = ("attn_q", "attn_k", "attn_v", "attn_o", "attn_gate", "mlp", "norm",
-         "modulation", "embed_final")
-_BLOCK_RE = re.compile(r"^blocks\.(\d+)\.")
-
-
-def tensor_kind(key):
-    """Official Krea 2 key -> one of KINDS."""
-    parts = key.split(".")
-    if "attn" in parts[:-1]:
-        kind = ATTN_KINDS.get(parts[parts.index("attn") + 1])
-        if kind:
-            return kind
-    if "mlp" in parts:
-        return "mlp"
-    if parts[-1] == "scale" or any(p.endswith("norm") for p in parts):
-        return "norm"
-    if "mod" in parts or "modulation" in parts:
-        return "modulation"
-    return "embed_final"   # first, last.linear, tmlp, tproj, txtmlp, projector
-
-
-def tensor_group(key):
-    """'blockNN' for DiT block NN, 'txtfusion' for the text fusion blocks,
-    'other' for the rest (embeddings, final layer)."""
-    m = _BLOCK_RE.match(key)
-    if m:
-        return f"block{int(m.group(1)):02d}"
-    return "txtfusion" if key.startswith("txtfusion.") else "other"
-
-
 def _sq_sums(w, b, chunk=1 << 24):
     """(sum (w - b)^2, sum b^2) in float64, chunked (bounded temporaries)."""
     import numpy as np
@@ -614,13 +617,13 @@ def vol_label(path, vol=VOL):
 def export_impl(run, step, source, compares=(), drift_only=False, force=False,
                 prefix=R2_PREFIX, env=None, vol=VOL, commit=lambda: None,
                 client=None, transfer_config=None, python=sys.executable,
-                log=print):
+                log=print, dtype="bf16", upload=True):
     """The whole remote flow (see the module docstring). client: a
-    boto3-style S3 client (default r2_client(env)). -> {"run", "step",
-    "source", "export": {...} or None, "upload": {...} or None, "drift":
-    drift_report}."""
+    boto3-style S3 client (default r2_client(env)). upload=False: the export
+    stays on the volume. -> {"run", "step", "source", "dtype", "export":
+    {...} or None, "upload": {...} or None, "drift": drift_report}."""
     env = os.environ if env is None else env
-    paths = local_paths(vol, run, step, source)
+    paths = local_paths(vol, run, step, source, dtype)
     base_path = Path(vol) / BASE_REL
     if not base_path.is_file():
         raise RuntimeError(f"{base_path} missing: run `modal run "
@@ -629,8 +632,8 @@ def export_impl(run, step, source, compares=(), drift_only=False, force=False,
     missing = [c for c in compares if not Path(c).is_file()]
     if missing:
         raise RuntimeError(f"--compare files not on the volume: {missing}")
-    out = {"run": run, "step": int(step), "source": source, "export": None,
-           "upload": None}
+    out = {"run": run, "step": int(step), "source": source, "dtype": dtype,
+           "export": None, "upload": None}
     if not drift_only:
         if client is None:
             client = r2_client(env)
@@ -641,7 +644,8 @@ def export_impl(run, step, source, compares=(), drift_only=False, force=False,
         sp = step_prefix(prefix, run, step)
         sel = select_ckpt_objects(list_objects(client, bucket, sp), sp,
                                   source)
-        ident = source_identity(bucket, prefix, run, step, source, sel)
+        ident = source_identity(bucket, prefix, run, step, source, sel,
+                                dtype)
         side_path = export_source_path(paths["export"])
         if not force and export_reusable(paths["export"], ident):
             log(f"{paths['export']}: export of this checkpoint (fingerprint "
@@ -657,10 +661,11 @@ def export_impl(run, step, source, compares=(), drift_only=False, force=False,
             commit()
             exp["seconds"] = run_export(paths["ckpt_root"], step, source,
                                         paths["export"], base_path,
-                                        python=python, log=log)
-            if not export_matches(paths["export"], step, source):
+                                        python=python, log=log, dtype=dtype)
+            if not export_matches(paths["export"], step, source, dtype):
                 raise RuntimeError(f"{paths['export']}: not an export of step "
-                                   f"{step} ({source}) after export_full")
+                                   f"{step} ({source}, {dtype}) after "
+                                   "export_full")
             _write_json(side_path, {
                 **ident, "size": paths["export"].stat().st_size,
                 "sha256": file_sha256(paths["export"])})
@@ -670,12 +675,15 @@ def export_impl(run, step, source, compares=(), drift_only=False, force=False,
         exp["size"] = paths["export"].stat().st_size
         exp["source_identity"] = side
         out["export"] = exp
-        status, up = upload_export(
-            client, bucket, export_key(prefix, run, step, source),
-            paths["export"], {"ckpt-fingerprint": side["ckpt_fingerprint"],
-                              "sha256": side["sha256"]},
-            force=force, transfer_config=transfer_config, log=log)
-        out["upload"] = {"status": status, **up}
+        if upload:
+            status, up = upload_export(
+                client, bucket, export_key(prefix, run, step, source, dtype),
+                paths["export"], {"ckpt-fingerprint": side["ckpt_fingerprint"],
+                                  "sha256": side["sha256"]},
+                force=force, transfer_config=transfer_config, log=log)
+            out["upload"] = {"status": status, **up}
+        else:
+            log(f"{paths['export']}: --no-upload, kept on the volume only")
     files = []
     if paths["export"].is_file():
         files.append((vol_label(paths["export"], vol), paths["export"]))
@@ -709,6 +717,10 @@ def build_arg_parser():
                     help="checkpoint step (<prefix>/<run>/ckpt/<step>/)")
     ap.add_argument("--source", choices=SOURCES, default="params",
                     help="tree to export (default params)")
+    ap.add_argument("--dtype", choices=DTYPES, default="bf16",
+                    help="export dtype (default bf16; f32 has _f32 paths)")
+    ap.add_argument("--no-upload", action="store_true",
+                    help="keep the export on the volume (no R2 upload)")
     ap.add_argument("--compare", action="append", default=[],
                     metavar="PATH",
                     help="another safetensors on the volume (/vol/...) for "
@@ -721,7 +733,7 @@ def build_arg_parser():
                     help="R2 prefix of the runs")
     ap.add_argument("--out", default="",
                     help="local drift JSON (default "
-                         f"{LOCAL_OUT_ROOT}/drift_<run>_<step>.json)")
+                         f"{LOCAL_OUT_ROOT}/drift_<run>_<step>[_f32].json)")
     return ap
 
 
@@ -746,8 +758,9 @@ def parse_args(argv):
 
 def write_local(result, out=""):
     """The returned drift report -> local JSON (--out or the default)."""
+    sfx = dtype_suffix(result.get("dtype", "bf16"))
     path = Path(out) if out else (
-        LOCAL_OUT_ROOT / f"drift_{result['run']}_{result['step']}.json")
+        LOCAL_OUT_ROOT / f"drift_{result['run']}_{result['step']}{sfx}.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=1))
     return path
@@ -772,12 +785,13 @@ if modal is not None:
                   timeout=EXPORT_TIMEOUT_S,
                   volumes={VOL: vol}, secrets=[r2_secret])
     def export_full_remote(run: str, step: int, source: str, compares: list,
-                           drift_only: bool, force: bool, prefix: str) -> dict:
+                           drift_only: bool, force: bool, prefix: str,
+                           dtype: str = "bf16", upload: bool = True) -> dict:
         return export_impl(
             run, step, source, compares, drift_only=drift_only, force=force,
             prefix=prefix, commit=vol.commit,
             log=lambda m: print(m, flush=True),
-            python=sys.executable)
+            python=sys.executable, dtype=dtype, upload=upload)
 
     @app.local_entrypoint()
     def main(*argv: str):
@@ -785,7 +799,8 @@ if modal is not None:
         t0 = time.time()
         res = export_full_remote.remote(
             args.run, args.step, args.source, list(args.compare),
-            args.drift_only, args.force, args.prefix)
+            args.drift_only, args.force, args.prefix, args.dtype,
+            not args.no_upload)
         print(f"remote: {(time.time() - t0) / 60:.1f} min")
         if res["export"]:
             print(f"export: {res['export']['status']} "
@@ -802,7 +817,7 @@ def local_main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     raise SystemExit(f"this script runs on Modal: modal run "
                      f"scripts/modal_export_full.py --run {args.run} "
-                     f"--step {args.step} ...")
+                     f"--step {args.step} --dtype {args.dtype} ...")
 
 
 if __name__ == "__main__":

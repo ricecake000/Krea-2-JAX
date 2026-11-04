@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import delta_compare as dc
 import modal_cache_latents as mcl
 import modal_eval_full as mef
 import modal_export_full as mxf
@@ -304,3 +305,27 @@ def test_prompts_file_table_refusals_and_r2_deleted_fallback(tmp_path, monkeypat
         else:
             with pytest.raises(RuntimeError, match="no such object"):
                 mef.r2_deleted_identity(key, log=lambda *_: None)
+
+
+def test_delta_compare_cos_and_energy_weighted_aggregates(tmp_path):
+    """Parallel deltas give cos 1, orthogonal ones 0; aggregates are energy-weighted (not a mean of cosines)."""
+    import numpy as np
+    from safetensors.numpy import save_file
+    e, q, m = np.eye(4, dtype=np.float32), "blocks.0.attn.wq.weight", "blocks.0.mod.lin.weight"
+    deltas = {"a": {q: 0.25 * e, m: 2 * e[0]}, "b": {q: 0.5 * e, m: e[1]}}   # b = 2a on q; b orthogonal to a on m
+    paths = {}
+    for name, d in (("base", {}), *deltas.items()):
+        paths[name] = tmp_path / f"{name}.safetensors"
+        save_file({k: np.ones(v.shape, np.float32) + d.get(k, 0) for k, v in deltas["a"].items()}, str(paths[name]))
+    rep = dc.delta_compare(paths["base"], [("a", paths["a"]), ("b", paths["b"])], chunk=3, log=lambda *_: None)
+    rows = {r["key"]: r for r in rep["tensors"]}
+    assert rows[q]["cos"]["a|b"] == pytest.approx(1) and rows[m]["cos"]["a|b"] == 0
+    assert rows[q]["rel"]["b"] == pytest.approx(0.5 * 2 / 4)
+    agg = rep["aggregates"]["all"]
+    p = agg["pairs"]["a|b"]   # dot 0.5, ||a||^2 4.25, ||b||^2 2; mean of the cosines would be 0.5
+    assert p["cos"] == pytest.approx(0.5 / np.sqrt(4.25 * 2)) and p["cos_median"] == pytest.approx(0.5)
+    assert p["proj_on_first"] == pytest.approx(0.5 / 4.25) and p["cos2"] == pytest.approx(0.25 / 8.5)
+    assert agg["noise_floor"] == pytest.approx(1 / np.sqrt(20)) and set(rep["aggregates"]["by_dtype"]) == {"F32"}
+    assert rep["aggregates"]["by_kind"]["attn_q"]["pairs"]["a|b"]["cos"] == pytest.approx(1)
+    notes = []   # roundoff-sized negative squared norm -> 0; a real negative one -> None + note, never an error
+    assert dc._sq_norm(-4.5e-13, 1.0, "x", notes) == 0.0 and dc._sq_norm(-1e-3, 1.0, "y", notes) is None and len(notes) == 1

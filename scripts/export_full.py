@@ -2,13 +2,14 @@
 
 Restores one tree (EMA or raw params) from `<output-dir>/ckpt/<step>/` on the
 host CPU — no accelerator or matching mesh needed — and writes it as an
-official-layout Krea 2 safetensors (per-layer keys, bf16), loadable by
-scripts/sample.py --base-ckpt, the official PyTorch code and ComfyUI.
+official-layout Krea 2 safetensors (per-layer keys, bf16 by default; --dtype
+f32 keeps the fp32 master values), loadable by scripts/sample.py --base-ckpt,
+the official PyTorch code and ComfyUI.
 
 Usage:
     python scripts/export_full.py --ckpt-dir full_out/ckpt \
         --output model.safetensors [--step N] [--source ema|params] \
-        [--base-ckpt raw.safetensors]
+        [--base-ckpt raw.safetensors] [--dtype bf16|f32]
 
 Runs on CPU by default (JAX_PLATFORMS=cpu unless already set), so it can run
 next to a live training job without touching its accelerators. Host RAM
@@ -62,6 +63,10 @@ def main():
     ap.add_argument("--base-ckpt", default=None,
                     help="optional base checkpoint: verify (before writing) "
                          "that the export has exactly its keys and shapes")
+    ap.add_argument("--dtype", choices=("bf16", "f32"), default="bf16",
+                    help="dtype of every written tensor (default bf16, as "
+                         "trained for inference; f32: the fp32 tree as "
+                         "restored, e.g. for small-delta analysis)")
     args = ap.parse_args()
 
     import jax.numpy as jnp
@@ -79,11 +84,14 @@ def main():
     print(f"restored {source} of step {meta['step']}")
     metadata = {"step": meta["step"], "source": source,
                 "format": "krea2-full-ft"}
+    if args.dtype != "bf16":   # bf16 exports keep their exact old bytes
+        metadata["dtype"] = args.dtype
     if args.base_ckpt:
         check_against_base(tree, args.base_ckpt)
         print(f"keys and shapes match {args.base_ckpt}")
         metadata["base"] = os.path.basename(args.base_ckpt)
-    save_krea2_params(args.output, tree, dtype=jnp.bfloat16, metadata=metadata)
+    dtype = {"bf16": jnp.bfloat16, "f32": jnp.float32}[args.dtype]
+    save_krea2_params(args.output, tree, dtype=dtype, metadata=metadata)
     del tree
     print(f"wrote {args.output}")
 

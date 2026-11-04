@@ -170,14 +170,15 @@ def test_orbax_round_trip(train_state, tmp_path):
     mgr.close()
 
 
-@pytest.mark.parametrize("source", ["ema", "params"])
-def test_export_full_matches_direct_save(train_state, tiny_ckpt, source, tmp_path):
+@pytest.mark.parametrize("source,dtype", [("ema", "bf16"), ("params", "bf16"), ("params", "f32")])
+def test_export_full_matches_direct_save(train_state, tiny_ckpt, source, dtype, tmp_path):
     ckpt, state, _ = train_state
     out, direct = tmp_path / "out.safetensors", tmp_path / "direct.safetensors"
-    subprocess.run(export_cmd(ckpt, out, "--source", source, "--step", "7", "--base-ckpt", str(tiny_ckpt[2])),
-                   check=True, env=ENV)
-    save_krea2_params(str(direct), state[source], metadata={
-        "step": 7, "source": source, "format": "krea2-full-ft", "base": tiny_ckpt[2].name})
+    subprocess.run(export_cmd(ckpt, out, "--source", source, "--step", "7", "--base-ckpt", str(tiny_ckpt[2]),
+                              "--dtype", dtype), check=True, env=ENV)
+    save_krea2_params(str(direct), state[source], dtype=jnp.float32 if dtype == "f32" else jnp.bfloat16, metadata={
+        "step": 7, "source": source, "format": "krea2-full-ft", "base": tiny_ckpt[2].name,
+        **({"dtype": "f32"} if dtype == "f32" else {})})
     assert out.read_bytes() == direct.read_bytes()
 
 
