@@ -534,7 +534,10 @@ def load_prompts_file(path, seed):
     (of the bytes parsed), "format", "n"}). ValueError unless format is 1,
     the list is non-empty, captions are non-empty unique strings and every
     width / height is a positive multiple of 16. Stdlib only."""
-    data = Path(path).read_bytes()
+    try:
+        data = Path(path).read_bytes()
+    except OSError as e:
+        raise ValueError(f"--prompts-file: {e}") from e
     try:
         doc = json.loads(data)
     except ValueError as e:
