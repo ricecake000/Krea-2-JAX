@@ -3,17 +3,18 @@
 # release/launch.sh via colab_job.sh, which provides the dead-man switches). Run as root, cwd /content:
 #   RUN_ID=<id> [REL_ALLOW_UPLOAD=1] [REL_MAX_MIN=195] [REL_MODELS="raw turbo"] bash /root/vm_job.sh
 # Inputs: /root/rel_in.tar (kit/ = scripts/release/*.py, ref/ = Comfy-Org header prefixes + official diffusers
-#   index/config + Drive Turbo shard header prefixes, workflows/*_api_smoke.json, cards/{raw,turbo}/README.md
-#   cards/LICENSE.pdf cards/NOTICE, plan.json, run_id, rclone.conf ([gdrive] only), rclone.sha256, hf_token)
+#   index/config + Drive Turbo shard header prefixes, workflows/*_api_smoke.json, plan.json, run_id, rclone.conf
+#   ([gdrive] only), rclone.sha256, hf_token). README.md / LICENSE.pdf / NOTICE are NOT shipped: the launcher validates
+#   and commits them from the laptop before the runtime starts (hf_release.py prepare); this job uploads model files only.
 #   + /root/rclone.xz. SECRETS (rclone.conf, hf_token) are chmod 600, never printed, deleted right after their last
 #   use and on EVERY exit (trap + the wall-cap watchdog).
 # Per model (raw, then turbo; everything of a model is deleted before the next):
 #   pull (rclone copyto from Drive; rclone verifies size + Drive md5 itself) -> check-single (vs Comfy's bf16 header)
 #   -> fp8 (release.py fp8) -> check-fp8 (header bytes == Comfy's, size) -> smoke fp8 render + bf16 render (ComfyUI
 #   pinned, comfy_smoke.py gate) -> diffusers (release.py diffusers from the single file; Turbo shard headers must
-#   equal the Drive Turbo dir's) -> stage (bf16, fp8, transformer/, README.md, LICENSE.pdf, NOTICE) == plan.json
-#   (names + sizes) -> upload (only with REL_ALLOW_UPLOAD=1; hf_release.py: upload_large_folder, then remote list +
-#   sizes == the manifest) -> delete.
+#   equal the Drive Turbo dir's) -> stage (bf16, fp8, transformer/) == plan.json's model files (names + sizes)
+#   -> upload (only with REL_ALLOW_UPLOAD=1; hf_release.py: upload_large_folder of the model files, then remote list
+#   + sizes == the plan's whole repo, cards included) -> delete.
 # /content/out_rel.tgz (logs, renders, status.json; never weights or secrets) is written on every exit path.
 # Last line: REL_DONE run_id=.. +Ns  or  REL_FAIL rc=N stage=S run_id=.. reason=..
 # Exit codes: 0 ok; 1 bad input; 2 disk; 3 setup (pip / ComfyUI / TE+VAE); 4 pull; 5 header check; 6 fp8 build;
@@ -151,14 +152,13 @@ watchdog $$ & WD_PID=$!
 { rm -rf "$IN" && mkdir -p "$IN" && chmod 700 "$IN" && (umask 077 && tar xf "$TAR_IN" -C "$IN"); } || fail 1 inputs "cannot extract $TAR_IN"
 rm -f "$TAR_IN"; chmod 600 "$RCONF" "$HFTOK" 2>/dev/null
 for f in kit/release_lib.py kit/release.py kit/comfy_smoke.py kit/hf_release.py plan.json run_id rclone.conf \
-         rclone.sha256 hf_token ref/index.json ref/config.json cards/LICENSE.pdf cards/NOTICE; do
+         rclone.sha256 hf_token ref/index.json ref/config.json; do
   [ -s "$IN/$f" ] || fail 1 inputs "missing $f in rel_in.tar"
 done
 [ "$(tr -d '[:space:]' < "$IN/run_id")" = "$RUN_ID" ] && [ -n "$RUN_ID" ] || fail 1 inputs "RUN_ID mismatch (env '$RUN_ID')"
 PLAN=$IN/plan.json; KIT=$IN/kit
 for m in $MODELS; do
   case $m in raw|turbo) ;; *) fail 1 args "REL_MODELS has '$m'" ;; esac
-  [ -s "$IN/cards/$m/README.md" ] || fail 1 inputs "missing cards/$m/README.md"
 done
 t inputs
 
@@ -276,20 +276,22 @@ for m in $MODELS; do
   must 8 "diffusers_$m" "check_diffusers_$m" 300 "$PYK" -I "$KIT/release.py" check-diffusers --dir "$ST/transformer" \
     --index "$IN/ref/index.json" --expect-total "$(pv models "$m" diffusers_total)" "${SREF[@]}"
   t "diffusers_$m"
-  cp "$IN/cards/$m/README.md" "$ST/README.md" && cp "$IN/cards/LICENSE.pdf" "$IN/cards/NOTICE" "$ST/" || fail 12 "stage_$m" "copy cards"
   python3 -I -c 'import json, os, sys
-plan, m, st, man = sys.argv[1:]
-want = json.load(open(plan))["models"][m]["files"]
+plan, m, st, man, exp = sys.argv[1:]
+full = json.load(open(plan))["models"][m]["files"]
+cards = {"README.md", "LICENSE.pdf", "NOTICE"}   # committed from the laptop (launcher), not by this job
+want = {k: v for k, v in full.items() if k not in cards}
 got = {}
 for root, dirs, files in os.walk(st):
     for fn in files:
         p = os.path.join(root, fn); got[os.path.relpath(p, st)] = os.path.getsize(p)
-cards = {"README.md", "LICENSE.pdf", "NOTICE"}
-bad = {k: (got.get(k), v) for k, v in want.items() if k not in cards and got.get(k) != v}
+bad = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
 if bad or set(got) != set(want):
     print("PLAN_MISMATCH", bad, sorted(set(got) ^ set(want))); sys.exit(1)
 json.dump({"files": got}, open(man, "w"), indent=1)
-print("STAGE_OK", m, len(got), "files", sum(got.values()), "bytes == plan")' "$PLAN" "$m" "$ST" "$MD/manifest.json" \
+json.dump({"files": full}, open(exp, "w"), indent=1)
+print("STAGE_OK", m, len(got), "model files", sum(got.values()), "bytes == plan (cards: committed by the launcher)")' \
+    "$PLAN" "$m" "$ST" "$MD/manifest.json" "$MD/expect.json" \
     || fail 12 "stage_$m" "staged files != plan.json"
   t "stage_$m"
   # start the next model's pull now (disk: plan.json's disk_need_gib covers both models' peaks at once)
@@ -297,7 +299,7 @@ print("STAGE_OK", m, len(got), "files", sum(got.values()), "bytes == plan")' "$P
   [ -n "$NEXT" ] && pull_start "$NEXT"
   if [ "$ALLOW" = 1 ]; then
     must 11 "upload_$m" "upload_$m" 5400 "$PYK" -I "$KIT/hf_release.py" upload --token-file "$HFTOK" \
-      --repo "$(pv models "$m" repo)" --folder "$ST" --manifest "$MD/manifest.json"
+      --repo "$(pv models "$m" repo)" --folder "$ST" --manifest "$MD/manifest.json" --expect "$MD/expect.json"
     UPLOADS="$UPLOADS $m"
   else
     echo "UPLOAD_SKIPPED $m (REL_ALLOW_UPLOAD!=1)"
