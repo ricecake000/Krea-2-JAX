@@ -36,10 +36,11 @@ Options (local entrypoint):
                   scripts/sample.py; mu from the resolution, negative "")
   --mu-offset X   added to every prompt's resolved mu (default 0; finite,
                   |X| <= 2); mu is in each entry's cache key
-  --turbo         Krea-2-Turbo-based checkpoints: steps 8, cfg 0, mu offset
-                  TURBO_MU_OFFSET (1.15 at Turbo's reference 4067 tokens,
-                  raised with resolution like Raw); an explicit --steps /
-                  --cfg / --mu-offset is then refused
+  --turbo         Krea-2-Turbo-based checkpoints: steps 8, cfg 0, mu fixed
+                  at TURBO_MU = 1.15 at every resolution (Turbo was trained
+                  at a fixed mu 1.15; the official inference pins --mu 1.15,
+                  no resolution rule); an explicit --steps / --cfg /
+                  --mu-offset is then refused
   --seed S        prompt-selection seed; prompt i samples with seed S + i
                   (identical for every model)
   --prompts-file F  the prompt set from a JSON file instead of the parquet +
@@ -47,10 +48,10 @@ Options (local entrypoint):
                   {"format": 1, "prompts": [{"caption", "width", "height"},
                   ...]} (other keys ignored); captions non-empty and unique,
                   sizes positive multiples of 16; prompt i samples with seed
-                  S + i, mu from its resolution. Read and validated on the
-                  laptop before any remote work; the table is passed to
-                  `prepare` (no parquet needed); its path and the sha256 of
-                  its bytes go to generate.json / index.html.
+                  S + i, mu from its resolution (--turbo: 1.15). Read and
+                  validated on the laptop before any remote work; the table
+                  is passed to `prepare` (no parquet needed); its path and
+                  the sha256 of its bytes go to generate.json / index.html.
   --only-prompts  run `prepare` for the parquet only, print the table, exit
                   (with --prompts-file: just the table, no remote call)
   --limit N       first N prompts of the table (0 = all)
@@ -104,7 +105,8 @@ Generated-image cache (Volume `krea2-eval-cache`):
   separators, ASCII). The key is {"sampler": {sampler_version, jax, dtype,
   steps, cfg, negative, cfg_batch, attn, compact_text, text_rows,
   text_encoder (repo + revision of the volume's Qwen3-VL), prompt: {caption,
-  width, height, seed, mu (resolved from the resolution, + --mu-offset)}},
+  width, height, seed, mu (resolved from the resolution, + --mu-offset;
+  --turbo: the fixed TURBO_MU)}},
   "model": the
   checkpoint identity (R2: key, ETag, size, LastModified - the
   _r2_cached_identity fields; HF base: repo, resolved revision (commit),
@@ -322,13 +324,13 @@ COMPACT_TEXT = False
 CFG_BATCH = True
 DTYPE = "bfloat16"        # DiT params / sampler latents
 # --turbo: Krea-2-Turbo + a*dFT transplants (distilled: 8 steps, no CFG).
-# Turbo's timestep-shift mu is 1.15 at its reference 4067 image tokens and
-# rises with resolution like Raw's linear rule; the recipe of the earlier
-# hi-res Turbo work: mu = 1.15 + mu_for_seq_len(tokens) - mu_for_seq_len(4067),
-# i.e. a constant offset (~0.246818) on the resolved mu.
+# Turbo was trained at a fixed timestep-shift mu 1.15: the official
+# inference (krea-ai/krea-2) pins --mu 1.15 at every resolution (its README
+# samples 2048x2048 with --mu 1.15), so Turbo prompts get mu = TURBO_MU, not
+# Raw's resolution rule (mu_for_seq_len).
 TURBO_STEPS = 8
 TURBO_CFG = 0.0
-TURBO_MU_OFFSET = 1.15 - KREA2_CONFIG.mu_for_seq_len(4067)
+TURBO_MU = 1.15
 MAX_ABS_MU_OFFSET = 2.0
 
 # --- generated-image cache (see the module docstring) ---
@@ -520,11 +522,20 @@ def resolved_mu(width, height, cfg=None):
                                     * (int(width) // align)))
 
 
-def finalize_prompts(prompts, seed, mu_offset=0.0):
+def finalize_prompts(prompts, seed, mu_offset=0.0, mu=None):
     """Number the table: index i, id = zero-padded i (>= 2 digits), seed =
     seed + i, mu = resolved_mu(width, height) + mu_offset (passed to the
-    sampler and part of the cache key; offset 0 leaves mu unchanged)."""
+    sampler and part of the cache key; offset 0 leaves mu unchanged).
+    mu (not None): every prompt's mu pinned to it, whatever the resolution
+    (the official sampler's mu= override; --turbo); mu_offset must then be
+    0."""
     mu_offset = check_mu_offset(mu_offset)
+    if mu is not None:
+        mu = float(mu)
+        if not math.isfinite(mu) or mu_offset != 0.0:
+            raise ValueError(f"a fixed mu must be finite and excludes "
+                             f"--mu-offset, got mu {mu!r} offset "
+                             f"{mu_offset!r}")
     width = max(2, len(str(max(len(prompts) - 1, 0))))
     out = []
     for i, p in enumerate(prompts):
@@ -533,7 +544,8 @@ def finalize_prompts(prompts, seed, mu_offset=0.0):
                              "a multiple of 16")
         out.append({"id": f"{i:0{width}d}", "index": i, **p,
                     "seed": int(seed) + i,
-                    "mu": resolved_mu(p["width"], p["height"]) + mu_offset})
+                    "mu": mu if mu is not None
+                    else resolved_mu(p["width"], p["height"]) + mu_offset})
     return out
 
 
@@ -551,18 +563,20 @@ def check_mu_offset(mu_offset):
 
 
 def resolve_sampler_args(steps, cfg, mu_offset, turbo):
-    """The sampler flags of the CLI -> (steps, cfg, mu_offset); None = not
-    given. turbo: TURBO_STEPS / TURBO_CFG / TURBO_MU_OFFSET, and an
-    explicit steps / cfg / mu_offset is a ValueError. Without: the defaults
-    (DEFAULT_STEPS, DEFAULT_CFG, 0.0). Validated: steps > 0, cfg finite
+    """The sampler flags of the CLI -> (steps, cfg, mu_offset, mu); None =
+    not given. turbo: TURBO_STEPS / TURBO_CFG, offset 0 and mu = TURBO_MU
+    (fixed at every resolution), and an explicit steps / cfg / mu_offset is
+    a ValueError. Without: the defaults (DEFAULT_STEPS, DEFAULT_CFG, 0.0)
+    and mu None (from the resolution). Validated: steps > 0, cfg finite
     >= 0, check_mu_offset."""
+    mu = None
     if turbo:
         given = [n for n, v in (("--steps", steps), ("--cfg", cfg),
                                 ("--mu-offset", mu_offset)) if v is not None]
         if given:
-            raise ValueError(f"--turbo sets the steps, cfg and mu offset "
+            raise ValueError(f"--turbo sets the steps, cfg and mu "
                              f"itself; drop {' and '.join(given)}")
-        steps, cfg, mu_offset = TURBO_STEPS, TURBO_CFG, TURBO_MU_OFFSET
+        steps, cfg, mu_offset, mu = TURBO_STEPS, TURBO_CFG, 0.0, TURBO_MU
     steps = DEFAULT_STEPS if steps is None else steps
     cfg = DEFAULT_CFG if cfg is None else cfg
     if not (_plain_int(steps) and steps > 0):
@@ -570,29 +584,31 @@ def resolve_sampler_args(steps, cfg, mu_offset, turbo):
     if not (math.isfinite(float(cfg)) and float(cfg) >= 0):
         raise ValueError(f"--cfg must be finite and >= 0, got {cfg!r}")
     return steps, float(cfg), check_mu_offset(
-        0.0 if mu_offset is None else mu_offset)
+        0.0 if mu_offset is None else mu_offset), mu
 
 
-def mu_line(mu_offset, turbo):
+def mu_line(mu_offset, turbo, mu=None):
     """The mu / turbo provenance text of the table and index.html."""
-    return (f"mu from resolution + offset {float(mu_offset):+.6f}"
+    return ((f"mu fixed {float(mu):g} at every resolution" if mu is not None
+             else f"mu from resolution + offset {float(mu_offset):+.6f}")
             + (" (--turbo)" if turbo else ""))
 
 
-def build_prompts(parquet, n_dataset, n_ood, seed, mu_offset=0.0):
+def build_prompts(parquet, n_dataset, n_ood, seed, mu_offset=0.0, mu=None):
     """The full prompt table (dataset prompts first, then OOD)."""
     ds = (select_dataset_prompts(read_parquet_rows(parquet), n_dataset, seed)
           if n_dataset > 0 else [])
-    return finalize_prompts(ds + ood_prompts(n_ood), seed, mu_offset)
+    return finalize_prompts(ds + ood_prompts(n_ood), seed, mu_offset, mu)
 
 
 def _plain_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def load_prompts_file(path, seed, mu_offset=0.0):
+def load_prompts_file(path, seed, mu_offset=0.0, mu=None):
     """--prompts-file -> (finalize_prompts table of its {caption, width,
-    height} entries (seed + i, mu from the resolution + mu_offset), {"path",
+    height} entries (seed + i, mu from the resolution + mu_offset, or the
+    fixed mu), {"path",
     "sha256"
     (of the bytes parsed), "format", "n"}). ValueError unless format is 1,
     the list is non-empty, captions are non-empty unique strings and every
@@ -629,13 +645,14 @@ def load_prompts_file(path, seed, mu_offset=0.0):
         entries.append({"source": "file", "row_id": None, "variant": None,
                         "artist": "", "caption": cap, "width": w,
                         "height": h})
-    return finalize_prompts(entries, seed, mu_offset), {
+    return finalize_prompts(entries, seed, mu_offset, mu), {
         "path": str(Path(path).resolve()),
         "sha256": hashlib.sha256(data).hexdigest(),
         "format": fmt, "n": len(entries)}
 
 
-def resolve_prompt_args(prompts_file, n_dataset, n_ood, seed, mu_offset=0.0):
+def resolve_prompt_args(prompts_file, n_dataset, n_ood, seed, mu_offset=0.0,
+                        mu=None):
     """The prompt source of the CLI: -> (n_dataset, n_ood, table, source).
     With prompts_file: (0, 0, load_prompts_file's table + source); an
     explicit n_dataset / n_ood (not None) is then a ValueError. Without:
@@ -646,7 +663,7 @@ def resolve_prompt_args(prompts_file, n_dataset, n_ood, seed, mu_offset=0.0):
                  if v is not None]
         if given:
             raise ValueError(f"--prompts-file replaces {' and '.join(given)}")
-        return (0, 0, *load_prompts_file(prompts_file, seed, mu_offset))
+        return (0, 0, *load_prompts_file(prompts_file, seed, mu_offset, mu))
     n_dataset = DEFAULT_N_DATASET if n_dataset is None else n_dataset
     n_ood = len(OOD_PROMPTS) if n_ood is None else n_ood
     if n_dataset < 0:
@@ -662,9 +679,10 @@ def apply_limit(prompts, limit):
     return list(prompts)[:limit]
 
 
-def prompt_table(prompts, width=100, mu_offset=None, turbo=False):
+def prompt_table(prompts, width=100, mu_offset=None, turbo=False, mu=None):
     """Plain-text prompt table (mu per prompt = the sampler's, offset
-    included); mu_offset (not None): a last line naming the offset."""
+    included); mu_offset (not None): a last line naming the offset, or the
+    fixed mu (not None)."""
     lines = [f"{'id':>3} {'source':<7} {'variant':<7} {'res':>9} {'seed':>5} "
              f"{'mu':>8}  caption"]
     for p in prompts:
@@ -675,7 +693,7 @@ def prompt_table(prompts, width=100, mu_offset=None, turbo=False):
                      f"{p['width']:>4}x{p['height']:<4} {p['seed']:>5} "
                      f"{p['mu']:>8.5f}  {cap}")
     if mu_offset is not None:
-        lines.append(mu_line(mu_offset, turbo))
+        lines.append(mu_line(mu_offset, turbo, mu))
     return "\n".join(lines)
 
 
@@ -1345,10 +1363,11 @@ def weights_lines(weights, labels=MODELS):
 def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
                  env=None, log=print, ft_key=R2_KEY, base_key=None,
                  models=None, settings=None, limit=0, cache_only=False,
-                 use_cache=True, gen_root=None, prompts=None, mu_offset=0.0):
+                 use_cache=True, gen_root=None, prompts=None, mu_offset=0.0,
+                 mu=None):
     """Fill the volume, build the prompt table and (with `settings`) the
-    cache plan. mu_offset: added to the parquet table's mu (build_prompts;
-    a `prompts` table already has it).
+    cache plan. mu_offset: added to the parquet table's mu, mu (not None):
+    its fixed mu (build_prompts; a `prompts` table already has it).
 
     prompts: a finalized prompt table (--prompts-file, built on the laptop):
     used as the table (first `limit` rows) instead of the parquet's, which
@@ -1430,7 +1449,8 @@ def prepare_impl(parquet_only, n_dataset, n_ood, seed, commit=lambda: None,
         out["prompts"] = apply_limit(prompts, limit)
     elif parquet.is_file():
         out["prompts"] = apply_limit(
-            build_prompts(parquet, n_dataset, n_ood, seed, mu_offset), limit)
+            build_prompts(parquet, n_dataset, n_ood, seed, mu_offset, mu),
+            limit)
     if not plan or out["prompts"] is None:
         return out
 
@@ -2211,7 +2231,7 @@ def check_dirs_free(dirs):
 def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
                       local_root=LOCAL_CACHE_ROOT, gen=None, run_id="",
                       title=None, prompt_source=None, mu_offset=0.0,
-                      turbo=False):
+                      turbo=False, mu=None):
     """Write the pair dir A:B (A = "base" side, B = "ft" side) from the local
     mirror in the layout of the earlier runs (<id>_base.png, <id>_ft.png,
     <id>_pair.png, prompts.json with "labels", generate.json, index.html),
@@ -2223,10 +2243,10 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
     others go to "incomplete" ({id, caption, have: [sides]}) and are named
     in the index.html header. Refuses an existing non-empty out_dir.
     prompt_source (--prompts-file: {path, sha256, ...}) is recorded in
-    generate.json ("prompts_file") and index.html; mu_offset / turbo in
-    generate.json ("mu_offset", "turbo") and the index.html settings line
-    (not in the cache key's settings: mu is per prompt). -> written
-    paths."""
+    generate.json ("prompts_file") and index.html; mu_offset / turbo (and
+    a fixed mu) in generate.json ("mu_offset", "turbo", "mu" only when
+    fixed) and the index.html settings line (not in the cache key's
+    settings: mu is per prompt). -> written paths."""
     check_dirs_free([out_dir])
     a, b = pair
     info = {m["label"]: m for m in models_info}
@@ -2272,12 +2292,14 @@ def assemble_pair_dir(out_dir, prompts, pair, models_info, settings, decode,
                "pair": [a, b], "run_id": run_id,
                "devices": sorted(devices), "generate": gen,
                "mu_offset": float(mu_offset), "turbo": bool(turbo)}
+    if mu is not None:
+        gen_doc["mu"] = float(mu)
     if prompt_source:
         gen_doc["prompts_file"] = prompt_source
     info_lines = [f"run {run_id}" if run_id else "run (cache)"] + \
         weights_lines(weights, (a, b)) + [
         f"steps {settings['steps']}, cfg {settings['cfg']}, negative "
-        f"{settings['negative']!r}, {mu_line(mu_offset, turbo)}, attn "
+        f"{settings['negative']!r}, {mu_line(mu_offset, turbo, mu)}, attn "
         f"{settings['attn']}, compact text {settings['compact_text']}, "
         f"cfg_batch {settings['cfg_batch']}, text_rows "
         f"{settings['text_rows']}",
@@ -2359,7 +2381,7 @@ def run_eval(*, prepare, generate, decode_map, models, pairs,
              seed=0, only_prompts=False, limit=0, gpu=DEFAULT_GPU, out="",
              use_cache=True, cache_only=False, local_root=LOCAL_CACHE_ROOT,
              out_root=LOCAL_OUT_ROOT, stamp=None, log=print, prompts=None,
-             prompt_source=None, mu_offset=0.0, turbo=False):
+             prompt_source=None, mu_offset=0.0, turbo=False, mu=None):
     """The local entrypoint's flow (stdlib only; the stages are callables:
     prepare(**kw) -> prepare_impl's dict, generate(prompts, jobs, settings,
     use_cache) -> generate_jobs_impl's dict, decode_map(chunks, decode) ->
@@ -2370,8 +2392,9 @@ def run_eval(*, prepare, generate, decode_map, models, pairs,
     table (load_prompts_file), passed to prepare instead of its parquet
     table (--only-prompts then prints it without any remote call), and its
     provenance for generate.json. mu_offset: added to the parquet table's
-    mu by prepare (a `prompts` table already has it); with turbo recorded
-    in the pair dirs. -> {"prompts", "todo", "gen", "dirs"}."""
+    mu by prepare, mu (not None): its fixed mu (a `prompts` table already
+    has them); with turbo recorded in the pair dirs. -> {"prompts",
+    "todo", "gen", "dirs"}."""
     stamp = stamp or utc_stamp()
     try:   # before any remote work
         dirs = pair_dirs(pairs, out, out_root, stamp)
@@ -2389,7 +2412,8 @@ def run_eval(*, prepare, generate, decode_map, models, pairs,
             f"(sha256 {prompt_source['sha256']})")
     if prompts is not None and only_prompts:
         prompts = apply_limit(prompts, limit)
-        log("\n" + prompt_table(prompts, mu_offset=mu_offset, turbo=turbo)
+        log("\n" + prompt_table(prompts, mu_offset=mu_offset,
+                                 turbo=turbo, mu=mu)
             + "\n")
         return {"prompts": prompts, "todo": None, "gen": None, "dirs": []}
     settings = sampler_settings(steps, cfg)
@@ -2399,7 +2423,7 @@ def run_eval(*, prepare, generate, decode_map, models, pairs,
                    n_ood=n_ood, seed=seed, models=[list(m) for m in models],
                    settings=None if only_prompts else settings, limit=limit,
                    cache_only=cache_only, use_cache=use_cache,
-                   mu_offset=mu_offset,
+                   mu_offset=mu_offset, mu=mu,
                    **({} if prompts is None else {"prompts": prompts}))
     for name, status in prep["artifacts"].items():
         log(f"  {name}: {status}")
@@ -2412,7 +2436,8 @@ def run_eval(*, prepare, generate, decode_map, models, pairs,
                "--cache-only (e.g. --only-prompts)" if cache_only
                else "see the prepare errors above"))
     prompts = prep["prompts"]
-    log("\n" + prompt_table(prompts, mu_offset=mu_offset, turbo=turbo)
+    log("\n" + prompt_table(prompts, mu_offset=mu_offset,
+                             turbo=turbo, mu=mu)
         + "\n")
     result = {"prompts": prompts, "todo": None, "gen": None, "dirs": []}
     if only_prompts:
@@ -2499,7 +2524,8 @@ def run_eval(*, prepare, generate, decode_map, models, pairs,
                                   decode, local_root, gen=gen_summary,
                                   run_id=f"eval_{stamp}",
                                   prompt_source=prompt_source,
-                                  mu_offset=mu_offset, turbo=turbo)
+                                  mu_offset=mu_offset, turbo=turbo,
+                                  mu=mu)
         log(f"\n{a} vs {b}: wrote {len(paths)} files to {d}")
         log(f"open {d / 'index.html'}")
         result["dirs"].append(d)
@@ -2538,14 +2564,15 @@ if modal is not None:
     def prepare(parquet_only: bool, n_dataset: int, n_ood: int, seed: int,
                 models: list, settings=None, limit: int = 0,
                 cache_only: bool = False, use_cache: bool = True,
-                prompts=None, mu_offset: float = 0.0) -> dict:
+                prompts=None, mu_offset: float = 0.0,
+                mu: float | None = None) -> dict:
         _remote_path()
         return prepare_impl(parquet_only, n_dataset, n_ood, seed,
                             commit=vol.commit,
                             models=[tuple(m) for m in models],
                             settings=settings, limit=limit,
                             cache_only=cache_only, use_cache=use_cache,
-                            prompts=prompts, mu_offset=mu_offset)
+                            prompts=prompts, mu_offset=mu_offset, mu=mu)
 
     # gpu is overridden per call with .with_options(gpu=--gpu)
     @app.function(image=gpu_image, gpu=DEFAULT_GPU, cpu=float(GENERATE_CPU),
@@ -2595,10 +2622,10 @@ if modal is not None:
         if limit < 0:
             raise SystemExit("--limit must be >= 0")
         try:
-            steps, cfg, mu_offset = resolve_sampler_args(steps, cfg,
-                                                         mu_offset, turbo)
+            steps, cfg, mu_offset, mu = resolve_sampler_args(
+                steps, cfg, mu_offset, turbo)
             n_dataset, n_ood, table, source = resolve_prompt_args(
-                prompts_file, n_dataset, n_ood, seed, mu_offset)
+                prompts_file, n_dataset, n_ood, seed, mu_offset, mu)
             gpu = check_gpu(gpu)
             ms, ps = resolve_models(models, pairs, base_key, ft_key, labels)
         except ValueError as e:
@@ -2612,7 +2639,7 @@ if modal is not None:
             steps=steps, cfg=cfg, seed=seed, only_prompts=only_prompts,
             limit=limit, gpu=gpu, out=out, use_cache=cache,
             cache_only=cache_only, prompts=table, prompt_source=source,
-            mu_offset=mu_offset, turbo=turbo)
+            mu_offset=mu_offset, turbo=turbo, mu=mu)
 
 
 # ------------------------------------------------------------------ local CLI
@@ -2639,10 +2666,12 @@ def build_arg_parser():
     ap.add_argument("--cfg", type=float, default=None,
                     help=f"default {DEFAULT_CFG}")
     ap.add_argument("--mu-offset", type=float, default=None,
-                    help="added to every prompt's resolved mu (default 0)")
+                    help="added to every prompt's resolved mu (default 0; "
+                         "not with --turbo)")
     ap.add_argument("--turbo", action="store_true",
                     help=f"Turbo checkpoints: steps {TURBO_STEPS}, cfg "
-                         f"{TURBO_CFG:g}, mu offset {TURBO_MU_OFFSET:.6f}")
+                         f"{TURBO_CFG:g}, mu fixed at {TURBO_MU:g} at every "
+                         "resolution (official Turbo spec)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--only-prompts", action="store_true",
                     help="print the prompt table (needs --parquet or "
@@ -2679,11 +2708,11 @@ def local_main(argv=None):
                          "--only-prompts --parquet PATH | --prompts-file "
                          "FILE)")
     try:
-        steps, cfg, mu_offset = resolve_sampler_args(
+        steps, cfg, mu_offset, mu = resolve_sampler_args(
             args.steps, args.cfg, args.mu_offset, args.turbo)
         n_dataset, n_ood, table, source = resolve_prompt_args(
             args.prompts_file, args.n_dataset, args.n_ood, args.seed,
-            mu_offset)
+            mu_offset, mu)
         ms, ps = resolve_models(args.models, args.pairs, args.base_key,
                                 args.ft_key, args.labels)
     except ValueError as e:
@@ -2695,9 +2724,9 @@ def local_main(argv=None):
         print(f"prompts: {source['n']} from {source['path']} (sha256 "
               f"{source['sha256']})")
     prompts = apply_limit(build_prompts(args.parquet, n_dataset, n_ood,
-                                        args.seed, mu_offset)
+                                        args.seed, mu_offset, mu)
                           if table is None else table, args.limit)
-    print(prompt_table(prompts, mu_offset=mu_offset, turbo=args.turbo))
+    print(prompt_table(prompts, mu_offset=mu_offset, turbo=args.turbo, mu=mu))
     print(f"sampler: steps {steps}, cfg {cfg:g}")
     print("models: " + ", ".join(f"{label}={key}" for label, key in ms)
           + "; pairs: " + ", ".join(f"{a}:{b}" for a, b in ps))

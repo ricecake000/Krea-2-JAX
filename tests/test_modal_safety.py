@@ -307,15 +307,18 @@ def test_prompts_file_table_refusals_and_r2_deleted_fallback(tmp_path, monkeypat
                 mef.r2_deleted_identity(key, log=lambda *_: None)
 
 
-def test_mu_offset_in_table_and_keys_and_turbo_refusals(tmp_path):
+def test_turbo_fixed_mu_raw_rule_keys_and_turbo_refusals(tmp_path):
     f = tmp_path / "p.json"
-    f.write_text(json.dumps({"format": 1, "prompts": [{"caption": "a", "width": 1344, "height": 768}]}))
-    steps, cfg, off = mef.resolve_sampler_args(None, None, None, True)
-    assert (steps, cfg, round(off, 6)) == (8, 0.0, 0.246818)
-    table = mef.resolve_prompt_args(str(f), None, None, 0, off)[2]
-    assert table[0]["mu"] == mef.resolved_mu(1344, 768) + off and str(off)[:8] in mef.prompt_table(table, mu_offset=off)
+    sizes = ((1024, 1024), (2048, 2048), (768, 1344))   # official Turbo: mu 1.15 at every resolution
+    f.write_text(json.dumps({"format": 1, "prompts": [{"caption": str(w * h + w), "width": w, "height": h} for w, h in sizes]}))
+    steps, cfg, off, mu = mef.resolve_sampler_args(None, None, None, True)
+    assert (steps, cfg, off, mu) == (8, 0.0, 0.0, 1.15)
+    table = mef.resolve_prompt_args(str(f), None, None, 0, off, mu)[2]
+    assert [p["mu"] for p in table] == [1.15] * 3 and "mu fixed 1.15" in mef.prompt_table(table, mu_offset=off, mu=mu)
+    raw = mef.resolve_prompt_args(str(f), None, None, 0, *mef.resolve_sampler_args(None, None, None, False)[2:])[2]
+    assert raw[0]["mu"] == mef.resolved_mu(1024, 1024) == 0.90625 and raw[1]["mu"] > 1.15   # Raw: official rule
     # offset 0 / no --turbo: the cache key of an existing entry, pinned from before --mu-offset existed
-    steps, cfg, off = mef.resolve_sampler_args(None, None, None, False)
+    steps, cfg, off, mu = mef.resolve_sampler_args(None, None, None, False)
     p = mef.finalize_prompts([{"source": "ood", "row_id": None, "variant": None, "artist": "",
                                "caption": "a", "width": 1024, "height": 1024}], 0, off)[0]
     assert mef.entry_hash(mef.entry_key(mef.sampler_settings(steps, cfg), p, {"key": "x"})) == \
