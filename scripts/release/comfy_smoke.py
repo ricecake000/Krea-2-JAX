@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ComfyUI smoke render (VM): headless main.py + POST /prompt of API-format workflows, must-fail gate per render.
 
-  comfy_smoke.py --comfy DIR --workflow API_SMOKE_JSON --render NAME:UNET_FILE[:load] ... --out DIR
+  comfy_smoke.py --comfy DIR --workflow API_SMOKE_JSON (--render NAME:UNET_FILE[:load] ... | --renders-json F) --out DIR
         [--prompt TEXT] [--seed N] [--width W --height H] [--port 8188] [--min-std 6.0] [--timeout-s 900]
         [--startup-s 300] [--stop-s 60] [--pidfile F] [--extra-args "..."]
   Worst-case wall time = startup-s + timeout-s per --render + stop-s (+ seconds): a caller's outer timeout must exceed it.
@@ -181,7 +181,9 @@ def terminal_error(st):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--comfy", required=True); ap.add_argument("--workflow", required=True)
-    ap.add_argument("--render", action="append", required=True); ap.add_argument("--out", required=True)
+    ap.add_argument("--render", action="append", default=[]); ap.add_argument("--out", required=True)
+    ap.add_argument("--renders-json", help="JSON list of {name, unet, prompt, seed, width, height[, load]}: per-render "
+                                          "overrides, rendered after the --render specs on the same server")
     ap.add_argument("--prompt"); ap.add_argument("--seed", type=int, default=20261107)
     ap.add_argument("--width", type=int, default=0); ap.add_argument("--height", type=int, default=0)
     ap.add_argument("--port", type=int, default=8188); ap.add_argument("--min-std", type=float, default=6.0)
@@ -191,7 +193,19 @@ def main():
     ap.add_argument("--extra-args", default="")
     ap.add_argument("--pidfile")
     a = ap.parse_args()
-    if bool(a.width) != bool(a.height) or a.width % 16 or a.height % 16:
+    renders = []
+    for spec in a.render:
+        parts = spec.split(":")
+        renders.append(dict(name=parts[0], unet=parts[1], load=len(parts) > 2 and parts[2] == "load", prompt=a.prompt,
+                            seed=a.seed, width=a.width, height=a.height))
+    if a.renders_json:
+        for r in json.load(open(a.renders_json)):
+            renders.append(dict(name=r["name"], unet=r["unet"], load=bool(r.get("load")), prompt=r.get("prompt", a.prompt),
+                                seed=int(r.get("seed", a.seed)), width=int(r.get("width", a.width)),
+                                height=int(r.get("height", a.height))))
+    if not renders:
+        raise SystemExit("SMOKE_FAIL kind=fatal no --render / --renders-json")
+    if any(bool(r["width"]) != bool(r["height"]) or r["width"] % 16 or r["height"] % 16 for r in renders):
         raise SystemExit("SMOKE_FAIL kind=fatal --width/--height: both, multiples of 16")
     for sg in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sg, on_signal)
@@ -226,11 +240,10 @@ def main():
                     say(f"SMOKE_FAIL kind=fatal server did not come up (rc={srv.poll()}); see {logp}"); return 1
                 time.sleep(2)
         say(f"SMOKE_SERVER_UP {time.time() - t0:.0f}s port={a.port}")
-        for spec in a.render:
-            parts = spec.split(":")
-            name, unet, load_only = parts[0], parts[1], len(parts) > 2 and parts[2] == "load"
+        for r in renders:
+            name, unet, load_only = r["name"], r["unet"], r["load"]
             logf.flush(); log_off = os.path.getsize(logp)
-            wf = patch(wf0, unet, a.prompt, a.seed, f"smoke_{name}", load_only, a.width, a.height)
+            wf = patch(wf0, unet, r["prompt"], r["seed"], f"smoke_{name}", load_only, r["width"], r["height"])
             t1 = time.time()
             try:
                 pid = http(a.port, "/prompt", {"prompt": wf, "client_id": "krea2-release-smoke"})["prompt_id"]
