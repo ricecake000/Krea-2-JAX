@@ -2,8 +2,9 @@
 """ComfyUI smoke render (VM): headless main.py + POST /prompt of API-format workflows, must-fail gate per render.
 
   comfy_smoke.py --comfy DIR --workflow API_SMOKE_JSON --render NAME:UNET_FILE[:load] ... --out DIR
-        [--prompt TEXT] [--seed N] [--width W --height H] [--port 8188] [--min-std 6.0] [--timeout-s 1500]
-        [--pidfile F] [--extra-args "..."]
+        [--prompt TEXT] [--seed N] [--width W --height H] [--port 8188] [--min-std 6.0] [--timeout-s 900]
+        [--startup-s 300] [--stop-s 60] [--pidfile F] [--extra-args "..."]
+  Worst-case wall time = startup-s + timeout-s per --render + stop-s (+ seconds): a caller's outer timeout must exceed it.
   Each --render patches the workflow (located by class_type: the one UNETLoader, KSampler, SaveImage, EmptyLatentImage;
   prompt text into the CLIPTextEncode wired to KSampler.positive; W/H into the nodes feeding EmptyLatentImage, which
   also feed ModelSamplingFlux) and queues it. UNET_FILE must already be in DIR/models/diffusion_models.
@@ -110,11 +111,11 @@ def group_members(pgid):
     return out
 
 
-def stop_server(srv):
-    """TERM, then KILL the server's whole process group; wait (bounded) until no member remains, reap the leader."""
+def stop_server(srv, budget_s=60):
+    """TERM, then KILL the server's whole process group; wait (bounded: budget_s in total) until no member remains."""
     if srv is None:
         return
-    for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, 30)):
+    for sig, wait in ((signal.SIGTERM, budget_s / 2), (signal.SIGKILL, budget_s / 2)):
         try:
             os.killpg(srv.pid, sig)
         except OSError:
@@ -174,7 +175,10 @@ def main():
     ap.add_argument("--prompt"); ap.add_argument("--seed", type=int, default=20261107)
     ap.add_argument("--width", type=int, default=0); ap.add_argument("--height", type=int, default=0)
     ap.add_argument("--port", type=int, default=8188); ap.add_argument("--min-std", type=float, default=6.0)
-    ap.add_argument("--timeout-s", type=int, default=1500); ap.add_argument("--extra-args", default="")
+    ap.add_argument("--timeout-s", type=int, default=900, help="render budget per --render")
+    ap.add_argument("--startup-s", type=int, default=300, help="server startup budget")
+    ap.add_argument("--stop-s", type=int, default=60, help="server stop budget (TERM half, KILL half)")
+    ap.add_argument("--extra-args", default="")
     ap.add_argument("--pidfile")
     a = ap.parse_args()
     if bool(a.width) != bool(a.height) or a.width % 16 or a.height % 16:
@@ -195,7 +199,9 @@ def main():
         srv = subprocess.Popen(cmd, cwd=a.comfy, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
         if a.pidfile:
             with open(a.pidfile, "w") as f:
-                f.write(f"{srv.pid}\n")
+                with open(f"/proc/{srv.pid}/stat") as st:   # "<pgid> <starttime>": a recycled pid never matches
+                    start = st.read().rsplit(")", 1)[1].split()[19]
+                f.write(f"{srv.pid} {start}\n")
         t0 = time.time()
         while True:
             try:
@@ -206,7 +212,7 @@ def main():
                     say(f"SMOKE_FAIL kind=fatal port {a.port} answers but its listener is not our server"); return 1
                 raise OSError("server exited")
             except OSError:
-                if srv.poll() is not None or time.time() - t0 > 300:
+                if srv.poll() is not None or time.time() - t0 > a.startup_s:
                     say(f"SMOKE_FAIL kind=fatal server did not come up (rc={srv.poll()}); see {logp}"); return 1
                 time.sleep(2)
         say(f"SMOKE_SERVER_UP {time.time() - t0:.0f}s port={a.port}")
@@ -270,7 +276,7 @@ def main():
         fatal += 1
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGINT, signal.SIG_IGN)
-        stop_server(srv)
+        stop_server(srv, a.stop_s)
         logf.close()
         if a.pidfile:
             try:

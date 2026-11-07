@@ -1,7 +1,7 @@
 #!/bin/bash
 # Colab GPU job of the Krea 2 Anime-tuned release (one session, both models, sequential; launcher: krea2-ops
 # release/launch.sh via colab_job.sh, which provides the dead-man switches). Run as root, cwd /content:
-#   RUN_ID=<id> [REL_ALLOW_UPLOAD=1] [REL_MAX_MIN=150] [REL_MODELS="raw turbo"] bash /root/vm_job.sh
+#   RUN_ID=<id> [REL_ALLOW_UPLOAD=1] [REL_MAX_MIN=195] [REL_MODELS="raw turbo"] bash /root/vm_job.sh
 # Inputs: /root/rel_in.tar (kit/ = scripts/release/*.py, ref/ = Comfy-Org header prefixes + official diffusers
 #   index/config + Drive Turbo shard header prefixes, workflows/*_api_smoke.json, cards/{raw,turbo}/README.md
 #   cards/LICENSE.pdf cards/NOTICE, plan.json, run_id, rclone.conf ([gdrive] only), rclone.sha256, hf_token)
@@ -30,7 +30,12 @@ COMFY=$C/ComfyUI; COMFY_TAG=v0.44.0; COMFY_SHA=2c75dc1b379a59e0880619d029607af51
 COMFY_REPO=https://github.com/comfyanonymous/ComfyUI.git
 REF_REPO=Comfy-Org/Krea-2; REF_REV=588feaf955b08b9ac4723eeb751752ab045dba71
 PIP_PINS=("huggingface_hub==1.33.0" "hf_xet==1.7.0")
-MAX_MIN=${REL_MAX_MIN:-150}; ALLOW=${REL_ALLOW_UPLOAD:-0}; MODELS=${REL_MODELS:-raw turbo}
+# smoke budgets (comfy_smoke.py): server startup + render + stop; the outer step timeout is strictly larger
+# (+ SMOKE_MARGIN_S), so a slow render ends as comfy_smoke's own rc 3 (resource -> bf16 fallback), never as rc 124
+SMOKE_START_S=300; SMOKE_RENDER_S=900; SMOKE_LOAD_S=600; SMOKE_STOP_S=60; SMOKE_MARGIN_S=120
+SMOKE_OUTER_S=$((SMOKE_START_S + SMOKE_RENDER_S + SMOKE_STOP_S + SMOKE_MARGIN_S))        # 1380
+SMOKE_LOAD_OUTER_S=$((SMOKE_START_S + SMOKE_LOAD_S + SMOKE_STOP_S + SMOKE_MARGIN_S))     # 1080
+MAX_MIN=${REL_MAX_MIN:-195}; ALLOW=${REL_ALLOW_UPLOAD:-0}; MODELS=${REL_MODELS:-raw turbo}
 PULL_FLAGS=(--multi-thread-streams 16 --multi-thread-cutoff 256M --retries 3 --low-level-retries 10 --stats 60s
             --stats-one-line -v)
 T0=$(date +%s); WALL_END=$((T0 + MAX_MIN * 60)); RUN_ID=${RUN_ID:-}
@@ -102,11 +107,15 @@ must() { # RC STAGE STEP TIMEOUT CMD...
 # are signalled -- TERM, then KILL -- and waited for until no member remains (bounded). comfy_smoke.py itself refuses a
 # port that is not free before it starts (fail closed), so a leftover never gets talked to.
 reap_comfy() {
-  local f pg i
+  local f pg st cur i
   for f in "$WD"/comfy_*.pid; do
     [ -e "$f" ] || continue
-    pg=$(tr -dc '0-9' < "$f"); rm -f "$f"
-    [ -n "$pg" ] && pgrep -g "$pg" > /dev/null || continue
+    read -r pg st < "$f"; rm -f "$f"
+    [[ $pg =~ ^[0-9]+$ ]] && [[ $st =~ ^[0-9]+$ ]] || continue
+    # the group leader must still be OUR server: same start time (field 22 of /proc/<pid>/stat); a gone leader =
+    # signal nothing (comfy_smoke's own stop covers the members), a recycled pid never matches
+    cur=$(sed 's/.*) //' "/proc/$pg/stat" 2>/dev/null | awk '{ print $20 }')
+    [ "$cur" = "$st" ] || continue
     kill -TERM -- "-$pg" 2>/dev/null
     for ((i = 0; i < 30; i++)); do pgrep -g "$pg" > /dev/null || break; sleep 1; done
     if pgrep -g "$pg" > /dev/null; then
@@ -234,23 +243,24 @@ for m in $MODELS; do
   WF=$IN/workflows/krea2_anime_tuned_${m}_api_smoke.json; PROMPT=$(pv smoke_prompt)
   [ "$DRY" = 1 ] && echo "DRY: smoke renders skipped"
   SMOKE=("$PYK" -I "$KIT/comfy_smoke.py" --comfy "$COMFY" --workflow "$WF" --out "$OUT/renders" --prompt "$PROMPT"
-         --seed "$(pv smoke_seed)" --width "$(pv smoke_width)" --height "$(pv smoke_height)" --timeout-s 1500)
+         --seed "$(pv smoke_seed)" --width "$(pv smoke_width)" --height "$(pv smoke_height)"
+         --startup-s "$SMOKE_START_S" --stop-s "$SMOKE_STOP_S")
   if [ "$DRY" != 1 ]; then
     # fp8 = the file users run: a hard gate (comfy_smoke rc 1 fatal / 3 resource: both abort). bf16 (> the L4's 24 GB,
     # relies on ComfyUI's offload): a full render; ONLY a resource failure (rc 3 = OOM / allocation error / server
     # SIGKILLed / --timeout-s exceeded) falls back to a load check (1 step, PLAN A.3) whose key + image gates still
     # apply. Key mismatches, image-gate failures and anything else are fatal.
     reap_comfy
-    must 7 "smoke_$m" "smoke_${m}_fp8" 1800 "${SMOKE[@]}" --port $((8188 + 3 * i)) --pidfile "$WD/comfy_fp8.pid" \
+    must 7 "smoke_$m" "smoke_${m}_fp8" "$SMOKE_OUTER_S" "${SMOKE[@]}" --timeout-s "$SMOKE_RENDER_S" --port $((8188 + 3 * i)) --pidfile "$WD/comfy_fp8.pid" \
       --render "${m}_fp8:$(basename "$FP8")"
     reap_comfy
-    step "smoke_${m}_bf16" 1800 "${SMOKE[@]}" --port $((8189 + 3 * i)) --pidfile "$WD/comfy_bf16.pid" \
+    step "smoke_${m}_bf16" "$SMOKE_OUTER_S" "${SMOKE[@]}" --timeout-s "$SMOKE_RENDER_S" --port $((8189 + 3 * i)) --pidfile "$WD/comfy_bf16.pid" \
       --render "${m}_bf16:$(basename "$SINGLE")"; rc=$?
     reap_comfy
     case $rc in
       0) ;;
       3) echo "BF16_RENDER_FALLBACK $m: resource failure of the full bf16 render (see smoke_${m}_bf16.log); load check next"
-         must 7 "smoke_$m" "smoke_${m}_bf16_load" 900 "${SMOKE[@]}" --port $((8190 + 3 * i)) --pidfile "$WD/comfy_load.pid" \
+         must 7 "smoke_$m" "smoke_${m}_bf16_load" "$SMOKE_LOAD_OUTER_S" "${SMOKE[@]}" --timeout-s "$SMOKE_LOAD_S" --port $((8190 + 3 * i)) --pidfile "$WD/comfy_load.pid" \
            --render "${m}_bf16load:$(basename "$SINGLE"):load"
          reap_comfy ;;
       124|137) fail 9 "smoke_$m" "STEP_TIMEOUT smoke_${m}_bf16" ;;
