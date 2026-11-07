@@ -11,8 +11,11 @@
 Gate (each render), checked in this order:
   1. keys: the ComfyUI log written during the render has no "unet missing" / "unet unexpected" / "left over keys in
      diffusion model" / "Could not detect model type" / "ERROR UNSUPPORTED" line -> FATAL (also for ':load').
-  2. status: history status success. A failure whose messages or log carry an out-of-memory / allocation error, a
-     server killed by SIGKILL (host OOM killer), or the render exceeding --timeout-s -> RESOURCE; any other -> FATAL.
+  2. status: history status success. RESOURCE only for: the terminal execution_error's exception_type/message naming
+     an out-of-memory / allocation error, our server killed by SIGKILL (host OOM killer), or the render exceeding
+     --timeout-s; any other failure -> FATAL.
+  Fail closed: the port must be bindable before our server starts, and readiness counts only when /system_stats
+  answers AND the LISTEN socket on the port belongs to our server's process group (/proc/net/tcp inode -> fd).
   3. image: exactly one PNG; it decodes; spatial variation: max over R,G,B of the per-channel spatial std
      >= --min-std (0..255; ':load' uses 1.0) AND at most 95 % of the pixels near-black (all channels <= 10).
      This rejects every constant-colour image (all per-channel stds 0) and black / mostly black outputs (where NaN
@@ -21,7 +24,7 @@ Output: SMOKE_OK name=.. per render, or SMOKE_FAIL kind=fatal|resource name=.. <
 Exit 0 all ok; 3 only RESOURCE failures; 1 any FATAL. The server (its own process group) is stopped and reaped at
 the end, on failure and on SIGTERM / SIGINT; its pid is written to --pidfile while it runs.
 """
-import argparse, copy, json, os, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request
+import argparse, copy, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.request
 
 KEY_LOG = ("unet missing", "unet unexpected", "left over keys in diffusion model", "Could not detect model type",
            "ERROR UNSUPPORTED")
@@ -92,19 +95,76 @@ def image_gate(path, min_std):
     return bool(stds.max() >= min_std and dark <= 0.95), detail
 
 
+def group_members(pgid):
+    """pids whose process group is pgid (Linux /proc)."""
+    out = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    st = f.read()
+                if int(st[st.rindex(")") + 2:].split()[2]) == pgid:
+                    out.append(int(d))
+            except (OSError, ValueError, IndexError):
+                pass
+    return out
+
+
 def stop_server(srv):
-    if srv is None or srv.poll() is not None:
+    """TERM, then KILL the server's whole process group; wait (bounded) until no member remains, reap the leader."""
+    if srv is None:
         return
     for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, 30)):
         try:
             os.killpg(srv.pid, sig)
         except OSError:
             pass
-        try:
-            srv.wait(wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+        t = time.time()
+        while time.time() - t < wait:
+            if srv.poll() is not None and not group_members(srv.pid):
+                return
+            time.sleep(0.5)
+    srv.poll()
+
+
+def port_free(port):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port)); return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def listener_pgid(port):
+    """Process group of the process holding the LISTEN socket on 127.0.0.1:port (via /proc/net/tcp inode), or None."""
+    inode = None
+    with open("/proc/net/tcp") as f:
+        for ln in f.readlines()[1:]:
+            c = ln.split()
+            if c[1] == f"0100007F:{port:04X}" and c[3] == "0A":
+                inode = c[9]
+    if not inode:
+        return None
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                for fd in os.listdir(f"/proc/{d}/fd"):
+                    if os.readlink(f"/proc/{d}/fd/{fd}") == f"socket:[{inode}]":
+                        return os.getpgid(int(d))
+            except OSError:
+                pass
+    return None
+
+
+def terminal_error(st):
+    """(exception_type, exception_message) of the LAST execution_error in a history status, or None."""
+    err = None
+    for m in st.get("messages", []) or []:
+        if isinstance(m, list) and len(m) == 2 and m[0] == "execution_error" and isinstance(m[1], dict):
+            err = (str(m[1].get("exception_type", "")), str(m[1].get("exception_message", "")))
+    return err
 
 
 def main():
@@ -130,6 +190,8 @@ def main():
     srv, fatal, resource = None, 0, 0
     say = lambda s: print(s, flush=True)
     try:
+        if not port_free(a.port):   # fail closed: never talk to a server that is not ours
+            say(f"SMOKE_FAIL kind=fatal port {a.port} is busy before our server started"); return 1
         srv = subprocess.Popen(cmd, cwd=a.comfy, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
         if a.pidfile:
             with open(a.pidfile, "w") as f:
@@ -137,7 +199,12 @@ def main():
         t0 = time.time()
         while True:
             try:
-                http(a.port, "/system_stats", timeout=5); break
+                if srv.poll() is None:
+                    http(a.port, "/system_stats", timeout=5)
+                    if srv.poll() is None and listener_pgid(a.port) == srv.pid:
+                        break
+                    say(f"SMOKE_FAIL kind=fatal port {a.port} answers but its listener is not our server"); return 1
+                raise OSError("server exited")
             except OSError:
                 if srv.poll() is not None or time.time() - t0 > 300:
                     say(f"SMOKE_FAIL kind=fatal server did not come up (rc={srv.poll()}); see {logp}"); return 1
@@ -174,12 +241,13 @@ def main():
             st = (h or {}).get("status", {})
             if st.get("status_str") != "success":
                 msgs = json.dumps(st.get("messages", []))
+                err = terminal_error(st)   # OOM only from the terminal execution_error, never from inputs / old logs
                 why = f"status={st.get('status_str')} server_rc={srv.poll()} after {secs:.0f}s"
                 if timed_out:
                     say(f"SMOKE_FAIL kind=resource name={name} render exceeded --timeout-s {a.timeout_s} ({why})"); resource += 1
-                elif RESOURCE_RE.search(msgs) or RESOURCE_RE.search(new) or srv.poll() == -signal.SIGKILL:
-                    m = RESOURCE_RE.search(msgs) or RESOURCE_RE.search(new)
-                    say(f"SMOKE_FAIL kind=resource name={name} {why}: {m.group(0) if m else 'server SIGKILLed'}"); resource += 1
+                elif srv.poll() == -signal.SIGKILL or (err and RESOURCE_RE.search(" ".join(err))):
+                    say(f"SMOKE_FAIL kind=resource name={name} {why}: "
+                        f"{'server SIGKILLed (OOM killer)' if srv.poll() == -signal.SIGKILL else err}"); resource += 1
                 else:
                     say(f"SMOKE_FAIL kind=fatal name={name} {why}; messages={msgs[-1500:]}"); fatal += 1
                 if srv.poll() is not None:

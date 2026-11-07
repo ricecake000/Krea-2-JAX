@@ -97,29 +97,25 @@ must() { # RC STAGE STEP TIMEOUT CMD...
     *) echo "=== $name.log tail ==="; tail -n 20 "$LOGS/$name.log" | cut -c1-300; fail "$code" "$stage" "$name rc=$rc" ;;
   esac
 }
-# reap_comfy: no ComfyUI server may outlive its render (a SIGKILLed comfy_smoke.py leaves its detached server):
-# TERM then KILL every server's process group (pidfile + any ComfyUI main.py), then wait until the ports are free
+# reap_comfy: no ComfyUI server of THIS job may outlive its render (a SIGKILLed comfy_smoke.py leaves its detached
+# server behind): only the process groups recorded in this job's pidfiles ($WD/comfy_*.pid, written by comfy_smoke.py)
+# are signalled -- TERM, then KILL -- and waited for until no member remains (bounded). comfy_smoke.py itself refuses a
+# port that is not free before it starts (fail closed), so a leftover never gets talked to.
 reap_comfy() {
-  local p pids i
-  pids=$(cat "$WD"/comfy_*.pid 2>/dev/null; pgrep -f "main.py --listen 127.0.0.1 --port" 2>/dev/null)
-  [ -n "$pids" ] || return 0
-  for p in $pids; do kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; done
-  for ((i = 0; i < 30; i++)); do pgrep -f "main.py --listen 127.0.0.1 --port" > /dev/null || break; sleep 1; done
-  for p in $pids $(pgrep -f "main.py --listen 127.0.0.1 --port" 2>/dev/null); do kill -KILL -- "-$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; done
-  rm -f "$WD"/comfy_*.pid
-  for ((i = 0; i < 30; i++)); do
-    python3 -I -c 'import socket, sys
-for port in range(8188, 8220):
-    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", port))
-    except OSError:
-        sys.exit(1)
-    finally:
-        s.close()' && { echo "COMFY_REAPED (ports free)"; return 0; }
-    sleep 1
+  local f pg i
+  for f in "$WD"/comfy_*.pid; do
+    [ -e "$f" ] || continue
+    pg=$(tr -dc '0-9' < "$f"); rm -f "$f"
+    [ -n "$pg" ] && pgrep -g "$pg" > /dev/null || continue
+    kill -TERM -- "-$pg" 2>/dev/null
+    for ((i = 0; i < 30; i++)); do pgrep -g "$pg" > /dev/null || break; sleep 1; done
+    if pgrep -g "$pg" > /dev/null; then
+      kill -KILL -- "-$pg" 2>/dev/null
+      for ((i = 0; i < 30; i++)); do pgrep -g "$pg" > /dev/null || break; sleep 1; done
+    fi
+    pgrep -g "$pg" > /dev/null && echo "COMFY_REAP_WARN process group $pg still has members" || echo "COMFY_REAPED group $pg"
   done
-  echo "COMFY_REAP_WARN a port in 8188-8219 is still busy"
+  return 0
 }
 free_gb() { df -P -B1G "$C" | awk 'NR == 2 { print $4 }'; }
 watchdog() {
