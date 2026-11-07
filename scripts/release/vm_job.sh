@@ -60,6 +60,7 @@ finish() {
   [ "${1:-}" = sig ] && [ "$RC" = 0 ] && { RC=${2:-143}; FAIL_STAGE=signal; FAIL_REASON="terminated in $STAGE_NOW"; }
   alive "$CUR_PID" && kill -TERM "$CUR_PID" 2>/dev/null
   alive "$PULL_PID" && kill -TERM "$PULL_PID" 2>/dev/null
+  reap_comfy
   scrub; pack
   : > "$WD/.finished"; alive "$WD_PID" && kill -TERM "$WD_PID" 2>/dev/null
   if [ "$RC" = 0 ]; then echo "REL_DONE run_id=$RUN_ID uploads=[$UPLOADS] +$(el)s"
@@ -84,7 +85,7 @@ step() {
   done
   wait "$CUR_PID"; rc=$?; CUR_PID=""
   echo "STEP_END $name rc=$rc +$(el)s"
-  grep -E '^(FP8_|SHARD_|DIFFUSERS_|SINGLE_|SMOKE_|HF_|RELEASE_)' "$log" | grep -v FP8_PROGRESS | tail -n 12 | sed 's/^/  /'
+  grep -E '^(FP8_|SHARD_|DIFFUSERS_|SINGLE_|SMOKE_|HF_|RELEASE_|META_)' "$log" | grep -v FP8_PROGRESS | tail -n 12 | sed 's/^/  /'
   return "$rc"
 }
 must() { # RC STAGE STEP TIMEOUT CMD...
@@ -95,6 +96,30 @@ must() { # RC STAGE STEP TIMEOUT CMD...
     124|137) fail 9 "$stage" "STEP_TIMEOUT $name" ;;
     *) echo "=== $name.log tail ==="; tail -n 20 "$LOGS/$name.log" | cut -c1-300; fail "$code" "$stage" "$name rc=$rc" ;;
   esac
+}
+# reap_comfy: no ComfyUI server may outlive its render (a SIGKILLed comfy_smoke.py leaves its detached server):
+# TERM then KILL every server's process group (pidfile + any ComfyUI main.py), then wait until the ports are free
+reap_comfy() {
+  local p pids i
+  pids=$(cat "$WD"/comfy_*.pid 2>/dev/null; pgrep -f "main.py --listen 127.0.0.1 --port" 2>/dev/null)
+  [ -n "$pids" ] || return 0
+  for p in $pids; do kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; done
+  for ((i = 0; i < 30; i++)); do pgrep -f "main.py --listen 127.0.0.1 --port" > /dev/null || break; sleep 1; done
+  for p in $pids $(pgrep -f "main.py --listen 127.0.0.1 --port" 2>/dev/null); do kill -KILL -- "-$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; done
+  rm -f "$WD"/comfy_*.pid
+  for ((i = 0; i < 30; i++)); do
+    python3 -I -c 'import socket, sys
+for port in range(8188, 8220):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError:
+        sys.exit(1)
+    finally:
+        s.close()' && { echo "COMFY_REAPED (ports free)"; return 0; }
+    sleep 1
+  done
+  echo "COMFY_REAP_WARN a port in 8188-8219 is still busy"
 }
 free_gb() { df -P -B1G "$C" | awk 'NR == 2 { print $4 }'; }
 watchdog() {
@@ -198,6 +223,9 @@ for m in $MODELS; do
   SINGLE=$ST/$(pv models "$m" single_name); FP8=$ST/$(pv models "$m" fp8_name)
   [ -n "$PULL_PID" ] || pull_start "$m"
   pull_wait "$m"; t "pull_$m"
+  # published files carry no internal paths: __metadata__ values with absolute paths are dropped in place
+  # (header length, offsets, data bytes and file size unchanged)
+  must 5 "check_$m" "strip_meta_$m" 300 "$PYK" -I "$KIT/release.py" strip-meta --file "$SINGLE"
   ALLBF=(); [ "$(pv models "$m" all_bf16)" = True ] && ALLBF=(--all-bf16)
   must 5 "check_$m" "check_single_$m" 300 "$PYK" -I "$KIT/release.py" check-single --file "$SINGLE" \
     --ref-hdr "$IN/ref/krea2_${m}_bf16.hdr" "${ALLBF[@]}"
@@ -210,15 +238,29 @@ for m in $MODELS; do
   WF=$IN/workflows/krea2_anime_tuned_${m}_api_smoke.json; PROMPT=$(pv smoke_prompt)
   [ "$DRY" = 1 ] && echo "DRY: smoke renders skipped"
   SMOKE=("$PYK" -I "$KIT/comfy_smoke.py" --comfy "$COMFY" --workflow "$WF" --out "$OUT/renders" --prompt "$PROMPT"
-         --seed "$(pv smoke_seed)" --port $((8188 + i)))
+         --seed "$(pv smoke_seed)" --width "$(pv smoke_width)" --height "$(pv smoke_height)" --timeout-s 1500)
   if [ "$DRY" != 1 ]; then
-    # fp8 = the file users run: a hard gate. bf16 (> the L4's 24 GB, relies on ComfyUI's offload): a full render, and
-    # if that fails a load-only check (1 step, PLAN A.3); only a failing load-only check aborts.
-    must 7 "smoke_$m" "smoke_${m}_fp8" 1800 "${SMOKE[@]}" --render "${m}_fp8:$(basename "$FP8")"
-    if ! step "smoke_${m}_bf16" 1800 "${SMOKE[@]}" --render "${m}_bf16:$(basename "$SINGLE")"; then
-      echo "BF16_RENDER_FALLBACK $m: the full bf16 render failed (see smoke_${m}_bf16.log); load-only check next"
-      must 7 "smoke_$m" "smoke_${m}_bf16_load" 900 "${SMOKE[@]}" --render "${m}_bf16load:$(basename "$SINGLE"):load"
-    fi
+    # fp8 = the file users run: a hard gate (comfy_smoke rc 1 fatal / 3 resource: both abort). bf16 (> the L4's 24 GB,
+    # relies on ComfyUI's offload): a full render; ONLY a resource failure (rc 3 = OOM / allocation error / server
+    # SIGKILLed / --timeout-s exceeded) falls back to a load check (1 step, PLAN A.3) whose key + image gates still
+    # apply. Key mismatches, image-gate failures and anything else are fatal.
+    reap_comfy
+    must 7 "smoke_$m" "smoke_${m}_fp8" 1800 "${SMOKE[@]}" --port $((8188 + 3 * i)) --pidfile "$WD/comfy_fp8.pid" \
+      --render "${m}_fp8:$(basename "$FP8")"
+    reap_comfy
+    step "smoke_${m}_bf16" 1800 "${SMOKE[@]}" --port $((8189 + 3 * i)) --pidfile "$WD/comfy_bf16.pid" \
+      --render "${m}_bf16:$(basename "$SINGLE")"; rc=$?
+    reap_comfy
+    case $rc in
+      0) ;;
+      3) echo "BF16_RENDER_FALLBACK $m: resource failure of the full bf16 render (see smoke_${m}_bf16.log); load check next"
+         must 7 "smoke_$m" "smoke_${m}_bf16_load" 900 "${SMOKE[@]}" --port $((8190 + 3 * i)) --pidfile "$WD/comfy_load.pid" \
+           --render "${m}_bf16load:$(basename "$SINGLE"):load"
+         reap_comfy ;;
+      124|137) fail 9 "smoke_$m" "STEP_TIMEOUT smoke_${m}_bf16" ;;
+      *) echo "=== smoke_${m}_bf16.log tail ==="; tail -n 20 "$LOGS/smoke_${m}_bf16.log" | cut -c1-300
+         fail 7 "smoke_$m" "smoke_${m}_bf16 rc=$rc (fatal: keys / image gate / other)" ;;
+    esac
   fi
   rm -f "$DM/$(basename "$FP8")" "$DM/$(basename "$SINGLE")"
   t "smoke_$m"

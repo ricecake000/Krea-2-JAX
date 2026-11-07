@@ -4,6 +4,7 @@
   release.py fp8 --src SINGLE --out FP8                         ComfyUI fp8_scaled file from an official-key single file
   release.py diffusers --src SINGLE --index IDX --config CFG --out DIR
                                                                 transformer/ (3 shards with IDX's key->shard map)
+  release.py strip-meta --file F                                drop __metadata__ values holding absolute paths, in place
   release.py check-single --file F --ref-hdr H [--all-bf16]     key set / shapes / dtypes vs Comfy's bf16 header
   release.py check-fp8 --file F --ref-hdr H --ref-size N        header bytes == Comfy's fp8_scaled header, same size
   release.py check-diffusers --dir D --index IDX --expect-total N [--shard-ref DIR]
@@ -22,6 +23,7 @@ def main(argv=None):
     p = sp.add_parser("diffusers")
     for k in ("--src", "--index", "--config", "--out"):
         p.add_argument(k, required=True)
+    p = sp.add_parser("strip-meta"); p.add_argument("--file", required=True)
     p = sp.add_parser("check-single"); p.add_argument("--file", required=True); p.add_argument("--ref-hdr", required=True)
     p.add_argument("--all-bf16", action="store_true")
     p = sp.add_parser("check-fp8"); p.add_argument("--file", required=True); p.add_argument("--ref-hdr", required=True)
@@ -36,6 +38,8 @@ def main(argv=None):
         elif a.cmd == "diffusers":
             wm = json.load(open(a.index))["weight_map"]
             L.build_diffusers(a.src, wm, open(a.config, "rb").read(), a.out, log=say)
+        elif a.cmd == "strip-meta":
+            L.strip_metadata_inplace(a.file, log=say)
         elif a.cmd == "check-single":
             say(L.check_single(a.file, open(a.ref_hdr, "rb").read(), a.all_bf16))
         elif a.cmd == "check-fp8":

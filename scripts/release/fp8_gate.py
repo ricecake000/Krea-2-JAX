@@ -11,7 +11,7 @@ HTTP range reads of the public Comfy-Org/Krea-2 files at a pinned revision (neve
      projector / norms / mod.lin) is copied from Comfy's bf16 file into a mini safetensors file, run through the REAL
      streaming builder (release_lib.build_fp8), and every output tensor (F8 weight, F32 weight_scale, BF16) must equal
      Comfy's fp8_scaled bytes exactly. Raw and turbo samples use different block indices.
-Usage: fp8_gate.py --work DIR [--pairs raw,turbo] [--shard-ref DIR] [--headers-out DIR]
+Usage: fp8_gate.py --work DIR [--pairs raw,turbo] [--shard-ref DIR] [--headers-out DIR] [--headers-only]
 Prints GATE_* lines; last line FP8_GATE_OK ... (exit 0) or FP8_GATE_FAIL <why> (exit 1).
 """
 import argparse, json, os, shutil, sys, time, urllib.request
@@ -66,7 +66,7 @@ def sample_keys(m, bf16_t):
     return keys
 
 
-def gate_pair(m, work, say):
+def gate_pair(m, work, say, headers_only=False):
     bname, fname = f"krea2_{m}_bf16", f"krea2_{m}_fp8_scaled"
     bp, fp = fetch_prefix(bname), fetch_prefix(fname)
     _, bmeta, bt = L.parse_header_bytes(bp, None, bname)
@@ -81,6 +81,9 @@ def gate_pair(m, work, say):
     nq = sum(1 for j in jobs.values() if j[0] == "quant")
     say(f"GATE_HEADER {m} fp8 header == Comfy ({len(fp)} B, {len(ft)} keys: {nq} F8 + {nq} scales + {len(bt) - nq} BF16; "
         f"_quantization_metadata {len(fmeta['_quantization_metadata'])} chars equal) size={size}; bf16 writer ok")
+    if headers_only:
+        say(f"GATE_TENSORS {m} SKIPPED (--headers-only)")
+        return bp, fp
     keys = sample_keys(m, bt)
     # the mini source: Comfy's bf16 bytes of the sample, in a safetensors file written by our writer
     sub = {k: bt[k] for k in keys}
@@ -137,6 +140,7 @@ def main():
     ap.add_argument("--shard-ref", help="dir with <shard>.hdr reference prefixes (Turbo diffusers on Drive)")
     ap.add_argument("--index", help="official diffusers index json (weight_map), needed with --shard-ref")
     ap.add_argument("--headers-out", help="save Comfy's 4 header prefixes here (<file>.hdr) for the VM job")
+    ap.add_argument("--headers-only", action="store_true", help="header gates only (no tensor reads): NOT the full gate")
     a = ap.parse_args()
     say = lambda s: print(s, flush=True)
     work = os.path.join(a.work, "fp8_gate"); os.makedirs(work, exist_ok=True)
@@ -145,7 +149,7 @@ def main():
         prefixes = {}
         for m in a.pairs.split(","):
             L.need(m in SAMPLE, f"unknown pair {m}")
-            prefixes[m] = gate_pair(m, work, say)
+            prefixes[m] = gate_pair(m, work, say, a.headers_only)
         if a.shard_ref:
             L.need("turbo" in prefixes and a.index, "--shard-ref needs the turbo pair and --index")
             gate_shards(prefixes["turbo"][0], json.load(open(a.index))["weight_map"], a.shard_ref, say)
@@ -160,7 +164,7 @@ def main():
         return 1
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    say(f"FP8_GATE_OK pairs={a.pairs} ref={REPO}@{REV[:12]}")
+    say(f"FP8_GATE_OK pairs={a.pairs} ref={REPO}@{REV[:12]}" + (" HEADERS ONLY (tensor gate skipped)" if a.headers_only else ""))
     return 0
 
 

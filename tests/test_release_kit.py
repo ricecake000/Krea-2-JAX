@@ -31,3 +31,12 @@ def test_fp8_plan_layout():
     order = [k for k in json.loads(hdr[8:]) if k != "__metadata__"]
     assert order[:2] == ["blocks.0.attn.wo.weight_scale", "blocks.0.attn.wq.weight_scale"]  # F32, BF16, F8
     assert order[-2:] == ["blocks.0.attn.wo.weight", "blocks.0.attn.wq.weight"] and len(hdr) % 8 == 0
+
+
+def test_strip_metadata_inplace(tmp_path):
+    p = str(tmp_path / "m.safetensors")
+    hdr, offs, size = L.build_header([("a", "F32", (2,))], {"ft": "/vol/exports/x step 1", "alpha": "1.0", "raw": "krea/K@1"})
+    open(p, "wb").write(hdr + b"\x01" * 8)
+    assert L.strip_metadata_inplace(p, log=lambda s: None) == ["ft"]
+    n, meta, t = L.read_header(p)
+    assert meta == {"alpha": "1.0", "raw": "krea/K@1"} and os.path.getsize(p) == size and open(p, "rb").read()[-8:] == b"\x01" * 8

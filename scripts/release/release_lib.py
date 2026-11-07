@@ -307,6 +307,45 @@ def build_diffusers(src, weight_map, config_bytes, out_dir, log=print):
     return total
 
 
+# ---------------- metadata hygiene (published files carry no internal paths) ----------------
+ABS_PATH_RE = re.compile(r"(^|[\s=:,;(\[])/[^/\s]")
+
+
+def internal_meta_keys(meta):
+    return sorted(k for k, v in (meta or {}).items() if ABS_PATH_RE.search(str(v)))
+
+
+def strip_metadata_inplace(path, log=print):
+    """Drop every __metadata__ entry whose value holds an absolute path, in place: the header JSON keeps its tensor
+    entries (same order, same data_offsets) and is padded with spaces to its old length, so the 8-byte length, every
+    data byte and the file size stay unchanged. Returns the dropped keys."""
+    size = os.path.getsize(path)
+    n, meta, t = read_header(path)
+    drop = internal_meta_keys(meta)
+    if not drop:
+        log(f"META_CLEAN {os.path.basename(path)} nothing to strip (metadata keys {sorted(meta)})")
+        return []
+    with open(path, "rb") as f:
+        f.seek(8); j = json.loads(f.read(n).decode("utf-8"))
+    for k in drop:
+        del j["__metadata__"][k]
+    if not j["__metadata__"]:
+        del j["__metadata__"]
+    h = json.dumps(j, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    need(len(h) <= n, f"{path}: the stripped header ({len(h)} B) is longer than the old one ({n} B)")
+    h += b" " * (n - len(h))
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        pwrite_all(fd, h, 8); os.fsync(fd)
+    finally:
+        os.close(fd)
+    n2, meta2, t2 = read_header(path)
+    need(n2 == n and t2 == t and os.path.getsize(path) == size and not internal_meta_keys(meta2),
+         f"{path}: header rewrite changed the tensor layout or left an internal path")
+    log(f"META_STRIPPED {os.path.basename(path)} dropped={drop} kept={sorted(meta2)} (header length, offsets, data unchanged)")
+    return drop
+
+
 # ---------------- header checks against the Comfy / official references ----------------
 def header_prefix(path):
     with open(path, "rb") as f:
@@ -318,6 +357,7 @@ def header_prefix(path):
 def check_single(path, ref_prefix, all_bf16):
     """Our single file vs Comfy's bf16 reference: key set + shapes equal; dtypes equal, or all BF16 (Raw = as trained)."""
     _, meta, t = read_header(path)
+    need(not internal_meta_keys(meta), f"{path}: __metadata__ holds internal paths: {internal_meta_keys(meta)}")
     _, _, r = parse_header_bytes(ref_prefix, None, "comfy bf16 ref")
     need(set(t) == set(r), f"{path}: key set != Comfy's ({len(t)} vs {len(r)})")
     bad = [k for k in t if t[k][1] != r[k][1]]
