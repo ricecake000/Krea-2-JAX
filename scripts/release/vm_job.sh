@@ -209,12 +209,17 @@ for m in $MODELS; do
   ln -sf "$FP8" "$DM/$(basename "$FP8")"; ln -sf "$SINGLE" "$DM/$(basename "$SINGLE")"
   WF=$IN/workflows/krea2_anime_tuned_${m}_api_smoke.json; PROMPT=$(pv smoke_prompt)
   [ "$DRY" = 1 ] && echo "DRY: smoke renders skipped"
-  for kind in fp8 bf16; do
-    [ "$DRY" = 1 ] && break
-    f=$FP8; [ $kind = bf16 ] && f=$SINGLE
-    must 7 "smoke_$m" "smoke_${m}_$kind" 1800 "$PYK" -I "$KIT/comfy_smoke.py" --comfy "$COMFY" --workflow "$WF" \
-      --render "${m}_$kind:$(basename "$f")" --out "$OUT/renders" --prompt "$PROMPT" --seed "$(pv smoke_seed)" --port $((8188 + i))
-  done
+  SMOKE=("$PYK" -I "$KIT/comfy_smoke.py" --comfy "$COMFY" --workflow "$WF" --out "$OUT/renders" --prompt "$PROMPT"
+         --seed "$(pv smoke_seed)" --port $((8188 + i)))
+  if [ "$DRY" != 1 ]; then
+    # fp8 = the file users run: a hard gate. bf16 (> the L4's 24 GB, relies on ComfyUI's offload): a full render, and
+    # if that fails a load-only check (1 step, PLAN A.3); only a failing load-only check aborts.
+    must 7 "smoke_$m" "smoke_${m}_fp8" 1800 "${SMOKE[@]}" --render "${m}_fp8:$(basename "$FP8")"
+    if ! step "smoke_${m}_bf16" 1800 "${SMOKE[@]}" --render "${m}_bf16:$(basename "$SINGLE")"; then
+      echo "BF16_RENDER_FALLBACK $m: the full bf16 render failed (see smoke_${m}_bf16.log); load-only check next"
+      must 7 "smoke_$m" "smoke_${m}_bf16_load" 900 "${SMOKE[@]}" --render "${m}_bf16load:$(basename "$SINGLE"):load"
+    fi
+  fi
   rm -f "$DM/$(basename "$FP8")" "$DM/$(basename "$SINGLE")"
   t "smoke_$m"
   SREF=(); [ "$m" = turbo ] && SREF=(--shard-ref "$IN/ref/turbo_shards")
