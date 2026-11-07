@@ -37,6 +37,9 @@ SMOKE_START_S=300; SMOKE_RENDER_S=900; SMOKE_LOAD_S=600; SMOKE_STOP_S=60; SMOKE_
 SMOKE_OUTER_S=$((SMOKE_START_S + SMOKE_RENDER_S + SMOKE_STOP_S + SMOKE_MARGIN_S))        # 1380
 SMOKE_LOAD_OUTER_S=$((SMOKE_START_S + SMOKE_LOAD_S + SMOKE_STOP_S + SMOKE_MARGIN_S))     # 1080
 MAX_MIN=${REL_MAX_MIN:-195}; ALLOW=${REL_ALLOW_UPLOAD:-0}; MODELS=${REL_MODELS:-raw turbo}
+# optional (OFF by default): after Turbo's renders, one render of the Raw -> Turbo hybrid workflow (both fp8 files;
+# the Raw fp8 is kept as a hard link until then); a failure is fatal like the fp8 gate
+HYBRID=${REL_HYBRID_SMOKE:-0}
 PULL_FLAGS=(--multi-thread-streams 16 --multi-thread-cutoff 256M --retries 3 --low-level-retries 10 --stats 60s
             --stats-one-line -v)
 T0=$(date +%s); WALL_END=$((T0 + MAX_MIN * 60)); RUN_ID=${RUN_ID:-}
@@ -148,6 +151,7 @@ mkdir -p "$LOGS" "$OUT"; rm -f "$PACK" "$STOP_FILE"
 echo "REL_JOB start $(date -u +%FT%TZ) allow_upload=$ALLOW models='$MODELS' cap=${MAX_MIN}min pid=$$"
 [[ $MAX_MIN =~ ^[1-9][0-9]*$ ]] || fail 1 args "REL_MAX_MIN='$MAX_MIN'"
 case $ALLOW in 0|1) ;; *) fail 1 args "REL_ALLOW_UPLOAD='$ALLOW'" ;; esac
+case $HYBRID in 0|1) ;; *) fail 1 args "REL_HYBRID_SMOKE='$HYBRID'" ;; esac
 watchdog $$ & WD_PID=$!
 { rm -rf "$IN" && mkdir -p "$IN" && chmod 700 "$IN" && (umask 077 && tar xf "$TAR_IN" -C "$IN"); } || fail 1 inputs "cannot extract $TAR_IN"
 rm -f "$TAR_IN"; chmod 600 "$RCONF" "$HFTOK" 2>/dev/null
@@ -156,7 +160,13 @@ for f in kit/release_lib.py kit/release.py kit/comfy_smoke.py kit/hf_release.py 
   [ -s "$IN/$f" ] || fail 1 inputs "missing $f in rel_in.tar"
 done
 [ "$(tr -d '[:space:]' < "$IN/run_id")" = "$RUN_ID" ] && [ -n "$RUN_ID" ] || fail 1 inputs "RUN_ID mismatch (env '$RUN_ID')"
-PLAN=$IN/plan.json; KIT=$IN/kit
+PLAN=$IN/plan.json; KIT=$IN/kit; HYB_DIR=$C/rel/hybrid_keep
+if [ "$HYBRID" = 1 ]; then
+  [ "$MODELS" = "raw turbo" ] || fail 1 args "REL_HYBRID_SMOKE=1 needs REL_MODELS='raw turbo' (Raw first)"
+  [ -s "$IN/workflows/krea2_anime_tuned_hybrid_api_smoke.json" ] || fail 1 inputs "missing the hybrid smoke workflow"
+  [ "$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("hybrid_smoke", False))' "$PLAN")" = True ] \
+    || fail 1 inputs "REL_HYBRID_SMOKE=1 but plan.json was made without the hybrid smoke (its disk need)"
+fi
 for m in $MODELS; do
   case $m in raw|turbo) ;; *) fail 1 args "REL_MODELS has '$m'" ;; esac
 done
@@ -269,6 +279,21 @@ for m in $MODELS; do
     esac
   fi
   rm -f "$DM/$(basename "$FP8")" "$DM/$(basename "$SINGLE")"
+  if [ "$HYBRID" = 1 ] && [ "$m" = raw ]; then
+    mkdir -p "$HYB_DIR" && ln -f "$FP8" "$HYB_DIR/" || fail 7 "smoke_$m" "cannot keep the Raw fp8 for the hybrid render"
+  fi
+  if [ "$HYBRID" = 1 ] && [ "$m" = turbo ] && [ "$DRY" != 1 ]; then
+    RAWF=$HYB_DIR/$(pv models raw fp8_name)
+    ln -sf "$RAWF" "$DM/$(basename "$RAWF")"; ln -sf "$FP8" "$DM/$(basename "$FP8")"
+    reap_comfy
+    must 7 "smoke_hybrid" "smoke_hybrid" "$SMOKE_OUTER_S" "$PYK" -I "$KIT/comfy_smoke.py" --comfy "$COMFY" \
+      --workflow "$IN/workflows/krea2_anime_tuned_hybrid_api_smoke.json" --out "$OUT/renders" --prompt "$PROMPT" \
+      --seed "$(pv smoke_seed)" --width "$(pv smoke_width)" --height "$(pv smoke_height)" \
+      --startup-s "$SMOKE_START_S" --stop-s "$SMOKE_STOP_S" --timeout-s "$SMOKE_RENDER_S" --port 8200 --pidfile "$WD/comfy_hybrid.pid" --render "hybrid:-"
+    reap_comfy
+    rm -f "$DM/$(basename "$RAWF")" "$DM/$(basename "$FP8")"
+  fi
+  [ "$m" = turbo ] && rm -rf "$HYB_DIR"
   t "smoke_$m"
   SREF=(); [ "$m" = turbo ] && SREF=(--shard-ref "$IN/ref/turbo_shards")
   must 8 "diffusers_$m" "diffusers_$m" 3600 "$PYK" -I "$KIT/release.py" diffusers --src "$SINGLE" \
