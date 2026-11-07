@@ -9,6 +9,8 @@
   prompt text into the CLIPTextEncode wired to KSampler.positive; W/H into the nodes feeding EmptyLatentImage, which
   also feed ModelSamplingFlux) and queues it. UNET_FILE must already be in DIR/models/diffusion_models.
   ':load' = load check: the same graph with steps=1 (the file loads and runs one step).
+  A graph with KSamplerAdvanced nodes (the Raw -> Turbo hybrid) keeps its own UNETLoaders: pass UNET_FILE '-'; the
+  seed goes to every KSamplerAdvanced, the prompt into the positive of the one starting at step 0.
 Gate (each render), checked in this order:
   1. keys: the ComfyUI log written during the render has no "unet missing" / "unet unexpected" / "left over keys in
      diffusion model" / "Could not detect model type" / "ERROR UNSUPPORTED" line -> FATAL (also for ':load').
@@ -65,11 +67,19 @@ def set_input(wf, node, name, value):
 
 def patch(wf, unet, prompt, seed, prefix, load_only, width, height):
     wf = copy.deepcopy(wf)
-    wf[one(wf, "UNETLoader")]["inputs"]["unet_name"] = unet
-    ks = wf[one(wf, "KSampler")]["inputs"]
-    ks["seed"] = seed
-    if load_only:
-        ks["steps"] = 1
+    adv = [k for k, v in wf.items() if v.get("class_type") == "KSamplerAdvanced"]
+    if adv:   # the hybrid graph: its own two UNETLoaders (UNET_FILE '-'), seed into every KSamplerAdvanced
+        if unet != "-" or load_only:
+            raise SystemExit("SMOKE_FAIL kind=fatal a KSamplerAdvanced (hybrid) graph takes UNET_FILE '-' and no ':load'")
+        for k in adv:
+            set_input(wf, k, "noise_seed", seed)
+        ks = next(wf[k]["inputs"] for k in adv if wf[k]["inputs"].get("start_at_step") == 0)
+    else:
+        wf[one(wf, "UNETLoader")]["inputs"]["unet_name"] = unet
+        ks = wf[one(wf, "KSampler")]["inputs"]
+        ks["seed"] = seed
+        if load_only:
+            ks["steps"] = 1
     pos = ks["positive"][0]
     if wf[pos]["class_type"] != "CLIPTextEncode":
         raise SystemExit(f"SMOKE_FAIL kind=fatal KSampler.positive comes from {wf[pos]['class_type']}")
