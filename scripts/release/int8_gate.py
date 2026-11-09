@@ -9,10 +9,14 @@ HTTP range reads of the public Comfy-Org/Krea-2 files at the fp8 gate's pinned r
      attn.wk + mlp.gate only) + non-quantized tensors of every kind (mod.lin, norms, txtfusion linears/projector,
      first/last, tmlp, txtmlp.0.scale) are copied from Comfy's bf16 file into a mini safetensors file, run through the
      REAL streaming builder (release_lib.build_int8), and compared with Comfy's int8_convrot bytes:
-       I8 weight: mismatch rate <= 1e-5 of the elements, max |dq| <= 1;  F32 weight_scale: finite, > 0, max relative
-       difference <= 1e-6;  comfy_quant U8 / every BF16 and F32 tensor / dtypes / shapes: exactly equal.
-     Bit-exactness is not reachable: the rotation's f32 summation order differs per hardware (measured on the laptop
-     CPU: scales equal or 1 ULP apart, ~1e-7 of the int8 values off by 1).
+       scales finite and > 0 (ours and Comfy's); rows whose scale differs from Comfy's by > 1e-6 relative ("picked
+       another clip ratio") <= 1e-3 of the rows, and on each such row our reconstruction error (f64, against the
+       rotated bf16 source) <= Comfy's * (1 + 1e-4); on all other rows: int8 mismatch rate <= 1e-5, max |dq| <= 1;
+       comfy_quant U8 / every BF16 and F32 tensor / dtypes / shapes: exactly equal.
+     Bit-exactness is not reachable: Comfy's file picks each row's clip ratio by an f32 error sum whose summation
+     order we cannot reproduce; where two ratios are within that noise (a near tie) the pick is arbitrary and both
+     have the same error. Our builder sums in f64 (identical picks on CPU and CUDA). Measured on the laptop CPU: scales
+     equal or ~1 ULP apart, ~2e-7 of the int8 values off by 1, and 1 near-tie row in the turbo blocks.27 sample.
 Usage: int8_gate.py --work DIR [--pairs raw,turbo] [--headers-out DIR] [--headers-only] [--device cpu|cuda] [--quick]
 Prints GATE_* lines; last line INT8_GATE_OK ... (exit 0) or INT8_GATE_FAIL <why> (exit 1).
 """
@@ -25,6 +29,7 @@ from fp8_gate import KINDS, REPO, REV, fetch, fetch_prefix  # noqa: E402
 import numpy as np  # noqa: E402
 
 MAX_MISMATCH_RATE, MAX_DQ, MAX_SCALE_REL = 1e-5, 1, 1e-6
+MAX_TIE_ROWS, TIE_ERR_SLACK = 1e-3, 1e-4
 QUICK_KINDS = ["attn.wk", "mlp.gate"]
 SAMPLE = {  # (block, extra non-quantized keys: a txtfusion layerwise linear and a refiner linear)
     "raw": (0, ["txtfusion.layerwise_blocks.0.attn.wq.weight", "txtfusion.refiner_blocks.1.mlp.down.weight"]),
@@ -44,19 +49,36 @@ def sample_keys(m, bf16_t, quick):
     return keys
 
 
-def compare_quant(m, layer, ours_q, ref_q, ours_s, ref_s):
-    """Returns (mismatches, elements, max |dq|, max rel scale diff); Refuse when out of tolerance."""
-    a, b = np.frombuffer(ours_q, dtype=np.int8), np.frombuffer(ref_q, dtype=np.int8)
-    dq = np.abs(a.astype(np.int16) - b.astype(np.int16))
-    mism, mdq = int(np.count_nonzero(dq)), int(dq.max())
+def compare_quant(m, layer, src, shape, ours_q, ref_q, ours_s, ref_s):
+    """src: the layer's BF16 source bytes. Returns (mismatches, elements, max |dq|, max rel scale diff on the other
+    rows, near-tie rows); Refuse when out of tolerance (see the module docstring)."""
+    import torch
+    n, k = (int(x) for x in shape)
+    a = np.frombuffer(ours_q, dtype=np.int8).reshape(n, k); b = np.frombuffer(ref_q, dtype=np.int8).reshape(n, k)
     so, sr = np.frombuffer(ours_s, dtype=np.float32), np.frombuffer(ref_s, dtype=np.float32)
     L.need(bool(np.isfinite(so).all() and (so > 0).all() and np.isfinite(sr).all() and (sr > 0).all()),
            f"{m} {layer}: a scale is non-finite or <= 0")
-    rel = float((np.abs(so.astype(np.float64) - sr) / sr).max())
-    L.need(rel <= MAX_SCALE_REL, f"{m} {layer}: max rel scale diff {rel:.3e} > {MAX_SCALE_REL}")
-    L.need(mism <= MAX_MISMATCH_RATE * a.size and mdq <= MAX_DQ,
-           f"{m} {layer}: int8 mismatches {mism}/{a.size} max|dq| {mdq} (limits {MAX_MISMATCH_RATE:g}, {MAX_DQ})")
-    return mism, a.size, mdq, rel
+    rel = np.abs(so.astype(np.float64) - sr) / sr
+    tie = np.flatnonzero(rel > MAX_SCALE_REL)
+    L.need(tie.size <= MAX_TIE_ROWS * n, f"{m} {layer}: {tie.size}/{n} rows picked another clip ratio than Comfy "
+           f"(limit {MAX_TIE_ROWS:g}; max rel scale diff {rel.max():.3e})")
+    if tie.size:   # a near tie is fine only if our pick is at least as good as Comfy's
+        w = torch.frombuffer(bytearray(src), dtype=torch.bfloat16).reshape(n, k)[torch.from_numpy(tie)].double()
+        h = L.hadamard_256(torch).double()
+        xr = torch.matmul(w.reshape(tie.size, k // L.INT8_GROUP, L.INT8_GROUP), h.T).reshape(tie.size, k)
+        def sse(q, sc):
+            return ((torch.from_numpy(q[tie].astype(np.float64)) * torch.from_numpy(sc[tie].astype(np.float64))[:, None]
+                     - xr) ** 2).sum(-1)
+        eo, er = sse(a, so), sse(b, sr)
+        worst = float((eo / er).max())
+        L.need(worst <= 1 + TIE_ERR_SLACK, f"{m} {layer}: on a row where we picked another clip ratio, our error is "
+               f"{worst:.6f}x Comfy's (limit 1 + {TIE_ERR_SLACK:g})")
+    keep = np.ones(n, dtype=bool); keep[tie] = False
+    dq = np.abs(a[keep].astype(np.int16) - b[keep].astype(np.int16))
+    mism, mdq, size = int(np.count_nonzero(dq)), int(dq.max()) if dq.size else 0, int(dq.size)
+    L.need(mism <= MAX_MISMATCH_RATE * size and mdq <= MAX_DQ,
+           f"{m} {layer}: int8 mismatches {mism}/{size} max|dq| {mdq} (limits {MAX_MISMATCH_RATE:g}, {MAX_DQ})")
+    return mism, size, mdq, float(rel[keep].max()) if keep.any() else 0.0, int(tie.size)
 
 
 def gate_pair(m, work, say, headers_only=False, quick=False, device="cpu"):
@@ -85,11 +107,15 @@ def gate_pair(m, work, say, headers_only=False, quick=False, device="cpu"):
     mh, moffs, msize = L.build_header([(k, v[0], v[1]) for k, v in sub.items()], None)
     src, out = os.path.join(work, f"{m}_mini_src.safetensors"), os.path.join(work, f"{m}_mini_int8.safetensors")
     fd = os.open(src, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    srcb = {}   # the quantized layers' bf16 bytes, for the near-tie error check
     try:
         os.ftruncate(fd, msize); L.pwrite_all(fd, mh, 0)
         got = 0
         for k in keys:
-            L.pwrite_all(fd, fetch(bname, bt[k][2], bt[k][3]), moffs[k][0]); got += bt[k][3] - bt[k][2]
+            data = fetch(bname, bt[k][2], bt[k][3])
+            L.pwrite_all(fd, data, moffs[k][0]); got += bt[k][3] - bt[k][2]
+            if jobs[k][0] == "quant":
+                srcb[k] = data
     finally:
         os.close(fd)
     say(f"GATE_FETCHED {m} {len(keys)} bf16 tensors ({got / 2**20:.0f} MiB)")
@@ -113,8 +139,8 @@ def gate_pair(m, work, say, headers_only=False, quick=False, device="cpu"):
                 L.need(ot[ok][0] == it[ok][0] and ot[ok][1] == it[ok][1], f"{m} {ok}: dtype/shape != Comfy")
             if jobs[k][0] == "quant":
                 ref_q, ref_s = fetch(iname, it[k][2], it[k][3]), fetch(iname, it[outs[1]][2], it[outs[1]][3])
-                mism, n, mdq, rel = compare_quant(m, layer, rd(k), ref_q, rd(outs[1]), ref_s)
-                stats.append(f"{layer.split('.', 2)[2]}:{mism}/{n},dq{mdq},srel{rel:.2e}")
+                mism, n, mdq, rel, ties = compare_quant(m, layer, srcb.pop(k), bt[k][1], rd(k), ref_q, rd(outs[1]), ref_s)
+                stats.append(f"{layer.split('.', 2)[2]}:{mism}/{n},dq{mdq},srel{rel:.2e},ties{ties}")
                 nbytes += len(ref_q) + len(ref_s)
                 outs = outs[2:]
             for ok in outs:
@@ -128,7 +154,7 @@ def gate_pair(m, work, say, headers_only=False, quick=False, device="cpu"):
     finally:
         os.close(fd)
     os.remove(out)
-    say(f"GATE_TENSORS {m} blocks.{SAMPLE[m][0]} quantized (mismatches/elements, max|dq|, max rel scale diff): "
+    say(f"GATE_TENSORS {m} blocks.{SAMPLE[m][0]} quantized (mismatches/elements and max|dq| and max rel scale diff on the other rows, near-tie rows): "
         f"{' '.join(stats)}; byte-exact: {exact} ({nbytes / 2**20:.0f} MiB compared)")
     return bp, ip
 
