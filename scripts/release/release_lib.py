@@ -327,32 +327,37 @@ def hadamard_256(torch):
 def quantize_int8_convrot(data, shape, device="cpu", rows=4096, what="tensor"):
     """data: raw BF16 bytes of one [N, K] weight. Returns (int8 bytes [N, K], f32 scale bytes [N, 1], rel_err).
     Per row (rows are independent; processed in chunks of `rows`, the device's tensors freed per chunk):
-      xr = (x.reshape(N, K/256, 256) @ H.T).reshape(N, K) in true f32;  am = amax|xr| per row;
+      xr = f32((x.reshape(N, K/256, 256) @ H.T) in f64);  am = amax|xr| per row (f32);
       for r in linspace(1.0, 0.55, 80): sc = am * r / 127; q = clamp(round(xr / sc), -127, 127);
-        err = sum((q * sc - xr)^2); keep (sc, q) where err < best (strict: the first minimum wins)."""
+        err = sum in f64 of (q * sc - xr)^2 (f32 difference); keep (sc, q) where err < best (strict: first minimum wins).
+    Same results on CPU and CUDA (elementwise f32 ops are IEEE; both reductions are f64)."""
     torch = _torch()
     _exact_f32_matmul(torch, device)
     n, k = (int(x) for x in shape)
     need(k % INT8_GROUP == 0 and len(data) == n * k * 2, f"{what}: shape {shape} / {len(data)} B is not a BF16 [N, K%256==0]")
     w = torch.frombuffer(bytearray(data), dtype=torch.bfloat16).reshape(n, k)
-    H = hadamard_256(torch).to(device)
+    H64 = hadamard_256(torch).double().to(device)
+    # a device tensor, not a Python scalar: CUDA turns `/ <cpu scalar>` into a multiply by its rounded reciprocal
+    d127 = torch.tensor(127.0, dtype=torch.float32, device=device)
     grid = torch.linspace(1.0, 0.55, 80).to(device)
     q_out = np.empty((n, k), dtype=np.int8)
     s_out = np.empty((n, 1), dtype=np.float32)
     err_sum = ref_sum = 0.0
     for s in range(0, n, rows):
         e = min(n, s + rows)
-        x = w[s:e].to(device).float()
+        x = w[s:e].to(device).double()
         need(bool(torch.isfinite(x).all()), f"{what}: non-finite weights in rows {s}:{e}")
-        xr = torch.matmul(x.reshape(e - s, k // INT8_GROUP, INT8_GROUP), H.T).reshape(e - s, k)
+        # rotation in f64, then rounded to f32: the correctly rounded f32 rotation on every device (an f32 matmul's
+        # summation order / TF32 differ between CPU and GPU, and on the L4 that moved some rows' clip choice by 3.6 %)
+        xr = torch.matmul(x.reshape(e - s, k // INT8_GROUP, INT8_GROUP), H64.T).reshape(e - s, k).float()
         del x
         am = xr.abs().amax(-1, keepdim=True)
         need(bool((torch.isfinite(am) & (am > 0)).all()), f"{what}: a row has amax 0 or non-finite (rows {s}:{e})")
         best = bs = bq = None
         for rr in grid:
-            sc = am * rr / 127
+            sc = am * rr / d127
             qq = (xr / sc).round().clamp(-127, 127)
-            err = ((qq * sc - xr) ** 2).sum(-1, keepdim=True)
+            err = (qq * sc - xr).double().square().sum(-1, keepdim=True)   # f64: order-independent argmin
             if best is None:
                 best, bs, bq = err, sc, qq
             else:
