@@ -12,6 +12,13 @@
       upload DIR (the model files only; upload_large_folder: resumable, Xet dedup), then the post-upload check: the
       remote file list (recursive) must hold exactly E's paths with E's sizes (cards included; no re-hashing).
       M = JSON {"files": {relpath: size}} of DIR (written by the VM job); E = the same for the whole repo (plan).
+  hf_release.py upload-pr --token-file F --repo R --file LOCAL --path-in-repo NAME --size N --title T
+      one file as ONE pull request (main untouched): refuse if main already holds NAME; an open PR of ours titled T
+      whose tree lists NAME with size N -> HF_PR_EXISTS (idempotent re-run); else create_commit(create_pr=True), then
+      the PR tree must list NAME (size N) and every main file with its main size, main must not -> HF_PR_OK.
+  hf_release.py merge-pr --token-file F --repo R --pr NUM --path-in-repo NAME --size N
+      (laptop, after the user's OK) PR NUM must be an open PR whose tree lists NAME (size N); merge it; main must then
+      list NAME with size N -> HF_MERGED.
 Lines: HF_* ... ; failures HF_FAIL <why> (exit 1). Exception texts pass through redact() (token removed).
 """
 import argparse, json, os, sys
@@ -30,9 +37,69 @@ def api_for(token_file):
     return HfApi(token=tok), tok
 
 
-def remote_sizes(api, repo):
+def remote_sizes(api, repo, revision=None):
     from huggingface_hub.hf_api import RepoFile
-    return {f.path: f.size for f in api.list_repo_tree(repo, recursive=True, repo_type="model") if isinstance(f, RepoFile)}
+    return {f.path: f.size for f in api.list_repo_tree(repo, recursive=True, repo_type="model", revision=revision)
+            if isinstance(f, RepoFile)}
+
+
+OPEN_PR = ("open", "draft")
+
+
+def upload_pr(api, a, user, say):
+    from huggingface_hub import CommitOperationAdd
+    name, size = a.path_in_repo, a.size
+    if os.path.getsize(a.file) != size:
+        say(f"HF_FAIL {a.file}: local size {os.path.getsize(a.file)} != --size {size}"); return 1
+    main = remote_sizes(api, a.repo)
+    if name in main:
+        say(f"HF_FAIL {a.repo}: main already holds {name} (size {main[name]}): nothing to propose"); return 1
+    for d in api.get_repo_discussions(a.repo, author=user, discussion_type="pull_request", repo_type="model"):
+        if d.status not in OPEN_PR or d.title != a.title or d.author != user:
+            continue
+        got = remote_sizes(api, a.repo, revision=d.git_reference).get(name)
+        if got == size:
+            say(f"HF_PR_EXISTS {a.repo} pr={d.num} url={d.url} ({name} size={size} already proposed; nothing uploaded)")
+            return 0
+        say(f"HF_PR_OTHER {a.repo} pr={d.num} status={d.status} same title, {name} size={got} != {size}: left alone")
+    say(f"HF_PR_START {a.repo} {name} bytes={size}")
+    c = api.create_commit(a.repo, operations=[CommitOperationAdd(path_in_repo=name, path_or_fileobj=a.file)],
+                          commit_message=a.title, repo_type="model", create_pr=True)
+    if c.pr_num is None:
+        say(f"HF_FAIL {a.repo}: create_commit opened no pull request (commit {c.oid})"); return 1
+    pr = remote_sizes(api, a.repo, revision=c.pr_revision)
+    bad = {p: (s, pr.get(p)) for p, s in main.items() if pr.get(p) != s}
+    if pr.get(name) != size or bad:
+        say(f"HF_FAIL {a.repo} pr={c.pr_num}: PR tree has {name}={pr.get(name)} (want {size}); main files changed {bad}")
+        return 1
+    if name in remote_sizes(api, a.repo):
+        say(f"HF_FAIL {a.repo}: main lists {name} after a PR-only commit"); return 1
+    say(f"HF_PR_OK {a.repo} pr={c.pr_num} url={c.pr_url} ({name} size={size}; main untouched)")
+    return 0
+
+
+def merge_pr(api, a, user, say):
+    name, size = a.path_in_repo, a.size
+    d = api.get_discussion_details(a.repo, a.pr, repo_type="model")
+    if not d.is_pull_request:
+        say(f"HF_FAIL {a.repo}: #{a.pr} is not a pull request"); return 1
+    if d.author != user:   # only a PR this token's user opened (upload-pr) is ever merged
+        say(f"HF_FAIL {a.repo}: PR #{a.pr} was opened by {d.author!r}, not {user!r}: not merging"); return 1
+    if d.status == "merged" and remote_sizes(api, a.repo).get(name) == size:
+        say(f"HF_MERGED {a.repo} pr={a.pr} (already merged; main lists {name} size={size})"); return 0
+    if d.status not in OPEN_PR:
+        say(f"HF_FAIL {a.repo}: PR #{a.pr} is {d.status}"); return 1
+    pr, main = remote_sizes(api, a.repo, revision=d.git_reference), remote_sizes(api, a.repo)
+    want = dict(main, **{name: size})
+    if pr != want:   # the PR must add exactly NAME and leave every main file as it is (by path + size)
+        diff = {p: (want.get(p), pr.get(p)) for p in set(pr) | set(want) if pr.get(p) != want.get(p)}
+        say(f"HF_FAIL {a.repo}: PR #{a.pr} tree != main + {name} ({size} B): (expected, PR) {diff}: not merging"); return 1
+    api.merge_pull_request(a.repo, a.pr, repo_type="model")
+    got = remote_sizes(api, a.repo).get(name)
+    if got != size:
+        say(f"HF_FAIL {a.repo}: after the merge main has {name}={got}, expected {size}"); return 1
+    say(f"HF_MERGED {a.repo} pr={a.pr} (main lists {name} size={size})")
+    return 0
 
 
 CARD_FILES = ("README.md", "LICENSE.pdf", "NOTICE")
@@ -71,17 +138,28 @@ def remote_bytes(api, repo, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["whoami", "prepare", "upload"])
+    ap.add_argument("cmd", choices=["whoami", "prepare", "upload", "upload-pr", "merge-pr"])
     ap.add_argument("--token-file", required=True)
     ap.add_argument("--expect-user", default="ricecake")
     ap.add_argument("--repos", default="")
     ap.add_argument("--repo"); ap.add_argument("--folder"); ap.add_argument("--manifest"); ap.add_argument("--expect")
     ap.add_argument("--cards")
+    ap.add_argument("--file"); ap.add_argument("--path-in-repo"); ap.add_argument("--size", type=int)
+    ap.add_argument("--title"); ap.add_argument("--pr", type=int)
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
     api, tok = api_for(a.token_file)
     say = lambda s: print(redact(s, tok), flush=True)
     try:
+        if a.cmd in ("upload-pr", "merge-pr"):
+            need = ["repo", "path_in_repo", "size"] + (["file", "title"] if a.cmd == "upload-pr" else ["pr"])
+            miss = [n for n in need if getattr(a, n) is None]
+            if miss:
+                say(f"HF_FAIL {a.cmd} needs " + " ".join("--" + n.replace("_", "-") for n in miss)); return 1
+            name = api.whoami().get("name")
+            if name != a.expect_user or not a.repo.startswith(name + "/"):
+                say(f"HF_FAIL token belongs to {name!r} (expected {a.expect_user!r}, repo {a.repo})"); return 1
+            return upload_pr(api, a, name, say) if a.cmd == "upload-pr" else merge_pr(api, a, name, say)
         if a.cmd in ("whoami", "prepare"):
             me = api.whoami()
             name = me.get("name")

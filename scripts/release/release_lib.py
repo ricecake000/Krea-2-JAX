@@ -15,6 +15,9 @@ ComfyUI fp8_scaled (reproduced bit-exactly from Comfy-Org/Krea-2's krea2_{raw,tu
     "full_precision_matrix_mult": true for attn.wo / attn.gate / mlp.down]}}} sorted), "format": "pt"}.
   - layout as the `safetensors` library writes it: tensors ordered by dtype (F32, BF16, F8_E4M3), then name;
     compact JSON header padded with spaces to a multiple of 8.
+ComfyUI int8_convrot (Comfy-Org/Krea-2's krea2_{raw,turbo}_int8_convrot reproduced within int8_gate.py's tolerances,
+bit-exactness is not reachable: the 256-group Hadamard rotation's f32 summation order differs per hardware): see the
+int8 section (quantize_int8_convrot); layout order F32, BF16, I8, U8 with "__metadata__":{}.
 """
 import json
 import os
@@ -22,9 +25,9 @@ import re
 
 import numpy as np
 
-DSIZE = {"F8_E4M3": 1, "BF16": 2, "F32": 4}
+DSIZE = {"F8_E4M3": 1, "BF16": 2, "F32": 4, "I8": 1, "U8": 1}
 # safetensors (Rust) sorts tensors by dtype descending (its Dtype enum order), then by name
-DTYPE_RANK = {"F32": 3, "BF16": 2, "F8_E4M3": 1}
+DTYPE_RANK = {"F32": 4, "BF16": 3, "F8_E4M3": 2, "I8": 1, "U8": 0}
 FP8_MAX = 448.0
 RECIP_448 = np.float32(1.0) / np.float32(FP8_MAX)
 assert RECIP_448 == np.float32(1.0 / FP8_MAX)
@@ -117,15 +120,18 @@ def read_header(path):
     return parse_header_bytes(prefix, size, path)
 
 
-def build_header(entries, metadata):
+def build_header(entries, metadata, empty_meta=False):
     """entries: [(key, dtype, shape)]. Returns (header bytes incl. the 8-byte length, {key: (abs_b, abs_e)}, file size),
-    laid out exactly as the safetensors library does (dtype rank desc, then name; spaces pad to 8)."""
+    laid out exactly as the safetensors library does (dtype rank desc, then name; spaces pad to 8).
+    empty_meta: with no metadata, still write "__metadata__":{} first (Comfy's int8_convrot files have it)."""
     keys = [k for k, _, _ in entries]
     need(len(set(keys)) == len(keys), "duplicate tensor keys")
     order = sorted(entries, key=lambda e: (-DTYPE_RANK[e[1]], e[0]))
     j, rel, pos = {}, {}, 0
     if metadata:
         j["__metadata__"] = {k: metadata[k] for k in sorted(metadata)}
+    elif empty_meta:
+        j["__metadata__"] = {}
     for k, dt, shape in order:
         nb = numel(shape) * DSIZE[dt]
         j[k] = {"dtype": dt, "shape": [int(x) for x in shape], "data_offsets": [pos, pos + nb]}
@@ -258,6 +264,147 @@ def build_fp8(src, out, log=print, expect_keys=EXPECT_KEYS):
     return size
 
 
+# ---------------- ComfyUI int8_convrot (Comfy-Org/Krea-2 krea2_{raw,turbo}_int8_convrot; see int8_gate.py) ----------
+# quantized: the 224 linear weights of blocks.N only (txtfusion linears stay BF16) -> <layer>.weight I8 [N, K] +
+# <layer>.weight_scale F32 [N, 1] + <layer>.comfy_quant U8 [72]; keys ending in .scale -> F32; the rest -> BF16;
+# "__metadata__":{} (present, empty). Quantizer recipe: see quantize_int8_convrot.
+INT8_QUANT_RE = re.compile(r"^blocks\.\d+\.(attn\.(?:wq|wk|wv|wo|gate)|mlp\.(?:up|gate|down))\.weight$")
+INT8_F32_RE = re.compile(r"\.scale$")
+COMFY_QUANT_INT8 = json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}).encode("utf-8")
+assert len(COMFY_QUANT_INT8) == 72
+INT8_GROUP = 256
+INT8_SIZE = 13492686496
+INT8_MAX_REL_ERR = 0.05   # the recipe gives ~0.01; a wrong rotation ~1.0
+
+
+def int8_plan(src_t):
+    """src_t: {key: (dtype, shape, ...)} with official keys. Returns (entries, jobs): jobs maps each source key to
+    ('quant', layer) | ('f32', key) | ('bf16', key)."""
+    entries, jobs = [], {}
+    for k, v in src_t.items():
+        dt, shape = v[0], tuple(v[1])
+        need(dt in ("BF16", "F32"), f"{k}: source dtype {dt} (BF16 or F32 expected)")
+        if INT8_QUANT_RE.match(k):
+            need(dt == "BF16" and len(shape) == 2 and shape[1] % INT8_GROUP == 0,
+                 f"{k}: a quantized layer must be a 2-D BF16 weight with K % {INT8_GROUP} == 0 (got {dt} {shape})")
+            layer = k[: -len(".weight")]
+            entries += [(k, "I8", shape), (layer + ".weight_scale", "F32", (shape[0], 1)),
+                        (layer + ".comfy_quant", "U8", (len(COMFY_QUANT_INT8),))]
+            jobs[k] = ("quant", layer)
+        elif INT8_F32_RE.search(k):
+            entries.append((k, "F32", shape))
+            jobs[k] = ("f32", k)
+        else:
+            entries.append((k, "BF16", shape))
+            jobs[k] = ("bf16", k)
+    return entries, jobs
+
+
+def to_f32_bytes(dtype, data):
+    """BF16 -> F32 (exact upcast); F32 -> unchanged bytes."""
+    if dtype == "F32":
+        return bytes(data)
+    need(dtype == "BF16", f"cannot cast {dtype} to F32")
+    torch = _torch()
+    return torch.frombuffer(bytearray(data), dtype=torch.bfloat16).to(torch.float32).numpy().tobytes()
+
+
+def _exact_f32_matmul(torch, device):
+    if str(device).startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+
+
+def hadamard_256(torch):
+    """Regular Hadamard of size 256: kron of H4 four times (h = kron(h, H4)), / 16 (entries exactly +-1/16), f32."""
+    h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.float32)
+    h = h4
+    while h.shape[0] < INT8_GROUP:
+        h = torch.kron(h, h4)
+    return h / (INT8_GROUP ** 0.5)
+
+
+def quantize_int8_convrot(data, shape, device="cpu", rows=4096, what="tensor"):
+    """data: raw BF16 bytes of one [N, K] weight. Returns (int8 bytes [N, K], f32 scale bytes [N, 1], rel_err).
+    Per row (rows are independent; processed in chunks of `rows`, the device's tensors freed per chunk):
+      xr = (x.reshape(N, K/256, 256) @ H.T).reshape(N, K) in true f32;  am = amax|xr| per row;
+      for r in linspace(1.0, 0.55, 80): sc = am * r / 127; q = clamp(round(xr / sc), -127, 127);
+        err = sum((q * sc - xr)^2); keep (sc, q) where err < best (strict: the first minimum wins)."""
+    torch = _torch()
+    _exact_f32_matmul(torch, device)
+    n, k = (int(x) for x in shape)
+    need(k % INT8_GROUP == 0 and len(data) == n * k * 2, f"{what}: shape {shape} / {len(data)} B is not a BF16 [N, K%256==0]")
+    w = torch.frombuffer(bytearray(data), dtype=torch.bfloat16).reshape(n, k)
+    H = hadamard_256(torch).to(device)
+    grid = torch.linspace(1.0, 0.55, 80).to(device)
+    q_out = np.empty((n, k), dtype=np.int8)
+    s_out = np.empty((n, 1), dtype=np.float32)
+    err_sum = ref_sum = 0.0
+    for s in range(0, n, rows):
+        e = min(n, s + rows)
+        x = w[s:e].to(device).float()
+        need(bool(torch.isfinite(x).all()), f"{what}: non-finite weights in rows {s}:{e}")
+        xr = torch.matmul(x.reshape(e - s, k // INT8_GROUP, INT8_GROUP), H.T).reshape(e - s, k)
+        del x
+        am = xr.abs().amax(-1, keepdim=True)
+        need(bool((torch.isfinite(am) & (am > 0)).all()), f"{what}: a row has amax 0 or non-finite (rows {s}:{e})")
+        best = bs = bq = None
+        for rr in grid:
+            sc = am * rr / 127
+            qq = (xr / sc).round().clamp(-127, 127)
+            err = ((qq * sc - xr) ** 2).sum(-1, keepdim=True)
+            if best is None:
+                best, bs, bq = err, sc, qq
+            else:
+                t = err < best
+                best = torch.where(t, err, best); bs = torch.where(t, sc, bs); bq = torch.where(t, qq, bq)
+            del qq, err
+        need(bool((torch.isfinite(bs) & (bs > 0)).all()), f"{what}: a scale is non-finite or <= 0 (rows {s}:{e})")
+        err_sum += float(best.sum(dtype=torch.float64)); ref_sum += float(xr.square().sum(dtype=torch.float64))
+        q_out[s:e] = bq.to(torch.int8).cpu().numpy()
+        s_out[s:e] = bs.cpu().numpy()
+        del xr, am, best, bs, bq, sc
+    rel = (err_sum / ref_sum) ** 0.5 if ref_sum > 0 else float("inf")
+    need(rel <= INT8_MAX_REL_ERR, f"{what}: reconstruction rel err {rel:.4f} > {INT8_MAX_REL_ERR} (wrong rotation?)")
+    return q_out.tobytes(), s_out.tobytes(), rel
+
+
+def build_int8(src, out, device="cpu", log=print, expect_keys=EXPECT_KEYS):
+    """src: official-key safetensors (BF16/F32). Writes out (ComfyUI int8_convrot) via out.part + rename."""
+    if str(device).startswith("cuda"):
+        _exact_f32_matmul(_torch(), device)
+    _, _, src_t = read_header(src)
+    need(expect_keys is None or len(src_t) == expect_keys, f"{src}: {len(src_t)} tensors, expected {expect_keys}")
+    entries, jobs = int8_plan(src_t)
+    hdr, offs, size = build_header(entries, None, empty_meta=True)
+    fd_in = os.open(src, os.O_RDONLY)
+    fd, tmp = _open_out(out, size)
+    try:
+        pwrite_all(fd, hdr, 0)
+        nq, max_rel = 0, 0.0
+        for i, k in enumerate(sorted(src_t, key=lambda k: src_t[k][2])):   # source file order: sequential reads
+            dt, shape, b, e = src_t[k]
+            data = pread_exact(fd_in, b, e)
+            kind, name = jobs[k]
+            if kind == "quant":
+                q, s, rel = quantize_int8_convrot(data, shape, device=device, what=k)
+                pwrite_all(fd, q, offs[k][0]); pwrite_all(fd, s, offs[name + ".weight_scale"][0])
+                pwrite_all(fd, COMFY_QUANT_INT8, offs[name + ".comfy_quant"][0])
+                nq += 1; max_rel = max(max_rel, rel)
+            elif kind == "f32":
+                pwrite_all(fd, to_f32_bytes(dt, data), offs[k][0])
+            else:
+                pwrite_all(fd, to_bf16_bytes(dt, data), offs[k][0])
+            if (i + 1) % 50 == 0:
+                log(f"INT8_PROGRESS {i + 1}/{len(src_t)}")
+        os.fsync(fd)
+    finally:
+        os.close(fd); os.close(fd_in)
+    os.replace(tmp, out)
+    log(f"INT8_BUILT {out} bytes={size} tensors={len(entries)} quantized={nq} max_rel_err={max_rel:.5f}")
+    return size
+
+
 def diffusers_plan(src_t, weight_map):
     """Per shard: [(diffusers key, dtype, shape, official key)] + the index json text."""
     need(len(set(map(r2d, src_t))) == len(src_t), "r2d is not 1:1 on the source keys")
@@ -377,6 +524,17 @@ def check_fp8(path, ref_prefix, ref_size):
     need(header_prefix(path) == bytes(ref_prefix), f"{path}: header bytes != Comfy's fp8_scaled header")
     need(size == ref_size, f"{path}: size {size} != Comfy's {ref_size}")
     return f"FP8_OK {os.path.basename(path)} header == Comfy's ({len(ref_prefix)} B) size={size}"
+
+
+def check_int8(path, ref_prefix, ref_size):
+    """Our int8_convrot file: header bytes identical to Comfy's (keys, dtypes, shapes, offsets, the empty __metadata__)
+    and the same size; no internal paths in the metadata."""
+    size = os.path.getsize(path)
+    _, meta, _ = read_header(path)
+    need(not internal_meta_keys(meta), f"{path}: __metadata__ holds internal paths: {internal_meta_keys(meta)}")
+    need(header_prefix(path) == bytes(ref_prefix), f"{path}: header bytes != Comfy's int8_convrot header")
+    need(size == ref_size, f"{path}: size {size} != Comfy's {ref_size}")
+    return f"INT8_OK {os.path.basename(path)} header == Comfy's ({len(ref_prefix)} B) size={size} metadata={meta}"
 
 
 def check_diffusers(out_dir, weight_map, expect_total, expect_shard_prefixes=None):
